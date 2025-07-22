@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 
 def parse_arguments():
-    """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description="Kimchi Premium Arbitrage Bot - Auto Trading"
     )
@@ -33,41 +32,7 @@ def parse_arguments():
         help="Path to configuration file (default: config.yaml)"
     )
     
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Test connections before starting trading"
-    )
-    
     return parser.parse_args()
-
-
-async def test_connections_quick(config):
-    """Quick connection test before trading"""
-    logger.info("⚡ Testing exchange connections...")
-    
-    async with ExchangeConnector(config) as connector:
-        results = await connector.test_connections()
-        
-        korean_ok = any(results.get(ex, False) for ex in ['upbit', 'bithumb'])
-        global_ok = any(results.get(ex, False) for ex in ['okx', 'gate'])
-        
-        for exchange, connected in results.items():
-            if connected:
-                logger.info(f"✅ {exchange.upper()}: Connected")
-            else:
-                logger.error(f"❌ {exchange.upper()}: Failed")
-                if exchange == 'upbit':
-                    logger.error("   → Add your IP to Upbit whitelist!")
-                elif exchange == 'bithumb':
-                    logger.error("   → Check Bithumb API keys!")
-        
-        if not (korean_ok and global_ok):
-            logger.error("\n❌ Need at least 1 Korean + 1 Global exchange!")
-            return False
-            
-        logger.info("\n✅ Ready to trade!")
-        return True
 
 
 async def run_trade(args):
@@ -126,29 +91,14 @@ async def run_trade(args):
 
 
 def main():
-    """Main entry point - Trading Only"""
     args = parse_arguments()
-    
+
     try:
-        # Load config
-        with open(args.config) as f:
-            config = yaml.safe_load(f)
-        
-        # Test connections if requested
-        if args.test:
-            if not asyncio.run(test_connections_quick(config)):
-                logger.error("Fix connection issues before trading!")
-                sys.exit(1)
-            logger.info("\n" + "="*60 + "\n")
-        
         # Start trading
         logger.info("🚀 Starting Kimchi Premium Trading Bot...")
         logger.info("⚠️  REAL MONEY TRADING - Press Ctrl+C to stop")
         asyncio.run(run_trade(args))
-        
-    except KeyboardInterrupt:
-        logger.info("\n\n✋ Stopped by user")
-        sys.exit(0)
+    
     except Exception as e:
         logger.error(f"\n❌ Error: {e}")
         sys.exit(1)
