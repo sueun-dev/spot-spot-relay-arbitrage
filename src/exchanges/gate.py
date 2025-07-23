@@ -10,31 +10,21 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Any
 from urllib.parse import urlencode
 
+import logging
 from .base import BaseExchange
 from ..models import OrderRequest, OrderResponse, OrderStatus, OrderSide, ExchangeBalance
-from ..utils.logger import logger
+logger = logging.getLogger(__name__)
 
 
 class GateExchange(BaseExchange):
     """Gate.io exchange implementation using native API"""
     
-    def __init__(self, api_key: str, secret_key: str, **kwargs):
-        super().__init__(api_key, secret_key, **kwargs)
+    def __init__(self, api_key: str, secret_key: str):
+        super().__init__(api_key, secret_key)
         self.base_url = "https://api.gateio.ws"
-        self.ws_url = "wss://fx-ws.gateio.ws/v4/ws/usdt"
         
     def get_base_url(self) -> str:
         return self.base_url
-        
-    def get_ws_url(self) -> str:
-        return self.ws_url
-        
-    async def get_server_time(self) -> int:
-        """Get server time"""
-        response = await self.request("GET", "/api/v4/spot/time")
-        if response and 'server_time' in response:
-            return int(response['server_time']) * 1000
-        return int(time.time() * 1000)
         
     def sign_request(self, method: str, endpoint: str, params: Dict[str, Any]) -> Dict[str, str]:
         """Sign request for Gate.io API"""
@@ -47,7 +37,7 @@ class GateExchange(BaseExchange):
         if method == "GET" and params:
             query_string = urlencode(sorted(params.items()))
             
-        if method in ["POST", "PATCH", "PUT", "DELETE"]:
+        if method in ["POST", "DELETE"]:
             if params:
                 body_string = json.dumps(params)
                 body_hash = hashlib.sha512(body_string.encode('utf-8')).hexdigest()
@@ -126,19 +116,6 @@ class GateExchange(BaseExchange):
             logger.error(f"Failed to place order on Gate.io: {e}")
             return None
             
-    async def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancel an order"""
-        try:
-            endpoint = f"/api/v4/futures/usdt/orders/{order_id}"
-            params = {'contract': self.format_symbol(symbol, "USDT")}
-            
-            response = await self.request("DELETE", endpoint, params, signed=True)
-            return response is not None
-            
-        except Exception as e:
-            logger.error(f"Failed to cancel order on Gate.io: {e}")
-            return False
-            
     async def get_order(self, order_id: str, symbol: str) -> Optional[OrderResponse]:
         """Get order status"""
         try:
@@ -181,11 +158,10 @@ class GateExchange(BaseExchange):
                 
                 # Gate.io returns single account info for USDT futures
                 balances['USDT'] = ExchangeBalance(
-                    exchange="gate",
                     currency='USDT',
-                    free=Decimal(response.get('available', '0')),
-                    used=Decimal(response.get('margin', '0')),
-                    total=Decimal(response.get('total', '0'))
+                    total=Decimal(response.get('total', '0')),
+                    available=Decimal(response.get('available', '0')),
+                    locked=Decimal(response.get('margin', '0'))
                 )
                 
                 return balances

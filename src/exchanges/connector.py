@@ -1,199 +1,250 @@
-"""
-Unified Exchange Connector - Factory for all exchange implementations
-"""
+import logging
 import os
-from typing import Dict, Optional, Any
-import asyncio
+from typing import Any, Dict, Optional
 
+from ..models import ExchangeBalance, OrderRequest, OrderResponse
 from .base import BaseExchange
-from .upbit import UpbitExchange
 from .bithumb import BithumbExchange
-from .okx import OKXExchange
 from .gate import GateExchange
-from ..models import OrderRequest, OrderResponse, ExchangeBalance
-from ..utils.logger import logger
+from .okx import OKXExchange
+from .upbit import UpbitExchange
+
+logger = logging.getLogger(__name__)
+
+# Constants
+GLOBAL_EXCHANGES = ["okx", "gate"]
 
 
 class ExchangeConnector:
-    """Unified interface for all exchanges"""
+    """Factory class for managing multiple cryptocurrency exchange connections.
     
-    def __init__(self, config: dict):
-        self.config = config
+    This class provides a unified interface for interacting with multiple
+    exchanges simultaneously, handling initialization, and routing operations
+    to the appropriate exchange implementation.
+    
+    Attributes:
+        exchanges: Dictionary mapping exchange names to initialized instances.
+    """
+    
+    def __init__(self) -> None:
+        """Initialize exchange connector.
+        
+        Automatically detects and initializes exchanges based on
+        environment variables.
+        """
         self.exchanges: Dict[str, BaseExchange] = {}
-        self._initialize_exchanges()
         
-    def _initialize_exchanges(self):
-        """Initialize all configured exchanges"""
+        self._initialize_korean_exchanges()
+        self._initialize_global_exchanges()
         
-        # Korean exchanges
-        for exchange_config in self.config["exchanges"]["korean"]:
-            if not exchange_config["enabled"]:
-                continue
-                
-            name = exchange_config["name"]
-            try:
-                if name == "upbit":
-                    api_key = os.getenv('UPBIT_ACCESS_KEY')
-                    secret_key = os.getenv('UPBIT_SECRET_KEY')
-                    if api_key and secret_key:
-                        self.exchanges[name] = UpbitExchange(api_key, secret_key)
-                        logger.info(f"Initialized Upbit exchange")
-                        
-                elif name == "bithumb":
-                    api_key = os.getenv('BITHUMB_API_KEY')
-                    secret_key = os.getenv('BITHUMB_SECRET_KEY')
-                    if api_key and secret_key:
-                        self.exchanges[name] = BithumbExchange(api_key, secret_key)
-                        logger.info(f"Initialized Bithumb exchange")
-                        
-            except Exception as e:
-                logger.error(f"Failed to initialize {name}: {e}")
-                
-        # Global futures exchanges
-        for exchange_config in self.config["exchanges"]["global"]:
-            if not exchange_config["enabled"]:
-                continue
-                
-            name = exchange_config["name"]
-            try:
-                if name == "okx":
-                    api_key = os.getenv('OKX_API_KEY')
-                    secret_key = os.getenv('OKX_SECRET_KEY')
-                    passphrase = os.getenv('OKX_PASSPHRASE')
-                    if api_key and secret_key and passphrase:
-                        self.exchanges[name] = OKXExchange(api_key, secret_key, passphrase)
-                        logger.info(f"Initialized OKX exchange")
-                        
-                # Bybit removed - not used in current implementation
-                        
-                elif name == "gate":
-                    api_key = os.getenv('GATE_API_KEY')
-                    secret_key = os.getenv('GATE_SECRET_KEY')
-                    if api_key and secret_key:
-                        self.exchanges[name] = GateExchange(api_key, secret_key)
-                        logger.info(f"Initialized Gate.io exchange")
-                        
-            except Exception as e:
-                logger.error(f"Failed to initialize {name}: {e}")
-                
         logger.info(f"Total exchanges initialized: {len(self.exchanges)}")
+    
+    def _initialize_korean_exchanges(self) -> None:
+        """Initialize Korean exchange connections."""
+        self._initialize_upbit()
+        self._initialize_bithumb()
+    
+    def _initialize_global_exchanges(self) -> None:
+        """Initialize global exchange connections."""
+        self._initialize_okx()
+        self._initialize_gate()
+    
+    def _initialize_upbit(self) -> None:
+        """Initialize Upbit exchange connection."""
+        api_key = os.getenv('UPBIT_ACCESS_KEY')
+        secret_key = os.getenv('UPBIT_SECRET_KEY')
         
-    async def __aenter__(self):
-        """Async context manager entry"""
-        for exchange in self.exchanges.values():
-            await exchange.__aenter__()
-        return self
+        if not api_key or not secret_key:
+            logger.warning("Upbit API credentials not found in environment")
+            return
         
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        for exchange in self.exchanges.values():
-            await exchange.__aexit__(exc_type, exc_val, exc_tb)
+        try:
+            self.exchanges["upbit"] = UpbitExchange(api_key, secret_key)
+        except Exception as e:
+            logger.error(f"Failed to initialize Upbit: {e}")
+    
+    def _initialize_bithumb(self) -> None:
+        """Initialize Bithumb exchange connection."""
+        api_key = os.getenv('BITHUMB_API_KEY')
+        secret_key = os.getenv('BITHUMB_SECRET_KEY')
+        
+        if not api_key or not secret_key:
+            logger.warning("Bithumb API credentials not found in environment")
+            return
+        
+        try:
+            self.exchanges["bithumb"] = BithumbExchange(api_key, secret_key)
+        except Exception as e:
+            logger.error(f"Failed to initialize Bithumb: {e}")
+    
+    def _initialize_okx(self) -> None:
+        """Initialize OKX exchange connection."""
+        api_key = os.getenv('OKX_API_KEY')
+        secret_key = os.getenv('OKX_SECRET_KEY')
+        passphrase = os.getenv('OKX_PASSPHRASE')
+        
+        if not api_key or not secret_key or not passphrase:
+            logger.warning("OKX API credentials not found in environment")
+            return
+        
+        try:
+            self.exchanges["okx"] = OKXExchange(api_key, secret_key, passphrase)
+        except Exception as e:
+            logger.error(f"Failed to initialize OKX: {e}")
+    
+    def _initialize_gate(self) -> None:
+        """Initialize Gate.io exchange connection."""
+        api_key = os.getenv('GATE_API_KEY')
+        secret_key = os.getenv('GATE_SECRET_KEY')
+        
+        if not api_key or not secret_key:
+            logger.warning("Gate.io API credentials not found in environment")
+            return
+        
+        try:
+            self.exchanges["gate"] = GateExchange(api_key, secret_key)
+        except Exception as e:
+            logger.error(f"Failed to initialize Gate.io: {e}")
             
     async def place_order(self, request: OrderRequest) -> Optional[OrderResponse]:
-        """Place an order on specified exchange"""
+        """Place an order on the specified exchange.
+        
+        Args:
+            request: Order request object containing:
+                - exchange: Target exchange name
+                - symbol: Trading pair symbol
+                - side: Buy or sell
+                - size: Order size
+                - price: Order price (for limit orders)
+                
+        Returns:
+            Order response object if successful, None if exchange not found
+            or order placement failed.
+        """
         exchange = self.exchanges.get(request.exchange)
         if not exchange:
-            logger.error(f"Exchange {request.exchange} not configured")
+            logger.error(f"Exchange '{request.exchange}' not configured")
             return None
             
         return await exchange.place_order(request)
         
-    async def cancel_order(self, order_id: str, symbol: str, exchange_name: str) -> bool:
-        """Cancel an order"""
-        exchange = self.exchanges.get(exchange_name)
-        if not exchange:
-            logger.error(f"Exchange {exchange_name} not configured")
-            return False
-            
-        return await exchange.cancel_order(order_id, symbol)
+    async def get_order(
+        self, 
+        order_id: str, 
+        symbol: str, 
+        exchange_name: str
+    ) -> Optional[OrderResponse]:
+        """Get order status and details from the specified exchange.
         
-    async def get_order(self, order_id: str, symbol: str, exchange_name: str) -> Optional[OrderResponse]:
-        """Get order status"""
+        Args:
+            order_id: Exchange-specific order identifier.
+            symbol: Trading pair symbol.
+            exchange_name: Name of the exchange.
+            
+        Returns:
+            Order response object if found, None otherwise.
+        """
         exchange = self.exchanges.get(exchange_name)
         if not exchange:
-            logger.error(f"Exchange {exchange_name} not configured")
+            logger.error(f"Exchange '{exchange_name}' not configured")
             return None
             
         return await exchange.get_order(order_id, symbol)
         
-    async def fetch_balance(self, exchange_name: str) -> Dict[str, ExchangeBalance]:
-        """Get account balance from exchange"""
-        exchange = self.exchanges.get(exchange_name)
-        if not exchange:
-            logger.error(f"Exchange {exchange_name} not configured")
-            return {}
-            
-        return await exchange.get_balance()
+    async def get_ticker(
+        self, 
+        symbol: str, 
+        exchange_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get current ticker data for a symbol from the specified exchange.
         
-    async def get_ticker(self, symbol: str, exchange_name: str) -> Optional[Dict[str, Any]]:
-        """Get ticker data"""
+        Args:
+            symbol: Trading pair symbol.
+            exchange_name: Name of the exchange.
+            
+        Returns:
+            Ticker data dictionary containing:
+                - last: Last traded price
+                - bid: Best bid price
+                - ask: Best ask price
+                - volume: 24h volume
+            Returns None if exchange not found or request failed.
+        """
         exchange = self.exchanges.get(exchange_name)
         if not exchange:
-            logger.error(f"Exchange {exchange_name} not configured")
+            logger.error(f"Exchange '{exchange_name}' not configured")
             return None
             
         return await exchange.get_ticker(symbol)
         
-    async def get_orderbook(self, symbol: str, exchange_name: str, limit: int = 10) -> Optional[Dict[str, Any]]:
-        """Get order book"""
+    async def get_orderbook(
+        self, 
+        symbol: str, 
+        exchange_name: str, 
+        limit: int = 10
+    ) -> Optional[Dict[str, Any]]:
+        """Get order book data for a symbol from the specified exchange.
+        
+        Args:
+            symbol: Trading pair symbol.
+            exchange_name: Name of the exchange.
+            limit: Number of price levels to return (default: 10).
+            
+        Returns:
+            Order book dictionary containing:
+                - bids: List of [price, size] bid levels
+                - asks: List of [price, size] ask levels
+                - timestamp: Order book timestamp
+            Returns None if exchange not found or request failed.
+        """
         exchange = self.exchanges.get(exchange_name)
         if not exchange:
-            logger.error(f"Exchange {exchange_name} not configured")
+            logger.error(f"Exchange '{exchange_name}' not configured")
             return None
             
         return await exchange.get_orderbook(symbol, limit)
         
-    async def get_funding_rate(self, symbol: str, exchange_name: str) -> Optional[float]:
-        """Get funding rate (futures only)"""
+    async def get_funding_rate(
+        self, 
+        symbol: str, 
+        exchange_name: str
+    ) -> Optional[float]:
+        """Get funding rate for futures contracts.
+        
+        Args:
+            symbol: Trading pair symbol.
+            exchange_name: Name of the exchange.
+            
+        Returns:
+            Funding rate as a float if available, None otherwise.
+            Only available for futures exchanges (OKX, Gate.io).
+        """
+        if exchange_name not in GLOBAL_EXCHANGES:
+            return None
+            
         exchange = self.exchanges.get(exchange_name)
         if not exchange:
-            logger.error(f"Exchange {exchange_name} not configured")
+            logger.error(f"Exchange '{exchange_name}' not configured")
             return None
             
-        # Only futures exchanges have funding rates
-        if exchange_name not in ["okx", "gate"]:
-            return None
-            
-        if hasattr(exchange, 'get_funding_rate'):
-            rate = await exchange.get_funding_rate(symbol)
-            return float(rate) if rate else None
-            
-        return None
-        
-    async def get_funding_fee(self, symbol: str, exchange_name: str, position_size: float) -> Optional[float]:
-        """Calculate funding fee for a position"""
-        funding_rate = await self.get_funding_rate(symbol, exchange_name)
-        if funding_rate is None:
-            return None
-            
-        # Funding fee = position size * funding rate
-        return position_size * funding_rate
-        
-    def is_futures_exchange(self, exchange_name: str) -> bool:
-        """Check if exchange is for futures trading"""
-        return exchange_name in ["okx", "gate"]
+        # OKX and Gate both have get_funding_rate method
+        rate = await exchange.get_funding_rate(symbol)
+        return float(rate) if rate is not None else None
         
     def get_configured_exchanges(self) -> list:
-        """Get list of configured exchanges"""
+        """Get list of successfully configured exchange names.
+        
+        Returns:
+            List of exchange names that were successfully initialized.
+        """
         return list(self.exchanges.keys())
-        
-    async def test_connections(self) -> Dict[str, bool]:
-        """Test all exchange connections"""
-        results = {}
-        
-        for name, exchange in self.exchanges.items():
+    
+    async def close_all(self) -> None:
+        """Close all exchange connections."""
+        for exchange_name, exchange in self.exchanges.items():
             try:
-                # Try to get balance as a connection test
-                balance = await exchange.get_balance()
-                # Consider connection successful if we got a response (even empty balance)
-                # For Bithumb, check if we got a dict response (even if empty)
-                if name == 'bithumb':
-                    results[name] = isinstance(balance, dict)
-                else:
-                    results[name] = balance is not None
-                logger.info(f"{name} connection: {'OK' if results[name] else 'Failed'}")
+                await exchange.close()
+                logger.info(f"Closed connection to {exchange_name}")
             except Exception as e:
-                logger.error(f"{name} connection test failed: {e}")
-                results[name] = False
-                
-        return results
+                logger.error(f"Error closing {exchange_name}: {e}")
+    

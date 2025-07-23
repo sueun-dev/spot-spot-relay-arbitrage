@@ -4,36 +4,27 @@ Upbit Exchange Implementation - Native API
 import jwt
 import uuid
 import hashlib
-import time
 import json
 from urllib.parse import urlencode
 from decimal import Decimal
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
+import logging
 from .base import BaseExchange
 from ..models import OrderRequest, OrderResponse, OrderStatus, OrderSide, ExchangeBalance
-from ..utils.logger import logger
+logger = logging.getLogger(__name__)
 
 
 class UpbitExchange(BaseExchange):
     """Upbit exchange implementation using native API"""
     
-    def __init__(self, api_key: str, secret_key: str, **kwargs):
-        super().__init__(api_key, secret_key, **kwargs)
+    def __init__(self, api_key: str, secret_key: str):
+        super().__init__(api_key, secret_key)
         self.base_url = "https://api.upbit.com"
-        self.ws_url = "wss://api.upbit.com/websocket/v1"
         
     def get_base_url(self) -> str:
         return self.base_url
-        
-    def get_ws_url(self) -> str:
-        return self.ws_url
-        
-    async def get_server_time(self) -> int:
-        """Get server time"""
-        # Upbit doesn't provide server time endpoint, use local time
-        return int(time.time() * 1000)
         
     def sign_request(self, method: str, endpoint: str, params: Dict[str, Any]) -> Dict[str, str]:
         """Sign request using JWT for Upbit"""
@@ -78,35 +69,25 @@ class UpbitExchange(BaseExchange):
         return status_map.get(status, OrderStatus.PENDING)
         
     async def place_order(self, order: OrderRequest) -> Optional[OrderResponse]:
-        """Place an order on Upbit"""
+        """Place a market order on Upbit"""
         try:
             symbol = self.format_symbol(order.symbol, "KRW")
             
-            params = {
-                'market': symbol,
-                'side': 'bid' if order.side == OrderSide.BUY else 'ask',
-                'ord_type': 'market' if order.order_type.value == 'market' else 'limit',
-            }
-            
-            if order.order_type.value == 'market':
-                if order.side == OrderSide.BUY:
-                    # For market buy, Upbit requires price (total KRW amount)
-                    if order.total_krw:
-                        params['price'] = str(int(order.total_krw))  # Must be integer KRW
-                    else:
-                        # Fallback: fetch current price and calculate
-                        ticker = await self.get_ticker(order.symbol)
-                        if ticker:
-                            estimated_price = ticker['ask'] * 1.01  # Add 1% buffer
-                            params['price'] = str(int(float(order.size) * estimated_price))
-                        else:
-                            raise ValueError(f"Cannot determine price for market buy of {order.symbol}")
-                else:
-                    # For market sell, use volume
-                    params['volume'] = str(float(order.size))
-            else:
-                params['volume'] = str(float(order.size))
-                params['price'] = str(float(order.price))
+            # BUY와 SELL 처리
+            if order.side == OrderSide.BUY:
+                params = {
+                    'market': symbol,
+                    'side': 'bid',  # Buy
+                    'ord_type': 'price',  # Market buy uses total KRW
+                    'price': str(int(order.total_krw))  # Total KRW amount
+                }
+            else:  # SELL
+                params = {
+                    'market': symbol,
+                    'side': 'ask',  # Sell
+                    'ord_type': 'market',  # Market sell uses quantity
+                    'volume': str(order.size)  # Coin quantity
+                }
                 
             response = await self.request("POST", "/v1/orders", params, signed=True)
             
@@ -127,16 +108,6 @@ class UpbitExchange(BaseExchange):
         except Exception as e:
             logger.error(f"Failed to place order on Upbit: {e}")
             return None
-            
-    async def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancel an order"""
-        try:
-            params = {'uuid': order_id}
-            response = await self.request("DELETE", "/v1/order", params, signed=True)
-            return response is not None
-        except Exception as e:
-            logger.error(f"Failed to cancel order on Upbit: {e}")
-            return False
             
     async def get_order(self, order_id: str, symbol: str) -> Optional[OrderResponse]:
         """Get order status"""
@@ -172,11 +143,10 @@ class UpbitExchange(BaseExchange):
                 for item in response:
                     currency = item['currency']
                     balances[currency] = ExchangeBalance(
-                        exchange="upbit",
                         currency=currency,
-                        free=Decimal(item['balance']),
-                        used=Decimal(item['locked']),
-                        total=Decimal(item['balance']) + Decimal(item['locked'])
+                        total=Decimal(item['balance']) + Decimal(item['locked']),
+                        available=Decimal(item['balance']),
+                        locked=Decimal(item['locked'])
                     )
                 return balances
                 

@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 """
 Test Bithumb v2.0 API Implementation
 Tests authentication, balance check, and basic API functionality
@@ -13,7 +17,6 @@ import json
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.exchanges.bithumb import BithumbExchange
-from src.utils.logger import logger
 
 load_dotenv()
 

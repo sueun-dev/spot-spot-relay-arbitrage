@@ -8,32 +8,24 @@ import base64
 import json
 from urllib.parse import urlencode
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
+import logging
 from .base import BaseExchange
 from ..models import OrderRequest, OrderResponse, OrderStatus, OrderSide, ExchangeBalance
-from ..utils.logger import logger
+logger = logging.getLogger(__name__)
 
 
 class BithumbExchange(BaseExchange):
     """Bithumb exchange implementation using native API"""
     
-    def __init__(self, api_key: str, secret_key: str, **kwargs):
-        super().__init__(api_key, secret_key, **kwargs)
+    def __init__(self, api_key: str, secret_key: str):
+        super().__init__(api_key, secret_key)
         self.base_url = "https://api.bithumb.com"
-        self.ws_url = "wss://pubwss.bithumb.com/pub/ws"
         
     def get_base_url(self) -> str:
         return self.base_url
-        
-    def get_ws_url(self) -> str:
-        return self.ws_url
-        
-    async def get_server_time(self) -> int:
-        """Get server time"""
-        # Bithumb doesn't provide server time endpoint, use local time
-        return int(time.time() * 1000)
         
     def sign_request(self, method: str, endpoint: str, params: Dict[str, Any]) -> Dict[str, str]:
         """Sign request using Bithumb's v2.0 API signature method"""
@@ -128,28 +120,17 @@ class BithumbExchange(BaseExchange):
             return []
             
     async def place_order(self, order: OrderRequest) -> Optional[OrderResponse]:
-        """Place an order on Bithumb"""
+        """Place a market order on Bithumb"""
         try:
             endpoint = "/trade/place"
             
+            # BUY와 SELL 처리
             params = {
                 'order_currency': order.symbol,
                 'payment_currency': 'KRW',
-                'type': 'bid' if order.side == OrderSide.BUY else 'ask',
+                'type': 'market_buy' if order.side == OrderSide.BUY else 'market_sell',
+                'units': str(float(order.size))  # Amount of crypto
             }
-            
-            if order.order_type.value == 'market':
-                params['type'] = 'market_' + params['type']
-                if order.side == OrderSide.BUY:
-                    # For market buy, Bithumb requires units (amount to buy)
-                    params['units'] = str(float(order.size))
-                else:
-                    # For market sell
-                    params['units'] = str(float(order.size))
-            else:
-                # Limit order
-                params['units'] = str(float(order.size))
-                params['price'] = str(int(float(order.price)))  # Price must be integer KRW
                 
             response = await self.request("POST", endpoint, params, signed=True)
             
@@ -164,7 +145,7 @@ class BithumbExchange(BaseExchange):
                     executed_size=Decimal('0'),  # Will be updated when checking order status
                     price=Decimal(params.get('price', '0')),
                     status=OrderStatus.PENDING,
-                    timestamp=datetime.now(),
+                    timestamp=datetime.now(timezone.utc),
                     fee=Decimal('0')
                 )
             else:
@@ -174,24 +155,6 @@ class BithumbExchange(BaseExchange):
         except Exception as e:
             logger.error(f"Failed to place order on Bithumb: {e}")
             return None
-            
-    async def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancel an order"""
-        try:
-            endpoint = "/trade/cancel"
-            params = {
-                'order_id': order_id,
-                'type': 'bid',  # Will be overridden if needed
-                'order_currency': symbol,
-                'payment_currency': 'KRW'
-            }
-            
-            response = await self.request("POST", endpoint, params, signed=True)
-            return response and response.get('status') == '0000'
-            
-        except Exception as e:
-            logger.error(f"Failed to cancel order on Bithumb: {e}")
-            return False
             
     async def get_order(self, order_id: str, symbol: str) -> Optional[OrderResponse]:
         """Get order status"""
@@ -356,3 +319,22 @@ class BithumbExchange(BaseExchange):
         except Exception as e:
             logger.error(f"Failed to parse Bithumb response: {e}")
             return None
+            
+    def _build_request_kwargs(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]],
+        headers: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Override to use form-data for POST requests"""
+        kwargs = {"headers": headers}
+        
+        if method == "GET":
+            kwargs["params"] = params
+        elif method == "POST":
+            # Bithumb requires form-data instead of JSON
+            kwargs["data"] = params
+        elif method == "DELETE":
+            kwargs["params"] = params
+            
+        return kwargs

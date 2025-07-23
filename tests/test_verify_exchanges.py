@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 """
 Verify all 5 exchanges are properly configured and connected
 Tests: Upbit, Bithumb, OKX, Gate.io (Bybit removed)
@@ -16,7 +20,6 @@ from src.exchanges.upbit import UpbitExchange
 from src.exchanges.bithumb import BithumbExchange
 from src.exchanges.okx import OKXExchange
 from src.exchanges.gate import GateExchange
-from src.utils.logger import logger
 import yaml
 
 load_dotenv()
@@ -87,8 +90,8 @@ async def verify_exchange_apis():
             async with exchange:
                 # Test 1: Required methods exist
                 required_methods = [
-                    'get_base_url', 'get_ws_url', 'get_symbols', 'get_server_time',
-                    'sign_request', 'format_symbol', 'place_order', 'cancel_order',
+                    'get_base_url', 'get_symbols',
+                    'sign_request', 'format_symbol', 'place_order',
                     'get_order', 'get_balance', 'get_ticker', 'get_orderbook'
                 ]
                 

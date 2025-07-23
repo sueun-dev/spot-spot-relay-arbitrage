@@ -5,42 +5,32 @@ import hmac
 import base64
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Any
 
+import logging
 from .base import BaseExchange
 from ..models import OrderRequest, OrderResponse, OrderStatus, OrderSide, ExchangeBalance
-from ..utils.logger import logger
+logger = logging.getLogger(__name__)
 
 
 class OKXExchange(BaseExchange):
     """OKX exchange implementation using native API"""
     
-    def __init__(self, api_key: str, secret_key: str, passphrase: str, **kwargs):
-        super().__init__(api_key, secret_key, **kwargs)
+    def __init__(self, api_key: str, secret_key: str, passphrase: str):
+        super().__init__(api_key, secret_key)
         self.passphrase = passphrase
         self.base_url = "https://www.okx.com"
-        self.ws_url = "wss://ws.okx.com:8443/ws/v5/public"
         # For perpetual contracts
         self.inst_type = "SWAP"
         
     def get_base_url(self) -> str:
         return self.base_url
         
-    def get_ws_url(self) -> str:
-        return self.ws_url
-        
-    async def get_server_time(self) -> int:
-        """Get server time"""
-        response = await self.request("GET", "/api/v5/public/time")
-        if response and response.get('code') == '0':
-            return int(response['data'][0]['ts'])
-        return int(time.time() * 1000)
-        
     def sign_request(self, method: str, endpoint: str, params: Dict[str, Any]) -> Dict[str, str]:
         """Sign request for OKX API"""
-        timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
         
         # Create signature string
         if method == "GET" and params:
@@ -115,29 +105,13 @@ class OKXExchange(BaseExchange):
                     executed_size=Decimal('0'),  # Need separate call for fill info
                     price=Decimal(data.get('px', '0')),
                     status=OrderStatus.PENDING,
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     fee=Decimal('0')
                 )
                 
         except Exception as e:
             logger.error(f"Failed to place order on OKX: {e}")
             return None
-            
-    async def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancel an order"""
-        try:
-            endpoint = "/api/v5/trade/cancel-order"
-            params = {
-                'instId': self.format_symbol(symbol, "USDT"),
-                'ordId': order_id
-            }
-            
-            response = await self.request("POST", endpoint, params, signed=True)
-            return response and response.get('code') == '0'
-            
-        except Exception as e:
-            logger.error(f"Failed to cancel order on OKX: {e}")
-            return False
             
     async def get_order(self, order_id: str, symbol: str) -> Optional[OrderResponse]:
         """Get order status"""
@@ -188,22 +162,20 @@ class OKXExchange(BaseExchange):
                             # For futures, we care about USDT balance
                             if currency == 'USDT':
                                 balances[currency] = ExchangeBalance(
-                                    exchange="okx",
                                     currency=currency,
-                                    free=Decimal(detail.get('availBal', '0')),
-                                    used=Decimal(detail.get('frozenBal', '0')),
-                                    total=Decimal(detail.get('bal', '0'))
+                                    total=Decimal(detail.get('bal', '0')),
+                                    available=Decimal(detail.get('availBal', '0')),
+                                    locked=Decimal(detail.get('frozenBal', '0'))
                                 )
                     # Handle different response format
                     elif 'bal' in account:
                         currency = account.get('ccy', 'USDT')
                         if currency == 'USDT':
                             balances[currency] = ExchangeBalance(
-                                exchange="okx",
                                 currency=currency,
-                                free=Decimal(account.get('availBal', '0')),
-                                used=Decimal(account.get('frozenBal', '0')),
-                                total=Decimal(account.get('bal', '0'))
+                                total=Decimal(account.get('bal', '0')),
+                                available=Decimal(account.get('availBal', '0')),
+                                locked=Decimal(account.get('frozenBal', '0'))
                             )
                             
                 return balances

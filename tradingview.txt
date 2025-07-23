@@ -1,0 +1,134 @@
+//@version=5
+indicator("Kimchi Premium Arbitrage Strategy", overlay=false, format=format.percent)
+
+// ===========================
+// 입력 파라미터
+// ===========================
+entry_threshold = input.float(-0.5, "진입 프리미엄 (%)", step=0.1, group="전략 설정")
+exit_threshold = input.float(0.5, "청산 프리미엄 (%)", step=0.1, group="전략 설정")
+usdt_rate = input.float(1365, "USDT/KRW 환율", step=1, group="환율 설정")
+korean_fee = input.float(0.05, "한국 거래소 수수료 (%)", step=0.01, group="수수료 설정")
+global_fee = input.float(0.05, "해외 거래소 수수료 (%)", step=0.01, group="수수료 설정")
+
+// ===========================
+// 가격 데이터 가져오기
+// ===========================
+// 한국 거래소 가격 (업비트 BTC/KRW)
+korean_price = request.security("UPBIT:BTCKRW", timeframe.period, close)
+
+// 해외 거래소 가격 (바이낸스 BTC/USDT)
+global_price = request.security("BINANCE:BTCUSDT", timeframe.period, close)
+
+// ===========================
+// 김치 프리미엄 계산
+// ===========================
+korean_price_usd = korean_price / usdt_rate
+premium = ((korean_price_usd - global_price) / global_price) * 100
+
+// ===========================
+// 시그널 생성
+// ===========================
+// 진입 시그널: 역프리미엄이 threshold 이하
+entry_signal = premium <= entry_threshold and premium >= -10.0
+
+// 청산 시그널: 정프리미엄이 threshold 이상
+exit_signal = premium >= exit_threshold and premium <= 10.0
+
+// ===========================
+// 포지션 추적
+// ===========================
+var float entry_premium = na
+var bool in_position = false
+var float total_profit = 0.0
+var int trade_count = 0
+
+// 진입 처리
+if entry_signal and not in_position
+    in_position := true
+    entry_premium := premium
+    label.new(bar_index, premium, "ENTRY\n" + str.tostring(premium, "#.##") + "%", 
+              color=color.green, style=label.style_label_up, textcolor=color.white)
+
+// 청산 처리
+if exit_signal and in_position
+    in_position := false
+    profit = premium - entry_premium - (korean_fee * 2) - (global_fee * 2)
+    total_profit := total_profit + profit
+    trade_count := trade_count + 1
+    label.new(bar_index, premium, "EXIT\n" + str.tostring(premium, "#.##") + "%\nProfit: " + str.tostring(profit, "#.##") + "%", 
+              color=color.red, style=label.style_label_down, textcolor=color.white)
+    entry_premium := na
+
+// ===========================
+// 차트 그리기
+// ===========================
+// 프리미엄 선
+plot(premium, title="김치 프리미엄 (%)", color=color.blue, linewidth=2)
+
+// 진입/청산 임계값
+hline(entry_threshold, title="진입 임계값", color=color.green, linestyle=hline.style_dashed)
+hline(exit_threshold, title="청산 임계값", color=color.red, linestyle=hline.style_dashed)
+hline(0, title="Zero Line", color=color.gray)
+
+// 위험 구간 표시
+hline(-10.0, title="최소 프리미엄", color=color.red, linestyle=hline.style_dotted)
+hline(10.0, title="최대 프리미엄", color=color.red, linestyle=hline.style_dotted)
+
+// 배경색
+bgcolor(entry_signal ? color.new(color.green, 90) : na, title="진입 구간")
+bgcolor(exit_signal ? color.new(color.red, 90) : na, title="청산 구간")
+bgcolor(in_position ? color.new(color.yellow, 95) : na, title="포지션 보유")
+
+// ===========================
+// 정보 테이블
+// ===========================
+var table infoTable = table.new(position.top_right, 2, 6)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "현재 프리미엄", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 0, str.tostring(premium, "#.##") + "%", 
+               bgcolor=premium > 0 ? color.green : color.red, text_color=color.white)
+    
+    table.cell(infoTable, 0, 1, "포지션 상태", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 1, in_position ? "보유중" : "대기중", 
+               bgcolor=in_position ? color.orange : color.blue, text_color=color.white)
+    
+    table.cell(infoTable, 0, 2, "진입 프리미엄", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 2, in_position ? str.tostring(entry_premium, "#.##") + "%" : "N/A", 
+               bgcolor=color.gray, text_color=color.white)
+    
+    table.cell(infoTable, 0, 3, "거래 횟수", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 3, str.tostring(trade_count), bgcolor=color.gray, text_color=color.white)
+    
+    table.cell(infoTable, 0, 4, "총 수익률", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 4, str.tostring(total_profit, "#.##") + "%", 
+               bgcolor=total_profit > 0 ? color.green : color.red, text_color=color.white)
+    
+    table.cell(infoTable, 0, 5, "평균 수익률", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 5, trade_count > 0 ? str.tostring(total_profit/trade_count, "#.##") + "%" : "0%", 
+               bgcolor=total_profit > 0 ? color.green : color.red, text_color=color.white)
+
+// ===========================
+// 알림 설정
+// ===========================
+alertcondition(entry_signal, title="진입 시그널", message="김치 프리미엄 진입 시그널 발생! 프리미엄: {{plot_0}}%")
+alertcondition(exit_signal, title="청산 시그널", message="김치 프리미엄 청산 시그널 발생! 프리미엄: {{plot_0}}%")
+
+// ===========================
+// 사용 방법
+// ===========================
+// 1. TradingView에서 새 차트 열기
+// 2. Pine Editor 열기 (차트 하단)
+// 3. 이 코드 전체 복사/붙여넣기
+// 4. "Add to Chart" 클릭
+// 5. 설정에서 파라미터 조정 가능
+//
+// 차트 추천:
+// - UPBIT:BTCKRW (1시간 또는 4시간)
+// - 비교를 위해 BINANCE:BTCUSDT 추가 가능
+//
+// 주의사항:
+// - 실제 봇과 동일한 -0.5% / +0.5% 임계값 사용
+// - USDT 환율은 실시간이 아닌 고정값 사용
+// - 펀딩비는 포함되지 않음
+// - 분할 진입/청산은 구현되지 않음

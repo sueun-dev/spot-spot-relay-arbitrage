@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 """
 Comprehensive Exchange Testing
 Tests all exchanges (Upbit, Bithumb, OKX, Gate.io) for proper functionality
@@ -17,7 +21,6 @@ from src.exchanges.upbit import UpbitExchange
 from src.exchanges.bithumb import BithumbExchange
 from src.exchanges.okx import OKXExchange
 from src.exchanges.gate import GateExchange
-from src.utils.logger import logger
 import yaml
 
 load_dotenv()

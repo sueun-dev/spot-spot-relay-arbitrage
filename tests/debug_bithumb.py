@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 """
 Bithumb API Debug Script
 Detailed debugging for Bithumb v2.0 API connection issues
@@ -18,7 +22,6 @@ from urllib.parse import urlencode
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.utils.logger import logger
 
 load_dotenv()
 

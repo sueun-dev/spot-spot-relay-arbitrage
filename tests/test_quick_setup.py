@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 """
 Quick Setup Test - Consolidated test for initial setup verification
 Combines functionality from test_connections, test_simple, and test_step_by_step
@@ -13,7 +17,6 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.exchanges.connector import ExchangeConnector
-from src.utils.logger import logger
 
 load_dotenv()
 
