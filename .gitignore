@@ -1,17 +1,21 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.venv/
-venv/
-ENV/
-env/
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
 
-# uv
-.venv/
-uv.lock
+# Build artifacts
+kimp_arb_cpp/build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Logs and data
+logs/
+*.log
+data/*.json
 
 # IDE
 .vscode/
@@ -19,47 +23,26 @@ uv.lock
 *.swp
 *.swo
 *~
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
 
-# Project specific - IMPORTANT: Never commit these!
-.env
-.env.*
-.env.development
-.env.production
-*.log
-logs/
-*.db
-*.sqlite
-*.sqlite3
+# Node modules (dashboard)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
 
-# Testing
-.coverage
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-htmlcov/
-.tox/
-.nox/
-coverage.xml
-*.cover
-.hypothesis/
-
-# Distribution
-build/
-dist/
-*.egg-info/
-.eggs/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
 
 # Temporary files
-tmp/
-temp/
 *.tmp
-*.bak
-*.backup
-
-# Data files
-data/
-*.csv
-*.json
-!config.yaml
-!pyproject.toml
+*.temp
+/tmp/

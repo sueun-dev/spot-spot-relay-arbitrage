@@ -1,0 +1,63 @@
+# KIMP Arbitrage Bot Configuration
+# Kimchi Premium Arbitrage Trading Bot - C++ HFT Version
+
+trading:
+  max_positions: 3
+  position_size_usd: 50.0
+  split_orders: 2
+  order_size_usd: 25.0
+  order_interval_ms: 1000
+  entry_premium_threshold: -0.75   # Entry when premium <= -0.75%
+  exit_premium_threshold: 1.0      # Exit when premium >= +1%
+  max_price_diff_percent: 50.0
+  usdt_update_interval_ms: 180000  # 3 minutes
+
+exchanges:
+  upbit:
+    enabled: true
+    ws_endpoint: "wss://api.upbit.com/websocket/v1"
+    rest_endpoint: "https://api.upbit.com"
+    api_key: "${UPBIT_ACCESS_KEY}"
+    secret_key: "${UPBIT_SECRET_KEY}"
+
+  bithumb:
+    enabled: true
+    ws_endpoint: "wss://pubwss.bithumb.com/pub/ws"
+    rest_endpoint: "https://api.bithumb.com"
+    api_key: "${BITHUMB_API_KEY}"
+    secret_key: "${BITHUMB_SECRET_KEY}"
+
+  bybit:
+    enabled: true
+    ws_endpoint: "wss://stream.bybit.com/v5/public/linear"
+    ws_private_endpoint: "wss://stream.bybit.com/v5/private"
+    rest_endpoint: "https://api.bybit.com"
+    api_key: "${BYBIT_API_KEY}"
+    secret_key: "${BYBIT_SECRET_KEY}"
+
+  gateio:
+    enabled: true
+    ws_endpoint: "wss://fx-ws.gateio.ws/v4/ws/usdt"
+    rest_endpoint: "https://api.gateio.ws"
+    api_key: "${GATE_API_KEY}"
+    secret_key: "${GATE_SECRET_KEY}"
+
+threading:
+  io_threads: 4
+  market_data_threads: 1
+  strategy_threads: 1
+  order_exec_threads: 2
+  use_cpu_affinity: false
+
+logging:
+  level: info
+  file: "logs/kimp_bot.log"
+  max_size_mb: 100
+  max_files: 10
+  async_queue_size: 8192
+
+performance:
+  use_io_uring: false
+  preallocate_buffers: true
+  buffer_pool_size: 256
+  ring_buffer_size: 4096
