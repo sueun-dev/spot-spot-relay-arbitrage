@@ -7,42 +7,56 @@
 src/main.cpp
 ```
 프로그램 시작점. 전체 흐름을 파악할 수 있음:
-- Exchange 객체 생성
-- WebSocket 연결
-- ArbitrageEngine 실행
-- JSON export 루프
+- Bithumb/Bybit Exchange 객체 생성
+- WebSocket 연결 + 브로드캐스트 서버 (포트 8765)
+- ArbitrageEngine + OrderManager 실행
+- Crash recovery (포지션 영속성)
+- 콘솔 모니터 (10초마다 프리미엄 테이블)
 
 ### 2. 핵심 타입 정의
 ```
 include/kimp/core/types.hpp
 ```
-- `Exchange` enum (Upbit, Bithumb, Bybit, GateIO)
+- `Exchange` enum (Bithumb, Bybit, Upbit, GateIO)
 - `SymbolId`, `Position`, `Ticker` 구조체
-- `TradingConfig` 상수 (진입/청산 threshold 등)
+- `TradingConfig` 상수 (ENTRY=-0.75%, DYNAMIC_EXIT_SPREAD=0.79%)
 
 ### 3. 전략 엔진 (가장 중요)
 ```
 include/kimp/strategy/arbitrage_engine.hpp  ← 헤더 먼저
 src/strategy/arbitrage_engine.cpp           ← 구현체
 ```
-- `PriceCache` - 거래소별 가격 캐시
-- `PremiumCalculator` - 김프 계산 로직
-- `ArbitrageEngine` - 시그널 생성, 포지션 관리
+- `PriceCache` - 거래소별 가격 캐시 (shared_mutex + atomic)
+- `PremiumCalculator` - 김프 계산 (entry: ask/bid, exit: bid/ask)
+- `PositionTracker` - 16-slot 배열, atomic CAS
+- `CapitalTracker` - 복리 성장, 동적 포지션 사이징
+- `ArbitrageEngine` - event-driven 시그널 생성
 
-### 4. 거래소 구현체
+### 4. 주문 실행
 ```
-include/kimp/exchange/exchange_base.hpp  ← 인터페이스
-include/kimp/exchange/upbit/            ← 업비트
-include/kimp/exchange/bybit/            ← 바이비트
+include/kimp/execution/order_manager.hpp
+src/execution/order_manager.cpp
 ```
-- WebSocket 연결
-- Ticker 파싱
-- 주문 실행 (API 키 필요)
+- Adaptive split execution ($25 단위)
+- Futures-first 주문 (Bybit SHORT → Bithumb BUY)
+- Hedge accuracy: normalize_order_qty → actual_filled → 동일 수량
+- 청산 중 재진입 (adaptive exit/re-entry)
 
-### 5. 메모리/네트워크 인프라
+### 5. 거래소 구현체
 ```
-include/kimp/memory/ring_buffer.hpp     ← Lock-free 큐
-include/kimp/network/websocket_client.hpp
+include/kimp/exchange/exchange_base.hpp     ← 인터페이스
+include/kimp/exchange/bithumb/bithumb.hpp   ← 빗썸 (주력)
+include/kimp/exchange/bybit/bybit.hpp       ← 바이비트 (주력)
+src/exchange/bithumb.cpp
+src/exchange/bybit.cpp
+```
+
+### 6. 인프라
+```
+include/kimp/memory/ring_buffer.hpp         ← Lock-free 큐
+include/kimp/network/websocket_client.hpp   ← Beast/Asio WebSocket
+include/kimp/network/ws_broadcast_server.hpp ← 대시보드 브로드캐스트
+include/kimp/core/simd_premium.hpp          ← AVX2/NEON SIMD 배치 계산
 ```
 
 ---
@@ -52,40 +66,17 @@ include/kimp/network/websocket_client.hpp
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Main Strategy Thread                      │
-│         (Premium Calculation + Signal Generation)            │
+│   (Event-driven: on_ticker_update → premium → signal)       │
 └─────────────────────────────────────────────────────────────┘
                               ▲
                               │ Lock-free queues
         ┌─────────────────────┼─────────────────────┐
         │                     │                     │
 ┌───────┴───────┐    ┌───────┴───────┐    ┌───────┴───────┐
-│  I/O Threads  │    │  Market Data  │    │  Order Exec   │
-│  (WebSocket)  │    │   Aggregator  │    │    Thread     │
-│  4 exchanges  │    │               │    │               │
+│  I/O Threads  │    │   Background  │    │  Order Exec   │
+│  (WebSocket)  │    │   Refresh     │    │    Thread     │
+│  Bithumb+Bybit│    │  5min/60sec   │    │  Adaptive $25 │
 └───────────────┘    └───────────────┘    └───────────────┘
-```
-
----
-
-## 핵심 로직 흐름
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  main.cpp                                               │
-│  ├── UpbitExchange, BybitExchange 생성                  │
-│  ├── ArbitrageEngine에 등록                             │
-│  ├── WebSocket 연결 (ticker 구독)                       │
-│  └── 매초 export_to_json() → dashboard가 읽음           │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  ArbitrageEngine                                        │
-│  ├── on_ticker_update() ← 거래소에서 가격 수신          │
-│  ├── PriceCache에 저장                                  │
-│  ├── Premium 계산: (한국가 - 해외가*환율) / 해외가*환율 │
-│  └── Entry ≤ -1%, Exit ≥ +1% 시그널 생성               │
-└─────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -105,8 +96,8 @@ double premium = ((korean_bid - foreign_ask * usdt_krw) / (foreign_ask * usdt_kr
 ```
 
 ### 트레이딩 조건
-- **Entry**: Premium ≤ -1.0% AND Funding Rate ≥ 0
-- **Exit**: Premium ≥ +1.0%
+- **Entry**: Premium ≤ -0.75% AND 8h Funding AND Funding Rate > 0
+- **Exit**: Dynamic (entry_premium + 0.79% = 0.19% fees + 0.60% profit)
 
 ---
 
@@ -132,23 +123,22 @@ static bool should_enter(double premium, double funding_rate);
 static bool should_exit(double premium);
 ```
 
-### ArbitrageEngine
-- 가격 캐시 관리
-- 포지션 추적
-- 시그널 생성
-- JSON export (대시보드용)
-
 ### PositionTracker
-- 최대 3개 동시 포지션
-- 포지션 열기/닫기
-- 활성 포지션 조회
+- 최대 1~4개 동시 포지션 (런타임 설정)
+- Atomic CAS 기반 포지션 열기/닫기
+- 16-slot 배열, symbol hash collision safety
+
+### CapitalTracker
+- 복리 성장 (초기 $2000)
+- 동적 포지션 사이징 (최대 $250/side)
+- Win rate, total trades 추적
 
 ---
 
 ## 빠르게 파악하려면
 
 1. **types.hpp** - 5분 훑어보기
-2. **arbitrage_engine.hpp** - `PremiumCalculator` 클래스 집중
+2. **arbitrage_engine.hpp** - `PriceCache`, `PremiumCalculator` 집중
 3. **main.cpp** - 실행 흐름 따라가기
 
 이 세 파일만 읽으면 전체 구조가 잡힘.
@@ -159,20 +149,21 @@ static bool should_exit(double premium);
 
 ```
 kimp_arb_cpp/
-├── CMakeLists.txt
-├── conanfile.txt
+├── CMakeLists.txt              # 빌드 시스템 (C++20, 14 executables)
 ├── include/kimp/
-│   ├── core/          # types, config, logger
-│   ├── memory/        # ring_buffer, object_pool
-│   ├── network/       # websocket_client, ssl
-│   ├── exchange/      # upbit, bithumb, bybit, gateio
-│   ├── data/          # market_data, orderbook, ticker
-│   ├── strategy/      # arbitrage_engine, premium_calc
-│   └── execution/     # order_manager
-├── src/
-├── config/
-├── data/              # JSON export (dashboard용)
-└── tests/
+│   ├── core/                   # types, config, logger, optimization, simd_premium
+│   ├── memory/                 # ring_buffer
+│   ├── network/                # websocket_client, ws_broadcast_server, connection_pool
+│   ├── exchange/               # exchange_base, bithumb/, bybit/, upbit/, gateio/
+│   ├── strategy/               # arbitrage_engine
+│   ├── execution/              # order_manager
+│   └── utils/                  # crypto (HMAC/JWT)
+├── src/                        # 구현체 (.cpp)
+├── tests/                      # 14개 테스트 (unit + integration + live)
+│   └── integration/            # diag_trade
+├── config/                     # config.yaml
+├── docs/                       # OPTIMIZATION.md
+└── third_party/                # jwt-cpp (header-only)
 ```
 
 ---
@@ -180,8 +171,8 @@ kimp_arb_cpp/
 ## 빌드 & 실행
 
 ```bash
-# 의존성 설치
-conan install . --output-folder=build --build=missing
+# 의존성 설치 (macOS)
+brew install boost openssl@3 simdjson spdlog fmt yaml-cpp
 
 # 빌드
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -189,32 +180,14 @@ cmake --build build -j$(nproc)
 
 # 실행
 ./build/kimp_bot --config config/config.yaml
+./build/kimp_bot -m   # 모니터 모드
 ```
 
 ---
 
 ## Dashboard 연동
 
-C++ 봇이 `data/premiums.json`에 매초 데이터 export:
-```json
-{
-  "status": {
-    "connected": true,
-    "upbitConnected": true,
-    "bybitConnected": true,
-    "lastUpdate": 1706842800000
-  },
-  "premiums": [
-    {
-      "symbol": "BTC",
-      "koreanPrice": 95000000,
-      "foreignPrice": 64500.5,
-      "usdtRate": 1450.0,
-      "premium": 1.52,
-      "signal": "EXIT"
-    }
-  ]
-}
-```
+C++ 봇이 `data/premiums.json`에 200ms마다 데이터 export.
+WebSocket 브로드캐스트 서버 (포트 8765)로 50ms 간격 실시간 전송.
 
-Next.js 대시보드가 이 파일을 읽어서 화면에 표시.
+Next.js 대시보드 (`dashboard/`)가 이 데이터를 읽어서 화면에 표시.

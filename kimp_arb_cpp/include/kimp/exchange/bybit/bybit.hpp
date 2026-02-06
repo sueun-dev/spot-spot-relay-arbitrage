@@ -25,6 +25,16 @@ private:
 
     // Cache funding intervals (symbol -> interval in hours) from instruments-info
     std::unordered_map<std::string, int> funding_interval_cache_;
+    struct LotSize {
+        double min_qty{0.0};
+        double qty_step{0.0};
+        double min_notional{0.0};
+    };
+    std::unordered_map<std::string, LotSize> lot_size_cache_;
+
+    // Store subscribed symbols for reconnection
+    std::vector<SymbolId> subscribed_tickers_;
+    std::mutex subscription_mutex_;
 
 public:
     BybitExchange(net::io_context& ioc, ExchangeCredentials creds)
@@ -65,7 +75,9 @@ private:
         const std::string& params = "") const;
 
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
-    bool parse_order_response(const std::string& response, Order& order);
+    bool parse_order_response(const std::string& response, Order& order, std::string* order_id_out = nullptr);
+    bool query_order_fill(const std::string& order_id, Order& order);
+    double normalize_order_qty(const SymbolId& symbol, double qty, bool is_open) const;
 
     std::string symbol_to_bybit(const SymbolId& symbol) const {
         return std::string(symbol.get_base()) + std::string(symbol.get_quote());

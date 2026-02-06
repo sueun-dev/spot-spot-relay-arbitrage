@@ -303,17 +303,39 @@ struct ExitSignal {
 
 // Trading configuration (compile-time constants for HFT)
 struct TradingConfig {
-    static constexpr int MAX_POSITIONS = 1;
-    static constexpr double POSITION_SIZE_USD = 1000.0;      // $1,000 per position
-    static constexpr double ORDER_SIZE_USD = 30.0;           // $30 per split
-    static constexpr int SPLIT_ORDERS = 34;                  // 1000 / 30 ≈ 34 splits
-    static constexpr int ORDER_INTERVAL_MS = 1000;           // 1 second between splits
+    // ==========================================================================
+    // 병렬 포지션 관리: 조건 만족하는 모든 코인에 동시 진입, 개별 청산
+    // ==========================================================================
+    static inline int MAX_POSITIONS = 1;                       // 최대 동시 포지션 수 (런타임 설정, 1~4)
+    static constexpr double POSITION_SIZE_USD = 250.0;        // $250 per side (총 $500 per position)
+    static constexpr double ORDER_SIZE_USD = 25.0;            // $25 per split
+    static constexpr int SPLIT_ORDERS = 10;                   // 250 / 25 = 10 splits
+    static constexpr int ORDER_INTERVAL_MS = 1000;            // 1 second between splits
+
+    // Entry threshold
     static constexpr double ENTRY_PREMIUM_THRESHOLD = -0.75;  // Entry when premium <= -0.75%
-    static constexpr double EXIT_PREMIUM_THRESHOLD = 1.0;    // Exit when premium >= +1.0%
+
+    // Fee structure (bid/ask spread already in premium calc, slippage ~0 at $25 splits)
+    static constexpr double BITHUMB_FEE_PCT = 0.04;           // Per trade (buy or sell)
+    static constexpr double BYBIT_FEE_PCT = 0.055;            // Per trade (short or cover)
+    static constexpr double ROUND_TRIP_FEE_PCT = (BITHUMB_FEE_PCT + BYBIT_FEE_PCT) * 2;  // 0.19%
+    static constexpr double MIN_NET_PROFIT_PCT = 0.60;         // 순수익 목표 0.6%
+    static constexpr double DYNAMIC_EXIT_SPREAD = ROUND_TRIP_FEE_PCT + MIN_NET_PROFIT_PCT; // 0.79%
+    // Dynamic exit: exit_pm >= entry_pm + 0.79%
+    // e.g., entry -0.75% → exit >= +0.04%
+    // e.g., entry -1.00% → exit >= -0.21%
+
+    // Fallback fixed exit threshold (used when no position entry_premium available)
+    static constexpr double EXIT_PREMIUM_THRESHOLD = 0.04;    // Conservative fallback
+
+    // Entry filters
+    static constexpr int MIN_FUNDING_INTERVAL_HOURS = 8;      // Only 8h funding coins
+    static constexpr bool REQUIRE_POSITIVE_FUNDING = true;    // Only positive funding rate
+
     static constexpr double MAX_PRICE_DIFF_PERCENT = 50.0;
-    static constexpr int USDT_UPDATE_INTERVAL_MS = 180000;   // 3 minutes
+    static constexpr int USDT_UPDATE_INTERVAL_MS = 180000;    // 3 minutes
     static constexpr double DEFAULT_USDT_KRW = 1380.0;
-    static constexpr double MIN_ORDER_KRW = 5000.0;          // Minimum order in KRW
+    static constexpr double MIN_ORDER_KRW = 5000.0;           // Minimum order in KRW
 };
 
 // Callback types

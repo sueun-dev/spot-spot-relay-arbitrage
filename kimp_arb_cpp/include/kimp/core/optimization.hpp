@@ -11,7 +11,9 @@
 #include <charconv>
 #include <string_view>
 #include <cstdlib>
-#include <immintrin.h>  // For _mm_pause
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>  // For _mm_pause (x86 only)
+#endif
 
 #ifdef __linux__
 #include <pthread.h>

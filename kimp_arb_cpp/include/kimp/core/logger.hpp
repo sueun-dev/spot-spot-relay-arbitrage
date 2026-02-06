@@ -12,7 +12,7 @@ namespace kimp {
 
 class Logger {
 public:
-    static void init(const std::string& log_file = "logs/kimp_bot.log",
+    static bool init(const std::string& log_file = "logs/kimp_bot.log",
                      const std::string& level = "info",
                      int max_size_mb = 100,
                      int max_files = 10,
@@ -33,10 +33,12 @@ public:
                 sinks.push_back(console_sink);
             }
             sinks.push_back(file_sink);
+
+            // overrun_oldest: drop oldest log instead of blocking the hot path
             auto logger = std::make_shared<spdlog::async_logger>(
                 "kimp", sinks.begin(), sinks.end(),
                 spdlog::thread_pool(),
-                spdlog::async_overflow_policy::block);
+                spdlog::async_overflow_policy::overrun_oldest);
 
             // Set pattern with microseconds
             logger->set_pattern("[%Y-%m-%d %H:%M:%S.%f] [%^%l%$] [%t] %v");
@@ -53,10 +55,14 @@ public:
             // Register as default logger
             spdlog::set_default_logger(logger);
             spdlog::flush_every(std::chrono::seconds(1));
+            // Flush immediately on warn+ to ensure critical messages are persisted
+            spdlog::flush_on(spdlog::level::warn);
 
             spdlog::info("Logger initialized - level: {}, file: {}", level, log_file);
+            return true;
         } catch (const spdlog::spdlog_ex& ex) {
             std::cerr << "Logger initialization failed: " << ex.what() << std::endl;
+            return false;
         }
     }
 

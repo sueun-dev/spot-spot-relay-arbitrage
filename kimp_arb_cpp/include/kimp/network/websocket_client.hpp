@@ -80,8 +80,9 @@ private:
     alignas(64) std::atomic<ConnectionState> state_{ConnectionState::Disconnected};
     alignas(64) std::atomic<bool> should_reconnect_{true};
     std::atomic<int> reconnect_attempts_{0};  // Same cache line as should_reconnect_ (both infrequent)
-    static constexpr int MAX_RECONNECT_ATTEMPTS = 10;
+    static constexpr int MAX_RECONNECT_ATTEMPTS = 0;  // 0 = unlimited (never give up)
     static constexpr int RECONNECT_DELAY_MS = 1000;
+    static constexpr int RECONNECT_MAX_DELAY_MS = 30000;  // Cap delay at 30 seconds
     static constexpr int PING_INTERVAL_MS = 30000;
 
     // Buffers - cache-line aligned for write path

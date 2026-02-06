@@ -11,6 +11,8 @@
 #include <memory>
 #include <future>
 #include <thread>
+#include <unordered_set>
+#include <mutex>
 
 namespace kimp::execution {
 
@@ -49,7 +51,7 @@ private:
 
     // Execution thread
     std::thread exec_thread_;
-    std::atomic<bool> running_{false};
+    std::atomic<bool> running_{true};
 
 public:
     OrderManager() = default;
@@ -75,7 +77,34 @@ public:
     // 2. SELL on Bithumb (same amount)
     ExecutionResult execute_exit_futures_first(const ExitSignal& signal, const Position& position);
 
+    // Pre-set leverage to 1x for all tradable symbols at startup
+    void pre_set_leverage(const std::vector<SymbolId>& symbols);
+
+    // Request graceful shutdown of any running adaptive loops
+    void request_shutdown() { running_.store(false, std::memory_order_release); }
+
+    // =========================================================================
+    // SAFETY CHECK - Prevent trading coins with existing external positions
+    // =========================================================================
+    // Check if we already have positions outside the bot's tracking
+    // (e.g., manually bought spot or existing futures positions)
+    // Returns true if safe to trade, false if should skip
+    bool is_safe_to_trade(const SymbolId& symbol, Exchange korean_ex, Exchange foreign_ex);
+
+    // Position update callback for crash recovery persistence
+    // Called with non-null Position* after each split (save), nullptr on full exit (delete)
+    using PositionUpdateCallback = std::function<void(const Position*)>;
+    void set_position_update_callback(PositionUpdateCallback cb) { on_position_update_ = std::move(cb); }
+
+    // Build external position blacklist at startup (checks all trading symbols)
+    void refresh_external_positions(const std::vector<SymbolId>& symbols);
+
 private:
+    PositionUpdateCallback on_position_update_;
+    // External position blacklist (symbols we shouldn't trade)
+    // Built once at startup, checked with O(1) lookup
+    std::unordered_set<SymbolId> external_position_blacklist_;
+    std::mutex blacklist_mutex_;
     // Get typed exchange
     KoreanExchangePtr get_korean_exchange(Exchange ex);
     FuturesExchangePtr get_futures_exchange(Exchange ex);
@@ -84,7 +113,7 @@ private:
     ExecutionResult execute_split_entry(const ArbitrageSignal& signal);
 
     // Single order execution helpers
-    Order execute_korean_buy(Exchange ex, const SymbolId& symbol, double krw_amount);
+    Order execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount);
     Order execute_foreign_short(Exchange ex, const SymbolId& symbol, double quantity);
     Order execute_korean_sell(Exchange ex, const SymbolId& symbol, double quantity);
     Order execute_foreign_cover(Exchange ex, const SymbolId& symbol, double quantity);

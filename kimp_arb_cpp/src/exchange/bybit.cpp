@@ -4,6 +4,26 @@
 
 #include <sstream>
 #include <iomanip>
+#include <cstdlib>
+#include <limits>
+#include <cmath>
+
+namespace {
+bool use_hedge_mode() {
+    static int cached = -1;
+    if (cached != -1) {
+        return cached == 1;
+    }
+    const char* env = std::getenv("BYBIT_HEDGE_MODE");
+    if (!env || env[0] == '\0') {
+        cached = 0;
+        return false;
+    }
+    char c = env[0];
+    cached = (c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y' || c == 'o' || c == 'O') ? 1 : 0;
+    return cached == 1;
+}
+} // namespace
 
 namespace kimp::exchange::bybit {
 
@@ -56,6 +76,12 @@ void BybitExchange::disconnect() {
 }
 
 void BybitExchange::subscribe_ticker(const std::vector<SymbolId>& symbols) {
+    // Store symbols for reconnection
+    {
+        std::lock_guard lock(subscription_mutex_);
+        subscribed_tickers_ = symbols;
+    }
+
     if (!ws_client_ || !ws_client_->is_connected()) {
         Logger::error("[Bybit] Cannot subscribe, not connected");
         return;
@@ -126,6 +152,30 @@ std::vector<SymbolId> BybitExchange::get_available_symbols() {
                     int interval_hours = interval_minutes / 60;
                     if (interval_hours == 0) interval_hours = 8;  // Default for delivery contracts
                     funding_interval_cache_[std::string(symbol_str)] = interval_hours;
+                }
+
+                // Cache lot size filters
+                auto lot = item["lotSizeFilter"];
+                if (!lot.error()) {
+                    LotSize info;
+                    auto min_qty = lot["minOrderQty"];
+                    if (!min_qty.error()) {
+                        info.min_qty = opt::fast_stod(min_qty.get_string().value());
+                    }
+                    auto step = lot["qtyStep"];
+                    if (!step.error()) {
+                        info.qty_step = opt::fast_stod(step.get_string().value());
+                    }
+                    auto min_amt = lot["minOrderAmt"];
+                    if (!min_amt.error()) {
+                        info.min_notional = opt::fast_stod(min_amt.get_string().value());
+                    }
+                    auto min_notional = lot["minNotionalValue"];
+                    if (!min_notional.error()) {
+                        info.min_notional = std::max(info.min_notional,
+                                                     opt::fast_stod(min_notional.get_string().value()));
+                    }
+                    lot_size_cache_[std::string(symbol_str)] = info;
                 }
             }
         }
@@ -262,7 +312,11 @@ Order BybitExchange::place_market_order(const SymbolId& symbol, Side side, Quant
         return order;
     }
 
-    parse_order_response(response.body, order);
+    std::string order_id_str;
+    parse_order_response(response.body, order, &order_id_str);
+    if (order.status == OrderStatus::Filled && !order_id_str.empty()) {
+        query_order_fill(order_id_str, order);
+    }
     return order;
 }
 
@@ -272,7 +326,13 @@ Order BybitExchange::open_short(const SymbolId& symbol, Quantity quantity) {
     order.symbol = symbol;
     order.side = Side::Sell;
     order.type = OrderType::Market;
-    order.quantity = quantity;
+    double adj_qty = normalize_order_qty(symbol, quantity, true);
+    if (adj_qty <= 0.0) {
+        order.status = OrderStatus::Rejected;
+        Logger::warn("[Bybit] Short open qty invalid after lot size check: {} {}", symbol.to_string(), quantity);
+        return order;
+    }
+    order.quantity = adj_qty;
     order.client_order_id = generate_order_id();
     order.create_time = std::chrono::system_clock::now();
 
@@ -281,8 +341,10 @@ Order BybitExchange::open_short(const SymbolId& symbol, Quantity quantity) {
     body << R"("symbol":")" << symbol_to_bybit(symbol) << R"(",)";
     body << R"("side":"Sell",)";
     body << R"("orderType":"Market",)";
-    body << R"("qty":")" << std::fixed << std::setprecision(8) << quantity << R"(",)";
-    body << R"("positionIdx":)" << SHORT_POSITION_IDX << R"(,)";
+    body << R"("qty":")" << std::fixed << std::setprecision(8) << adj_qty << R"(",)";
+    if (use_hedge_mode()) {
+        body << R"("positionIdx":)" << SHORT_POSITION_IDX << R"(,)";
+    }
     body << R"("reduceOnly":false})";
 
     std::string body_str = body.str();
@@ -296,9 +358,14 @@ Order BybitExchange::open_short(const SymbolId& symbol, Quantity quantity) {
         return order;
     }
 
-    parse_order_response(response.body, order);
-    Logger::info("[Bybit] Opened short {} {} - Status: {}",
-                 symbol.to_string(), quantity, static_cast<int>(order.status));
+    std::string order_id_str;
+    parse_order_response(response.body, order, &order_id_str);
+    if (order.status == OrderStatus::Filled && !order_id_str.empty()) {
+        query_order_fill(order_id_str, order);
+    }
+    Logger::info("[Bybit] Opened short {} {} - Status: {}, avgPrice: {:.8f}, filledQty: {:.8f}",
+                 symbol.to_string(), adj_qty, static_cast<int>(order.status),
+                 order.average_price, order.filled_quantity);
     return order;
 }
 
@@ -308,7 +375,13 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
     order.symbol = symbol;
     order.side = Side::Buy;
     order.type = OrderType::Market;
-    order.quantity = quantity;
+    double adj_qty = normalize_order_qty(symbol, quantity, false);
+    if (adj_qty <= 0.0) {
+        order.status = OrderStatus::Rejected;
+        Logger::warn("[Bybit] Short close qty invalid after lot size check: {} {}", symbol.to_string(), quantity);
+        return order;
+    }
+    order.quantity = adj_qty;
     order.client_order_id = generate_order_id();
     order.create_time = std::chrono::system_clock::now();
 
@@ -317,8 +390,10 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
     body << R"("symbol":")" << symbol_to_bybit(symbol) << R"(",)";
     body << R"("side":"Buy",)";
     body << R"("orderType":"Market",)";
-    body << R"("qty":")" << std::fixed << std::setprecision(8) << quantity << R"(",)";
-    body << R"("positionIdx":)" << SHORT_POSITION_IDX << R"(,)";
+    body << R"("qty":")" << std::fixed << std::setprecision(8) << adj_qty << R"(",)";
+    if (use_hedge_mode()) {
+        body << R"("positionIdx":)" << SHORT_POSITION_IDX << R"(,)";
+    }
     body << R"("reduceOnly":true})";
 
     std::string body_str = body.str();
@@ -332,10 +407,50 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
         return order;
     }
 
-    parse_order_response(response.body, order);
-    Logger::info("[Bybit] Closed short {} {} - Status: {}",
-                 symbol.to_string(), quantity, static_cast<int>(order.status));
+    std::string order_id_str;
+    parse_order_response(response.body, order, &order_id_str);
+    if (order.status == OrderStatus::Filled && !order_id_str.empty()) {
+        query_order_fill(order_id_str, order);
+    }
+    Logger::info("[Bybit] Closed short {} {} - Status: {}, avgPrice: {:.8f}, filledQty: {:.8f}",
+                 symbol.to_string(), adj_qty, static_cast<int>(order.status),
+                 order.average_price, order.filled_quantity);
     return order;
+}
+
+double BybitExchange::normalize_order_qty(const SymbolId& symbol, double qty, bool is_open) const {
+    if (qty <= 0.0) return 0.0;
+    const std::string key = symbol_to_bybit(symbol);
+    auto it = lot_size_cache_.find(key);
+    if (it == lot_size_cache_.end()) {
+        return qty;
+    }
+
+    double step = it->second.qty_step > 0.0 ? it->second.qty_step : 0.0;
+    double min_qty = it->second.min_qty;
+    double min_notional = it->second.min_notional;
+
+    if (step > 0.0) {
+        qty = std::floor(qty / step) * step;
+    }
+    if (qty < min_qty) {
+        return 0.0;
+    }
+
+    double price_hint = 0.0;
+    auto cached = get_cached_ticker(symbol);
+    if (cached) {
+        if (is_open) {
+            price_hint = cached->bid > 0 ? cached->bid : cached->last;
+        } else {
+            price_hint = cached->ask > 0 ? cached->ask : cached->last;
+        }
+    }
+    if (min_notional > 0.0 && price_hint > 0.0 && qty * price_hint < min_notional) {
+        return 0.0;
+    }
+
+    return qty;
 }
 
 bool BybitExchange::cancel_order(uint64_t order_id) {
@@ -468,6 +583,18 @@ void BybitExchange::on_ws_message(std::string_view message) {
 void BybitExchange::on_ws_connected() {
     connected_ = true;
     Logger::info("[Bybit] WebSocket connected");
+
+    // Resubscribe to tickers after reconnection
+    std::vector<SymbolId> symbols_to_subscribe;
+    {
+        std::lock_guard lock(subscription_mutex_);
+        symbols_to_subscribe = subscribed_tickers_;
+    }
+
+    if (!symbols_to_subscribe.empty()) {
+        Logger::info("[Bybit] Resubscribing to {} tickers after reconnection", symbols_to_subscribe.size());
+        subscribe_ticker(symbols_to_subscribe);
+    }
 }
 
 void BybitExchange::on_ws_disconnected() {
@@ -512,6 +639,8 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
 
         ticker.exchange = Exchange::Bybit;
         ticker.timestamp = std::chrono::steady_clock::now();
+        ticker.funding_rate = std::numeric_limits<double>::quiet_NaN();
+        ticker.next_funding_time = 0;
 
         std::string_view symbol_str = data["symbol"].get_string().value();
         if (symbol_str.size() > 4) {
@@ -552,9 +681,10 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
     }
 }
 
-bool BybitExchange::parse_order_response(const std::string& response, Order& order) {
+bool BybitExchange::parse_order_response(const std::string& response, Order& order, std::string* order_id_out) {
+    Logger::debug("[Bybit] Order raw response: {}", response);
+
     try {
-        // Use padded_string to satisfy simdjson's padding requirement
         simdjson::padded_string padded_response(response);
         auto doc = json_parser_.iterate(padded_response);
 
@@ -565,6 +695,10 @@ bool BybitExchange::parse_order_response(const std::string& response, Order& ord
             auto result = doc["result"];
             std::string_view order_id = result["orderId"].get_string().value();
             order.exchange_order_id = std::hash<std::string_view>{}(order_id);
+
+            if (order_id_out) {
+                *order_id_out = std::string(order_id);
+            }
         } else {
             order.status = OrderStatus::Rejected;
             std::string_view msg = doc["retMsg"].get_string().value();
@@ -577,6 +711,77 @@ bool BybitExchange::parse_order_response(const std::string& response, Order& ord
         order.status = OrderStatus::Rejected;
         return false;
     }
+}
+
+bool BybitExchange::query_order_fill(const std::string& order_id, Order& order) {
+    constexpr int MAX_RETRIES = 5;
+    constexpr int BASE_DELAY_MS = 300;  // 300, 600, 1200, 2400ms backoff
+
+    std::string endpoint = "/v5/order/realtime?category=linear&orderId=" + order_id;
+
+    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+        if (attempt > 0) {
+            int delay = BASE_DELAY_MS * (1 << (attempt - 1));  // exponential backoff
+            Logger::warn("[Bybit] Fill query retry {}/{} for order {} (wait {}ms)",
+                         attempt + 1, MAX_RETRIES, order_id, delay);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        }
+
+        auto headers = build_auth_headers();
+        auto response = rest_client_->get(endpoint, headers);
+
+        if (!response.success) {
+            Logger::warn("[Bybit] Failed to query order fill: {}", response.error);
+            continue;
+        }
+
+        Logger::debug("[Bybit] Fill query raw: {}", response.body);
+
+        try {
+            simdjson::ondemand::parser local_parser;
+            simdjson::padded_string padded(response.body);
+            auto doc = local_parser.iterate(padded);
+
+            int ret_code = static_cast<int>(doc["retCode"].get_int64().value());
+            if (ret_code != 0) {
+                Logger::warn("[Bybit] Order fill query error, retCode: {}", ret_code);
+                continue;
+            }
+
+            auto list = doc["result"]["list"].get_array();
+            for (auto item : list) {
+                auto avg_price = item["avgPrice"];
+                if (!avg_price.error()) {
+                    std::string_view p = avg_price.get_string().value();
+                    double price = opt::fast_stod(p);
+                    if (price > 0) order.average_price = price;
+                }
+                auto cum_qty = item["cumExecQty"];
+                if (!cum_qty.error()) {
+                    std::string_view q = cum_qty.get_string().value();
+                    double qty = opt::fast_stod(q);
+                    if (qty > 0) order.filled_quantity = qty;
+                }
+
+                if (order.average_price > 0 && order.filled_quantity > 0) {
+                    Logger::info("[Bybit] Fill: orderId={}, avgPrice={:.8f}, filledQty={:.8f}",
+                                 order_id, order.average_price, order.filled_quantity);
+                    return true;
+                }
+                break;  // Only check first result
+            }
+
+            // List empty or avgPrice=0 — order may not be settled yet
+            Logger::warn("[Bybit] Order {} fill data incomplete, attempt {}/{}",
+                         order_id, attempt + 1, MAX_RETRIES);
+        } catch (const simdjson::simdjson_error& e) {
+            Logger::warn("[Bybit] Failed to parse order fill: {}", e.what());
+        }
+    }
+
+    Logger::error("[Bybit] Failed to get fill price after {} retries for order {}",
+                  MAX_RETRIES, order_id);
+    return false;
 }
 
 } // namespace kimp::exchange::bybit

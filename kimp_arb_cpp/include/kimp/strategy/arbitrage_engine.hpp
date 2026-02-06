@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -37,7 +38,6 @@ public:
     };
 
 private:
-    // Key: "EXCHANGE:BASE/QUOTE" (e.g., "Bybit:BTC/USDT")
     struct PriceEntry {
         std::atomic<double> bid{0.0};
         std::atomic<double> ask{0.0};
@@ -48,29 +48,37 @@ private:
         std::atomic<uint64_t> timestamp{0};
     };
 
-    // Use string key for guaranteed uniqueness (no hash collisions)
+    // Zero-allocation composite key (exchange + symbol)
+    struct PriceKey {
+        uint8_t exchange;
+        SymbolId symbol;
+
+        bool operator==(const PriceKey& other) const noexcept {
+            return exchange == other.exchange && symbol == other.symbol;
+        }
+    };
+
+    struct PriceKeyHash {
+        size_t operator()(const PriceKey& k) const noexcept {
+            // Mix exchange into symbol hash (golden ratio hash for exchange bits)
+            return (static_cast<size_t>(k.exchange) * 2654435761u) ^ k.symbol.hash();
+        }
+    };
+
+    static PriceKey make_key(Exchange ex, const SymbolId& symbol) noexcept {
+        return {static_cast<uint8_t>(ex), symbol};
+    }
+
     mutable std::shared_mutex mutex_;
-    std::unordered_map<std::string, PriceEntry> prices_;
+    std::unordered_map<PriceKey, PriceEntry, PriceKeyHash> prices_;
 
     // USDT/KRW prices
     std::atomic<double> usdt_krw_upbit_{0.0};
     std::atomic<double> usdt_krw_bithumb_{0.0};
 
-    // Create unique key from exchange and symbol
-    static std::string make_key(Exchange ex, const SymbolId& symbol) {
-        std::string key;
-        key.reserve(32);
-        key += std::to_string(static_cast<int>(ex));
-        key += ':';
-        key += symbol.get_base();
-        key += '/';
-        key += symbol.get_quote();
-        return key;
-    }
-
 public:
     void update(Exchange ex, const SymbolId& symbol, double bid, double ask, double last) {
-        std::string key = make_key(ex, symbol);
+        PriceKey key = make_key(ex, symbol);
 
         {
             std::shared_lock read_lock(mutex_);
@@ -88,7 +96,7 @@ public:
             }
         }
 
-        // Slow path: need to create entry
+        // Slow path: need to create entry (only at startup)
         std::unique_lock write_lock(mutex_);
         auto& entry = prices_[key];
         entry.bid.store(bid, std::memory_order_relaxed);
@@ -102,7 +110,7 @@ public:
 
     void update_funding(Exchange ex, const SymbolId& symbol, double funding_rate,
                         int interval_hours, uint64_t next_funding_time) {
-        std::string key = make_key(ex, symbol);
+        PriceKey key = make_key(ex, symbol);
 
         {
             std::shared_lock read_lock(mutex_);
@@ -131,7 +139,7 @@ public:
     }
 
     PriceData get_price(Exchange ex, const SymbolId& symbol) const {
-        std::string key = make_key(ex, symbol);
+        PriceKey key = make_key(ex, symbol);
 
         std::shared_lock lock(mutex_);
         auto it = prices_.find(key);
@@ -161,13 +169,15 @@ public:
         return TradingConfig::DEFAULT_USDT_KRW;
     }
 
-    // Debug: get all stored symbols for an exchange
+    // Debug: get all stored symbols
     std::vector<std::string> get_all_keys() const {
         std::shared_lock lock(mutex_);
         std::vector<std::string> keys;
         keys.reserve(prices_.size());
         for (const auto& [key, _] : prices_) {
-            keys.push_back(key);
+            keys.push_back(std::to_string(key.exchange) + ":" +
+                           std::string(key.symbol.get_base()) + "/" +
+                           std::string(key.symbol.get_quote()));
         }
         return keys;
     }
@@ -201,12 +211,16 @@ public:
                static_cast<int>(TradingConfig::MAX_POSITIONS);
     }
 
-    bool has_position(const SymbolId& symbol) const noexcept {
+    bool has_position(const SymbolId& symbol) const {
         uint64_t hash = symbol.hash();
         for (const auto& slot : positions_) {
             if (slot.active.load(std::memory_order_acquire) &&
                 slot.symbol_hash.load(std::memory_order_acquire) == hash) {
-                return true;
+                std::lock_guard lock(slot.mutex);
+                if (slot.active.load(std::memory_order_relaxed) &&
+                    slot.position.symbol == symbol) {
+                    return true;
+                }
             }
         }
         return false;
@@ -216,12 +230,16 @@ public:
         return position_count_.load(std::memory_order_acquire) > 0;
     }
 
-    const Position* get_position(const SymbolId& symbol) const noexcept {
+    const Position* get_position(const SymbolId& symbol) const {
         uint64_t hash = symbol.hash();
         for (const auto& slot : positions_) {
             if (slot.active.load(std::memory_order_acquire) &&
                 slot.symbol_hash.load(std::memory_order_acquire) == hash) {
-                return &slot.position;
+                std::lock_guard lock(slot.mutex);
+                if (slot.active.load(std::memory_order_relaxed) &&
+                    slot.position.symbol == symbol) {
+                    return &slot.position;
+                }
             }
         }
         return nullptr;
@@ -248,6 +266,10 @@ public:
             if (slot.active.load(std::memory_order_acquire) &&
                 slot.symbol_hash.load(std::memory_order_acquire) == hash) {
                 std::lock_guard lock(slot.mutex);
+                if (!slot.active.load(std::memory_order_relaxed) ||
+                    slot.position.symbol != symbol) {
+                    continue;
+                }
                 closed = slot.position;
                 slot.active.store(false, std::memory_order_release);
                 position_count_.fetch_sub(1, std::memory_order_release);
@@ -270,6 +292,114 @@ public:
             }
         }
         return result;
+    }
+};
+
+/**
+ * Capital tracker for compound growth
+ * Tracks total capital and calculates dynamic position sizes
+ */
+class CapitalTracker {
+private:
+    std::atomic<double> initial_capital_{2000.0};     // Starting capital in USD
+    std::atomic<double> realized_pnl_usd_{0.0};       // Accumulated P&L in USD
+    std::atomic<int> total_trades_{0};                 // Total trades closed
+    std::atomic<int> winning_trades_{0};               // Winning trades count
+    mutable std::mutex history_mutex_;
+    std::vector<double> pnl_history_;                  // P&L per trade for stats
+
+public:
+    CapitalTracker() = default;
+    explicit CapitalTracker(double initial_capital)
+        : initial_capital_(initial_capital), realized_pnl_usd_(0.0) {}
+
+    void set_initial_capital(double capital) {
+        initial_capital_.store(capital, std::memory_order_release);
+    }
+
+    double get_initial_capital() const {
+        return initial_capital_.load(std::memory_order_acquire);
+    }
+
+    double get_current_capital() const {
+        return initial_capital_.load(std::memory_order_acquire) +
+               realized_pnl_usd_.load(std::memory_order_acquire);
+    }
+
+    double get_realized_pnl() const {
+        return realized_pnl_usd_.load(std::memory_order_acquire);
+    }
+
+    // Add P&L from closed position (in USD)
+    void add_realized_pnl(double pnl_usd) {
+        // Update atomic P&L
+        double current = realized_pnl_usd_.load(std::memory_order_relaxed);
+        while (!realized_pnl_usd_.compare_exchange_weak(
+            current, current + pnl_usd, std::memory_order_release, std::memory_order_relaxed));
+
+        // Update trade stats
+        total_trades_.fetch_add(1, std::memory_order_relaxed);
+        if (pnl_usd > 0) {
+            winning_trades_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Store in history for stats
+        {
+            std::lock_guard lock(history_mutex_);
+            pnl_history_.push_back(pnl_usd);
+        }
+    }
+
+    // Dynamic position size: capped by POSITION_SIZE_USD (per side)
+    double get_position_size_usd() const {
+        double current = get_current_capital();
+        // Position size = min(capital/max_positions/2, POSITION_SIZE_USD)
+        // Example: $2000 / 1 / 2 = $1000, capped to $250 per side
+        double dynamic = current / static_cast<double>(TradingConfig::MAX_POSITIONS) / 2.0;
+        return std::min(dynamic, TradingConfig::POSITION_SIZE_USD);
+    }
+
+    // Get total order value (both sides)
+    double get_total_position_value() const {
+        return get_position_size_usd() * 2.0;
+    }
+
+    // Statistics
+    int get_total_trades() const {
+        return total_trades_.load(std::memory_order_acquire);
+    }
+
+    int get_winning_trades() const {
+        return winning_trades_.load(std::memory_order_acquire);
+    }
+
+    double get_win_rate() const {
+        int total = get_total_trades();
+        if (total == 0) return 0.0;
+        return static_cast<double>(get_winning_trades()) / total * 100.0;
+    }
+
+    double get_return_percent() const {
+        double initial = get_initial_capital();
+        if (initial <= 0) return 0.0;
+        return (get_realized_pnl() / initial) * 100.0;
+    }
+
+    // Get P&L history for analysis
+    std::vector<double> get_pnl_history() const {
+        std::lock_guard lock(history_mutex_);
+        return pnl_history_;
+    }
+
+    // Reset for new session (keeps initial capital)
+    void reset_session() {
+        realized_pnl_usd_.store(0.0, std::memory_order_release);
+        total_trades_.store(0, std::memory_order_release);
+        winning_trades_.store(0, std::memory_order_release);
+        {
+            std::lock_guard lock(history_mutex_);
+            pnl_history_.clear();
+        }
     }
 };
 
@@ -344,6 +474,13 @@ public:
     bool close_position(const SymbolId& symbol, Position& closed);
     int get_position_count() const { return position_tracker_.get_position_count(); }
 
+    // Capital management (복리 성장)
+    void set_initial_capital(double capital_usd) { capital_tracker_.set_initial_capital(capital_usd); }
+    double get_current_capital() const { return capital_tracker_.get_current_capital(); }
+    double get_position_size_usd() const { return capital_tracker_.get_position_size_usd(); }
+    void add_realized_pnl(double pnl_usd) { capital_tracker_.add_realized_pnl(pnl_usd); }
+    const CapitalTracker& get_capital_tracker() const { return capital_tracker_; }
+
     // Signals
     std::optional<ArbitrageSignal> get_entry_signal();
     std::optional<ExitSignal> get_exit_signal();
@@ -354,7 +491,11 @@ public:
     const PriceCache& get_price_cache() const { return price_cache_; }
     PriceCache& get_price_cache() { return price_cache_; }
 
-    // Callbacks
+    // Market data update signaling (for event-driven waits)
+    uint64_t get_update_seq() const { return update_seq_.load(std::memory_order_acquire); }
+    void wait_for_update(uint64_t last_seq, std::chrono::milliseconds timeout) const;
+
+    // Callbacks (병렬 포지션 - 각 코인별 진입/청산)
     using EntryCallback = std::function<void(const ArbitrageSignal&)>;
     using ExitCallback = std::function<void(const ExitSignal&)>;
     void set_entry_callback(EntryCallback cb) { on_entry_signal_ = std::move(cb); }
@@ -370,17 +511,22 @@ private:
     // Exchanges
     std::array<ExchangePtr, static_cast<size_t>(Exchange::Count)> exchanges_{};
 
-    // Symbol tracking with O(1) lookup
+    // Symbol tracking with O(1) lookup (SymbolId key — collision-safe)
+    struct SymbolIdHash {
+        size_t operator()(const SymbolId& s) const noexcept { return s.hash(); }
+    };
+
     std::vector<SymbolId> monitored_symbols_;
     std::vector<SymbolId> foreign_symbols_;  // Pre-computed foreign symbols
-    std::unordered_map<size_t, size_t> korean_symbol_index_;   // hash -> index
-    std::unordered_map<size_t, size_t> foreign_symbol_index_;  // hash -> index
+    std::unordered_map<SymbolId, size_t, SymbolIdHash> korean_symbol_index_;
+    std::unordered_map<SymbolId, size_t, SymbolIdHash> foreign_symbol_index_;
 
     std::vector<std::pair<Exchange, Exchange>> exchange_pairs_;
 
     // Price and position tracking
     PriceCache price_cache_;
     PositionTracker position_tracker_;
+    CapitalTracker capital_tracker_{2000.0};  // 초기 자본 $2000
 
     // Signal queues (lock-free)
     memory::SPSCRingBuffer<ArbitrageSignal, 64> entry_signals_;
@@ -404,10 +550,16 @@ private:
     std::mutex exporter_mutex_;
     std::condition_variable exporter_cv_;
 
+    // Update notification for order execution waits
+    mutable std::mutex update_mutex_;
+    mutable std::condition_variable update_cv_;
+    std::atomic<uint64_t> update_seq_{0};
+    std::array<std::atomic<double>, static_cast<size_t>(Exchange::Count)> last_usdt_log_{};
+
     // Internal methods
     void monitor_loop();
-    void check_entry_opportunities();
-    void check_exit_conditions();
+    void check_entry_opportunities();  // 조건 만족하는 모든 코인 진입
+    void check_exit_conditions();      // 각 포지션 개별 청산 체크
     void check_symbol_opportunity(Exchange updated_ex, const SymbolId& updated_symbol);
 
     static bool is_korean_exchange(Exchange ex) {

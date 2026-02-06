@@ -270,7 +270,10 @@ void WebSocketClient::schedule_reconnect() {
         return;
     }
 
-    if (++reconnect_attempts_ > MAX_RECONNECT_ATTEMPTS) {
+    int attempts = ++reconnect_attempts_;
+
+    // MAX_RECONNECT_ATTEMPTS == 0 means unlimited (never give up)
+    if (MAX_RECONNECT_ATTEMPTS > 0 && attempts > MAX_RECONNECT_ATTEMPTS) {
         Logger::error("[{}] Max reconnect attempts ({}) exceeded", name_, MAX_RECONNECT_ATTEMPTS);
         state_ = ConnectionState::Failed;
         if (on_error_) {
@@ -279,10 +282,10 @@ void WebSocketClient::schedule_reconnect() {
         return;
     }
 
-    int attempts = reconnect_attempts_.load();
-    int delay = RECONNECT_DELAY_MS * attempts;
-    Logger::info("[{}] Reconnecting in {}ms (attempt {}/{})",
-                 name_, delay, attempts, MAX_RECONNECT_ATTEMPTS);
+    // Exponential backoff with cap at RECONNECT_MAX_DELAY_MS
+    int delay = std::min(RECONNECT_DELAY_MS * attempts, RECONNECT_MAX_DELAY_MS);
+    Logger::info("[{}] Reconnecting in {}ms (attempt {})",
+                 name_, delay, attempts);
 
     reconnect_timer_.expires_after(std::chrono::milliseconds(delay));
     reconnect_timer_.async_wait(
