@@ -356,14 +356,14 @@ void test_section8_position_tracker_hash_collision_safety() {
     TEST("BTC position does NOT exist", !tracker.has_position(kimp::SymbolId("BTC", "KRW")));
 
     // get_position returns correct data
-    const auto* p = tracker.get_position(kimp::SymbolId("SOL", "KRW"));
-    TEST("get_position(SOL) returns non-null", p != nullptr);
+    auto p = tracker.get_position(kimp::SymbolId("SOL", "KRW"));
+    TEST("get_position(SOL) returns value", p.has_value());
     if (p) {
         TEST_NEAR("get_position(SOL) amount = 10", p->korean_amount, 10.0, 1e-10);
     }
 
-    const auto* p2 = tracker.get_position(kimp::SymbolId("ETH", "KRW"));
-    TEST("get_position(ETH) returns null", p2 == nullptr);
+    auto p2 = tracker.get_position(kimp::SymbolId("ETH", "KRW"));
+    TEST("get_position(ETH) returns nullopt", !p2.has_value());
 
     // close_position only closes the right symbol
     kimp::Position closed;
@@ -389,7 +389,10 @@ void test_section8_premium_calculator() {
     // foreign_krw = 187.50 * 1380 = 258750
     // premium = (256800 - 258750) / 258750 * 100 = -0.7536%
     TEST_NEAR("Entry premium SOL ~= -0.75%", entry_pm, -0.7536, 0.01);
-    TEST("should_enter at -0.75%", kimp::strategy::PremiumCalculator::should_enter(entry_pm));
+    TEST("should_enter at -0.75% is false (threshold -0.99%)",
+         !kimp::strategy::PremiumCalculator::should_enter(entry_pm));
+    TEST("should_enter at -1.10% is true",
+         kimp::strategy::PremiumCalculator::should_enter(-1.10));
 
     // Exit premium: korean_bid vs foreign_ask
     double exit_pm = kimp::strategy::PremiumCalculator::calculate_exit_premium(

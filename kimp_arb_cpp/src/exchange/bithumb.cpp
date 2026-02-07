@@ -122,8 +122,9 @@ std::vector<SymbolId> BithumbExchange::get_available_symbols() {
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         auto data = doc["data"].get_object();
 
         for (auto field : data) {
@@ -150,8 +151,9 @@ std::vector<Ticker> BithumbExchange::fetch_all_tickers() {
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         auto data = doc["data"].get_object();
 
         for (auto field : data) {
@@ -169,18 +171,21 @@ std::vector<Ticker> BithumbExchange::fetch_all_tickers() {
             if (!closing_result.error()) {
                 std::string_view price_str = closing_result.get_string().value();
                 ticker.last = opt::fast_stod(price_str);
-                ticker.bid = ticker.last;
-                ticker.ask = ticker.last;
+                ticker.bid = 0.0;
+                ticker.ask = 0.0;
 
                 // Overlay real bid/ask from orderbook BBO
                 if (orderbook_ready_.load(std::memory_order_acquire)) {
                     std::string symbol_key = std::string(key) + "_KRW";
-                    auto bbo_it = orderbook_bbo_.find(symbol_key);
-                    if (bbo_it != orderbook_bbo_.end()) {
-                        double real_bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
-                        double real_ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
-                        if (real_bid > 0.0) ticker.bid = real_bid;
-                        if (real_ask > 0.0) ticker.ask = real_ask;
+                    {
+                        std::lock_guard lock(orderbook_mutex_);
+                        auto bbo_it = orderbook_bbo_.find(symbol_key);
+                        if (bbo_it != orderbook_bbo_.end()) {
+                            double real_bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
+                            double real_ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
+                            if (real_bid > 0.0) ticker.bid = real_bid;
+                            if (real_ask > 0.0) ticker.ask = real_ask;
+                        }
                     }
                 }
             }
@@ -285,12 +290,13 @@ double BithumbExchange::get_usdt_krw_price() {
     auto response = rest_client_->get("/public/ticker/USDT_KRW");
     if (!response.success) {
         Logger::error("[Bithumb] Failed to fetch USDT price: {}", response.error);
-        return TradingConfig::DEFAULT_USDT_KRW;
+        return 0.0;
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         std::string_view price_str = doc["data"]["closing_price"].get_string().value();
         double price = opt::fast_stod(price_str);
         usdt_krw_price_.store(price);
@@ -299,7 +305,7 @@ double BithumbExchange::get_usdt_krw_price() {
         Logger::error("[Bithumb] Failed to parse USDT price: {}", e.what());
     }
 
-    return TradingConfig::DEFAULT_USDT_KRW;
+    return 0.0;
 }
 
 Order BithumbExchange::place_market_order(const SymbolId& symbol, Side side, Quantity quantity) {
@@ -338,8 +344,9 @@ Order BithumbExchange::place_market_order(const SymbolId& symbol, Side side, Qua
     Logger::debug("[Bithumb] Order raw response: {}", response.body);
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         std::string_view status = doc["status"].get_string().value();
         if (status == "0000") {
             order.status = OrderStatus::Filled;
@@ -408,8 +415,9 @@ Order BithumbExchange::place_market_buy_quantity(const SymbolId& symbol, Quantit
     Logger::debug("[Bithumb] BuyQty raw response: {}", response.body);
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         std::string_view status = doc["status"].get_string().value();
         if (status == "0000") {
             order.status = OrderStatus::Filled;
@@ -448,8 +456,9 @@ double BithumbExchange::get_balance(const std::string& currency) {
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         std::string field = "available_" + currency;
 
         // Convert to lowercase for the field name
@@ -475,15 +484,22 @@ void BithumbExchange::on_ws_message(std::string_view message) {
         // Dispatch synthetic tickers for BBO-changed symbols (0ms propagation)
         if (orderbook_ready_.load(std::memory_order_acquire)) {
             for (const auto& symbol_key : updated_symbols) {
-                auto bbo_it = orderbook_bbo_.find(symbol_key);
-                if (bbo_it == orderbook_bbo_.end()) continue;
+                double bid = 0.0;
+                double ask = 0.0;
+                double last = 0.0;
+                {
+                    std::lock_guard lock(orderbook_mutex_);
+                    auto bbo_it = orderbook_bbo_.find(symbol_key);
+                    if (bbo_it == orderbook_bbo_.end()) continue;
 
-                double bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
-                double ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
-                if (bid <= 0.0 || ask <= 0.0) continue;
+                    bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
+                    ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
+                    if (bid <= 0.0 || ask <= 0.0) continue;
 
-                auto last_it = last_price_cache_.find(symbol_key);
-                if (last_it == last_price_cache_.end()) continue;
+                    auto last_it = last_price_cache_.find(symbol_key);
+                    if (last_it == last_price_cache_.end()) continue;
+                    last = last_it->second;
+                }
 
                 Ticker ticker;
                 ticker.exchange = Exchange::Bithumb;
@@ -493,7 +509,7 @@ void BithumbExchange::on_ws_message(std::string_view message) {
                     ticker.symbol.set_base(symbol_key.substr(0, pos));
                     ticker.symbol.set_quote(symbol_key.substr(pos + 1));
                 }
-                ticker.last = last_it->second;
+                ticker.last = last;
                 ticker.bid = bid;
                 ticker.ask = ask;
                 dispatch_ticker(ticker);
@@ -511,6 +527,7 @@ void BithumbExchange::on_ws_message(std::string_view message) {
         // Overlay real bid/ask from orderbook BBO
         if (orderbook_ready_.load(std::memory_order_acquire)) {
             std::string symbol_key = ticker.symbol.to_bithumb_format();
+            std::lock_guard lock(orderbook_mutex_);
             auto bbo_it = orderbook_bbo_.find(symbol_key);
             if (bbo_it != orderbook_bbo_.end()) {
                 double real_bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
@@ -555,9 +572,16 @@ void BithumbExchange::on_ws_connected() {
 
     if (!orderbooks_to_subscribe.empty()) {
         // Re-fetch snapshots then subscribe to deltas
-        std::thread([this, orderbooks_to_subscribe]() {
-            fetch_all_orderbook_snapshots(orderbooks_to_subscribe);
-            subscribe_orderbook(orderbooks_to_subscribe);
+        auto weak_self = weak_from_this();
+        std::thread([weak_self, orderbooks_to_subscribe]() {
+            auto base_self = weak_self.lock();
+            if (!base_self) return;
+            auto self = std::dynamic_pointer_cast<BithumbExchange>(base_self);
+            if (!self) return;
+
+            self->fetch_all_orderbook_snapshots(orderbooks_to_subscribe);
+            if (!self->connected_.load(std::memory_order_acquire)) return;
+            self->subscribe_orderbook(orderbooks_to_subscribe);
             Logger::info("[Bithumb] Orderbook re-initialized after reconnection");
         }).detach();
     }
@@ -595,8 +619,9 @@ bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& tic
     try {
         // Use padded_string to satisfy simdjson's padding requirement
         // This fixes potential parsing issues with decimal prices
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(message);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
 
         std::string_view type = doc["type"].get_string().value();
         if (type != "ticker") return false;
@@ -615,11 +640,14 @@ bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& tic
 
         std::string_view close_str = content["closePrice"].get_string().value();
         ticker.last = opt::fast_stod(close_str);
-        ticker.bid = ticker.last;
-        ticker.ask = ticker.last;
+        ticker.bid = 0.0;
+        ticker.ask = 0.0;
 
         // Cache last price for orderbookdepth-driven dispatch
-        last_price_cache_[std::string(symbol_str)] = ticker.last;
+        {
+            std::lock_guard lock(orderbook_mutex_);
+            last_price_cache_[std::string(symbol_str)] = ticker.last;
+        }
 
         return true;
     } catch (const simdjson::simdjson_error& e) {
@@ -631,8 +659,9 @@ bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& tic
 std::vector<std::string> BithumbExchange::parse_orderbookdepth_message(std::string_view message) {
     std::vector<std::string> updated_symbols;
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(message);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
 
         std::string_view type = doc["type"].get_string().value();
         if (type != "orderbookdepth") return updated_symbols;

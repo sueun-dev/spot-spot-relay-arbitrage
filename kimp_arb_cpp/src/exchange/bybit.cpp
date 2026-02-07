@@ -131,8 +131,9 @@ std::vector<SymbolId> BybitExchange::get_available_symbols() {
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         auto list = doc["result"]["list"].get_array();
 
         for (auto item : list) {
@@ -151,6 +152,7 @@ std::vector<SymbolId> BybitExchange::get_available_symbols() {
                     int interval_minutes = static_cast<int>(funding_interval.get_int64().value());
                     int interval_hours = interval_minutes / 60;
                     if (interval_hours == 0) interval_hours = 8;  // Default for delivery contracts
+                    std::unique_lock lock(metadata_mutex_);
                     funding_interval_cache_[std::string(symbol_str)] = interval_hours;
                 }
 
@@ -175,6 +177,7 @@ std::vector<SymbolId> BybitExchange::get_available_symbols() {
                         info.min_notional = std::max(info.min_notional,
                                                      opt::fast_stod(min_notional.get_string().value()));
                     }
+                    std::unique_lock lock(metadata_mutex_);
                     lot_size_cache_[std::string(symbol_str)] = info;
                 }
             }
@@ -198,8 +201,9 @@ std::vector<Ticker> BybitExchange::fetch_all_tickers() {
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         auto list = doc["result"]["list"].get_array();
 
         for (auto item : list) {
@@ -241,8 +245,11 @@ std::vector<Ticker> BybitExchange::fetch_all_tickers() {
             }
 
             // Use cached funding interval, default to 8h if not found
-            auto it = funding_interval_cache_.find(std::string(symbol_str));
-            ticker.funding_interval_hours = (it != funding_interval_cache_.end()) ? it->second : 8;
+            {
+                std::shared_lock lock(metadata_mutex_);
+                auto it = funding_interval_cache_.find(std::string(symbol_str));
+                ticker.funding_interval_hours = (it != funding_interval_cache_.end()) ? it->second : 8;
+            }
             ticker.timestamp = std::chrono::steady_clock::now();
 
             if (ticker.last > 0) {
@@ -268,8 +275,9 @@ double BybitExchange::get_funding_rate(const SymbolId& symbol) {
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         auto list = doc["result"]["list"].get_array();
 
         for (auto item : list) {
@@ -421,14 +429,19 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
 double BybitExchange::normalize_order_qty(const SymbolId& symbol, double qty, bool is_open) const {
     if (qty <= 0.0) return 0.0;
     const std::string key = symbol_to_bybit(symbol);
-    auto it = lot_size_cache_.find(key);
-    if (it == lot_size_cache_.end()) {
-        return qty;
+    double step = 0.0;
+    double min_qty = 0.0;
+    double min_notional = 0.0;
+    {
+        std::shared_lock lock(metadata_mutex_);
+        auto it = lot_size_cache_.find(key);
+        if (it == lot_size_cache_.end()) {
+            return qty;
+        }
+        step = it->second.qty_step > 0.0 ? it->second.qty_step : 0.0;
+        min_qty = it->second.min_qty;
+        min_notional = it->second.min_notional;
     }
-
-    double step = it->second.qty_step > 0.0 ? it->second.qty_step : 0.0;
-    double min_qty = it->second.min_qty;
-    double min_notional = it->second.min_notional;
 
     if (step > 0.0) {
         qty = std::floor(qty / step) * step;
@@ -485,8 +498,9 @@ bool BybitExchange::set_leverage(const SymbolId& symbol, int leverage) {
 std::vector<Position> BybitExchange::get_positions() {
     std::vector<Position> positions;
 
-    auto headers = build_auth_headers();
-    auto response = rest_client_->get("/v5/position/list?category=linear&settleCoin=USDT", headers);
+    std::string query = "category=linear&settleCoin=USDT";
+    auto headers = build_auth_headers(query);
+    auto response = rest_client_->get("/v5/position/list?" + query, headers);
 
     if (!response.success) {
         Logger::error("[Bybit] Failed to fetch positions: {}", response.error);
@@ -494,8 +508,9 @@ std::vector<Position> BybitExchange::get_positions() {
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         auto list = doc["result"]["list"].get_array();
 
         for (auto item : list) {
@@ -515,6 +530,12 @@ std::vector<Position> BybitExchange::get_positions() {
                 pos.foreign_exchange = Exchange::Bybit;
                 pos.foreign_amount = size;
                 pos.is_active = true;
+
+                auto avg_price_field = item["avgPrice"];
+                if (!avg_price_field.error()) {
+                    std::string_view avg_price_str = avg_price_field.get_string().value();
+                    pos.foreign_entry_price = opt::fast_stod(avg_price_str);
+                }
 
                 std::string_view side = item["side"].get_string().value();
                 if (side == "Sell") {
@@ -543,8 +564,9 @@ bool BybitExchange::close_position(const SymbolId& symbol) {
 }
 
 double BybitExchange::get_balance(const std::string& currency) {
-    auto headers = build_auth_headers();
-    auto response = rest_client_->get("/v5/account/wallet-balance?accountType=UNIFIED", headers);
+    std::string query = "accountType=UNIFIED";
+    auto headers = build_auth_headers(query);
+    auto response = rest_client_->get("/v5/account/wallet-balance?" + query, headers);
 
     if (!response.success) {
         Logger::error("[Bybit] Failed to fetch balance: {}", response.error);
@@ -552,8 +574,9 @@ double BybitExchange::get_balance(const std::string& currency) {
     }
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(response.body);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
         auto list = doc["result"]["list"].get_array();
 
         for (auto account : list) {
@@ -625,8 +648,9 @@ std::unordered_map<std::string, std::string> BybitExchange::build_auth_headers(
 bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
     try {
         // Use padded_string to satisfy simdjson's padding requirement
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(message);
-        auto doc = json_parser_.iterate(padded);
+        auto doc = local_parser.iterate(padded);
 
         auto topic = doc["topic"];
         if (topic.error()) return false;
@@ -672,8 +696,11 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
 
         // Use cached funding interval, default to 8h if not found
         std::string bybit_symbol = std::string(ticker.symbol.get_base()) + "USDT";
-        auto it = funding_interval_cache_.find(bybit_symbol);
-        ticker.funding_interval_hours = (it != funding_interval_cache_.end()) ? it->second : 8;
+        {
+            std::shared_lock lock(metadata_mutex_);
+            auto it = funding_interval_cache_.find(bybit_symbol);
+            ticker.funding_interval_hours = (it != funding_interval_cache_.end()) ? it->second : 8;
+        }
 
         return true;
     } catch (const simdjson::simdjson_error& e) {
@@ -685,8 +712,9 @@ bool BybitExchange::parse_order_response(const std::string& response, Order& ord
     Logger::debug("[Bybit] Order raw response: {}", response);
 
     try {
+        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded_response(response);
-        auto doc = json_parser_.iterate(padded_response);
+        auto doc = local_parser.iterate(padded_response);
 
         int ret_code = static_cast<int>(doc["retCode"].get_int64().value());
         if (ret_code == 0) {
@@ -717,7 +745,8 @@ bool BybitExchange::query_order_fill(const std::string& order_id, Order& order) 
     constexpr int MAX_RETRIES = 5;
     constexpr int BASE_DELAY_MS = 300;  // 300, 600, 1200, 2400ms backoff
 
-    std::string endpoint = "/v5/order/realtime?category=linear&orderId=" + order_id;
+    std::string query = "category=linear&orderId=" + order_id;
+    std::string endpoint = "/v5/order/realtime?" + query;
 
     for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
         if (attempt > 0) {
@@ -727,7 +756,7 @@ bool BybitExchange::query_order_fill(const std::string& order_id, Order& order) 
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
         }
 
-        auto headers = build_auth_headers();
+        auto headers = build_auth_headers(query);
         auto response = rest_client_->get(endpoint, headers);
 
         if (!response.success) {

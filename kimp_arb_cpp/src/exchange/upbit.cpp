@@ -119,7 +119,9 @@ std::vector<SymbolId> UpbitExchange::get_available_symbols() {
     }
 
     try {
-        auto doc = json_parser_.iterate(response.body);
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
 
         for (auto market : doc.get_array()) {
             std::string_view market_str = market["market"].get_string().value();
@@ -149,11 +151,13 @@ double UpbitExchange::get_usdt_krw_price() {
     auto response = rest_client_->get("/v1/ticker?markets=KRW-USDT");
     if (!response.success) {
         Logger::error("[Upbit] Failed to fetch USDT price: {}", response.error);
-        return TradingConfig::DEFAULT_USDT_KRW;
+        return 0.0;
     }
 
     try {
-        auto doc = json_parser_.iterate(response.body);
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
         auto arr = doc.get_array();
 
         for (auto ticker : arr) {
@@ -165,7 +169,7 @@ double UpbitExchange::get_usdt_krw_price() {
         Logger::error("[Upbit] Failed to parse USDT price: {}", e.what());
     }
 
-    return TradingConfig::DEFAULT_USDT_KRW;
+    return 0.0;
 }
 
 Order UpbitExchange::place_market_order(const SymbolId& symbol, Side side, Quantity quantity) {
@@ -269,7 +273,9 @@ double UpbitExchange::get_balance(const std::string& currency) {
     }
 
     try {
-        auto doc = json_parser_.iterate(response.body);
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
 
         for (auto account : doc.get_array()) {
             std::string_view curr = account["currency"].get_string().value();
@@ -341,9 +347,9 @@ std::unordered_map<std::string, std::string> UpbitExchange::build_auth_headers(c
 
 bool UpbitExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
     try {
-        std::memcpy(json_buffer_.data(), message.data(), message.size());
-
-        auto doc = json_parser_.iterate(json_buffer_.data(), message.size(), 4096);
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(message);
+        auto doc = local_parser.iterate(padded);
 
         // Check if this is ticker data
         std::string_view type = doc["ty"].get_string().value();
@@ -386,7 +392,9 @@ bool UpbitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
 
 bool UpbitExchange::parse_order_response(const std::string& response, Order& order) {
     try {
-        auto doc = json_parser_.iterate(response);
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response);
+        auto doc = local_parser.iterate(padded);
 
         std::string_view uuid = doc["uuid"].get_string().value();
         order.exchange_order_id = std::hash<std::string_view>{}(uuid);

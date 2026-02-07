@@ -1,12 +1,14 @@
 #include "kimp/execution/order_manager.hpp"
 #include "kimp/core/logger.hpp"
 
+#include <algorithm>
 #include <thread>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <ctime>
@@ -29,6 +31,53 @@ std::string format_time(std::chrono::system_clock::time_point tp) {
     std::snprintf(out, sizeof(out), "%s.%03lld", buf,
                   static_cast<long long>(ms.count()));
     return std::string(out);
+}
+
+uint64_t steady_now_ms() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+double spread_pct(double bid, double ask) {
+    if (bid <= 0.0 || ask <= 0.0 || ask < bid) {
+        return std::numeric_limits<double>::infinity();
+    }
+    double mid = (bid + ask) * 0.5;
+    if (mid <= 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return ((ask - bid) / mid) * 100.0;
+}
+
+bool quote_is_fresh(const kimp::strategy::PriceCache::PriceData& price, uint64_t now_ms) {
+    if (!price.valid || price.timestamp == 0) {
+        return false;
+    }
+    if (now_ms < price.timestamp) {
+        return false;
+    }
+    return (now_ms - price.timestamp) <= kimp::TradingConfig::MAX_QUOTE_AGE_MS;
+}
+
+bool quote_pair_is_usable(const kimp::strategy::PriceCache::PriceData& korean_price,
+                          const kimp::strategy::PriceCache::PriceData& foreign_price) {
+    uint64_t now_ms = steady_now_ms();
+    if (!quote_is_fresh(korean_price, now_ms) || !quote_is_fresh(foreign_price, now_ms)) {
+        return false;
+    }
+    uint64_t ts_diff = korean_price.timestamp >= foreign_price.timestamp
+                           ? korean_price.timestamp - foreign_price.timestamp
+                           : foreign_price.timestamp - korean_price.timestamp;
+    if (ts_diff > kimp::TradingConfig::MAX_QUOTE_DESYNC_MS) {
+        return false;
+    }
+    if (spread_pct(korean_price.bid, korean_price.ask) > kimp::TradingConfig::MAX_KOREAN_SPREAD_PCT) {
+        return false;
+    }
+    if (spread_pct(foreign_price.bid, foreign_price.ask) > kimp::TradingConfig::MAX_FOREIGN_SPREAD_PCT) {
+        return false;
+    }
+    return true;
 }
 
 void append_exit_split_log(const kimp::Position& pos,
@@ -185,8 +234,8 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
 
     // =========================================================================
     // ADAPTIVE SPLIT EXECUTION: 진입/청산 유기적 전환
-    // - premium <= -0.75%: entry split ($25 short + buy)
-    // - premium >= +0.34%: exit split ($25 cover + sell, <$50 close all)
+    // - premium <= -0.99%: entry split ($25 short + buy)
+    // - premium >= max(entry + 0.79%, +0.10%): exit split ($25 cover + sell, <$50 close all)
     // - between: wait for market update
     // Loop ends when: fully entered ($250) or fully exited (0 coins)
     // =========================================================================
@@ -194,6 +243,30 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
     double total_korean_cost = 0.0;
     double total_foreign_value = 0.0;
     double realized_pnl_krw = 0.0;
+    double last_usdt_rate = signal.usdt_krw_rate;
+
+    auto calculate_effective_entry_pm = [&](double usdt_rate) {
+        if (held_amount <= 0.0 || total_foreign_value <= 0.0 || usdt_rate <= 0.0) {
+            return signal.premium;
+        }
+        double avg_foreign_entry = total_foreign_value / held_amount;
+        double avg_korean_entry = total_korean_cost / held_amount;
+        double foreign_krw = avg_foreign_entry * usdt_rate;
+        if (foreign_krw <= 0.0) {
+            return signal.premium;
+        }
+        return ((avg_korean_entry - foreign_krw) / foreign_krw) * 100.0;
+    };
+
+    auto min_executable_usd = [&](double foreign_bid, double korean_ask) {
+        constexpr double MIN_BYBIT_NOTIONAL_USD = 1.0;  // Conservative fallback when venue filters are unavailable here
+        if (foreign_bid <= 0.0 || korean_ask <= 0.0) {
+            return std::max(TradingConfig::MIN_ORDER_KRW / 1500.0, MIN_BYBIT_NOTIONAL_USD);
+        }
+        // Convert Bithumb KRW minimum to equivalent USD notional for this pair
+        double min_by_krw = TradingConfig::MIN_ORDER_KRW * (foreign_bid / korean_ask);
+        return std::max(min_by_krw, MIN_BYBIT_NOTIONAL_USD);
+    };
 
     while (running_.load(std::memory_order_acquire)) {
         // Get fresh prices from cache
@@ -201,17 +274,32 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
         double current_foreign_ask = 0.0;
         double current_korean_ask = signal.korean_ask;
         double current_korean_bid = 0.0;
-        double usdt_rate = TradingConfig::DEFAULT_USDT_KRW;
+        double usdt_rate = signal.usdt_krw_rate;  // From signal (guaranteed real)
+        bool quote_pair_ok = !engine_;
         if (engine_) {
             auto& cache = engine_->get_price_cache();
             auto foreign_price = cache.get_price(signal.foreign_exchange, foreign_symbol);
             auto korean_price = cache.get_price(signal.korean_exchange, signal.symbol);
-            if (foreign_price.valid && foreign_price.bid > 0) current_foreign_bid = foreign_price.bid;
-            if (foreign_price.valid && foreign_price.ask > 0) current_foreign_ask = foreign_price.ask;
-            if (korean_price.valid && korean_price.ask > 0) current_korean_ask = korean_price.ask;
-            if (korean_price.valid && korean_price.bid > 0) current_korean_bid = korean_price.bid;
+            if (quote_pair_is_usable(korean_price, foreign_price)) {
+                current_foreign_bid = foreign_price.bid;
+                current_foreign_ask = foreign_price.ask;
+                current_korean_ask = korean_price.ask;
+                current_korean_bid = korean_price.bid;
+                quote_pair_ok = true;
+            }
             double bithumb_usdt = cache.get_usdt_krw(Exchange::Bithumb);
             if (bithumb_usdt > 0) usdt_rate = bithumb_usdt;
+        }
+        last_usdt_rate = usdt_rate;
+
+        if (!quote_pair_ok) {
+            if (engine_) {
+                uint64_t seq = engine_->get_update_seq();
+                engine_->wait_for_update(seq, std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+            }
+            continue;
         }
 
         // Calculate ENTRY premium: buy Korean (ask), short foreign (bid)
@@ -230,25 +318,39 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
 
         double held_value_usd = held_amount * current_foreign_bid;
 
-        // Dynamic exit threshold from actual average entry prices
-        double dynamic_exit_threshold = TradingConfig::EXIT_PREMIUM_THRESHOLD;  // fallback
+        // Dynamic exit threshold with a hard floor (+0.10% by default)
+        double dynamic_exit_threshold = TradingConfig::EXIT_PREMIUM_THRESHOLD;
         if (held_amount > 0 && total_foreign_value > 0 && usdt_rate > 0) {
-            double avg_foreign_entry = total_foreign_value / held_amount;
-            double avg_korean_entry = total_korean_cost / held_amount;
-            double effective_entry_pm = ((avg_korean_entry - avg_foreign_entry * usdt_rate)
-                                         / (avg_foreign_entry * usdt_rate)) * 100.0;
-            dynamic_exit_threshold = effective_entry_pm + TradingConfig::DYNAMIC_EXIT_SPREAD;
+            double effective_entry_pm = calculate_effective_entry_pm(usdt_rate);
+            dynamic_exit_threshold = std::max(
+                effective_entry_pm + TradingConfig::DYNAMIC_EXIT_SPREAD,
+                TradingConfig::EXIT_PREMIUM_THRESHOLD);
         }
 
-        if (entry_premium <= TradingConfig::ENTRY_PREMIUM_THRESHOLD && held_value_usd < position_size_usd) {
+        double remaining_position_usd = std::max(0.0, position_size_usd - held_value_usd);
+        double min_split_usd = min_executable_usd(current_foreign_bid, current_korean_ask);
+        if (held_amount > 0.0 && remaining_position_usd > 0.0 && remaining_position_usd < min_split_usd) {
+            Logger::info("[ADAPTIVE-ENTRY] {} remainder ${:.2f} is below executable minimum ${:.2f}; "
+                         "finalizing entry without extra tiny split",
+                         signal.symbol.to_string(), remaining_position_usd, min_split_usd);
+            break;
+        }
+
+        if (entry_premium <= TradingConfig::ENTRY_PREMIUM_THRESHOLD && remaining_position_usd >= min_split_usd) {
             // ==================== ENTRY SPLIT ====================
-            double order_size_usd = std::min(TradingConfig::ORDER_SIZE_USD, position_size_usd - held_value_usd);
+            double order_size_usd = std::min(TradingConfig::ORDER_SIZE_USD, remaining_position_usd);
             double coin_amount = order_size_usd / current_foreign_bid;
 
             // SHORT futures first
             Order foreign_order = execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
+                if (remaining_position_usd < TradingConfig::ORDER_SIZE_USD) {
+                    Logger::warn("[ADAPTIVE-ENTRY] Tiny tail split (${:.2f}) rejected by venue filters; "
+                                 "finalizing at held ${:.2f}/${:.2f}",
+                                 remaining_position_usd, held_value_usd, position_size_usd);
+                    break;
+                }
                 Logger::error("[ADAPTIVE-ENTRY] Futures SHORT failed, retrying next cycle");
                 std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
                 continue;
@@ -288,14 +390,20 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                 total_foreign_value += actual_filled * short_price;
 
                 double new_held_value = held_amount * current_foreign_bid;
-                Logger::info("[ADAPTIVE-ENTRY] {} +{:.8f} coins (${:.2f}), held: ${:.2f}/${:.2f}, entry_pm: {:.4f}%, buy_price: {:.2f}",
+                double effective_entry_pm = calculate_effective_entry_pm(usdt_rate);
+                double target_exit_pm = std::max(
+                    effective_entry_pm + TradingConfig::DYNAMIC_EXIT_SPREAD,
+                    TradingConfig::EXIT_PREMIUM_THRESHOLD);
+                Logger::info("[ADAPTIVE-ENTRY] {} +{:.8f} coins (${:.2f}), held: ${:.2f}/${:.2f}, "
+                             "entry_pm_now: {:.4f}%, eff_entry_pm: {:.4f}%, target_exit_pm: {:.4f}%, buy_price: {:.2f}",
                              signal.symbol.to_string(), actual_filled, order_size_usd,
-                             new_held_value, position_size_usd, entry_premium, buy_price);
+                             new_held_value, position_size_usd, entry_premium, effective_entry_pm,
+                             target_exit_pm, buy_price);
 
                 // Log entry split to CSV (actual fill price)
                 append_entry_split_log(signal.symbol, actual_filled, buy_price,
                                        short_price, usdt_rate, new_held_value,
-                                       position_size_usd, entry_premium);
+                                       position_size_usd, effective_entry_pm);
 
                 // Save position state for crash recovery
                 if (on_position_update_) {
@@ -304,7 +412,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                     snap.korean_exchange = signal.korean_exchange;
                     snap.foreign_exchange = signal.foreign_exchange;
                     snap.entry_time = result.position.entry_time;
-                    snap.entry_premium = signal.premium;
+                    snap.entry_premium = effective_entry_pm;
                     snap.position_size_usd = position_size_usd;
                     snap.korean_amount = held_amount;
                     snap.foreign_amount = held_amount;
@@ -402,7 +510,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                         snap.korean_exchange = signal.korean_exchange;
                         snap.foreign_exchange = signal.foreign_exchange;
                         snap.entry_time = result.position.entry_time;
-                        snap.entry_premium = signal.premium;
+                        snap.entry_premium = calculate_effective_entry_pm(usdt_rate);
                         snap.position_size_usd = position_size_usd;
                         snap.korean_amount = held_amount;
                         snap.foreign_amount = held_amount;
@@ -484,10 +592,17 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
         result.position.foreign_amount = held_amount;
         result.position.korean_entry_price = total_korean_cost / held_amount;
         result.position.foreign_entry_price = total_foreign_value / held_amount;
+        result.position.entry_premium = calculate_effective_entry_pm(last_usdt_rate);
         result.position.is_active = true;
         result.position.realized_pnl_krw = realized_pnl_krw;
         result.korean_filled_amount = held_amount;
         result.foreign_filled_amount = held_amount;
+        return result;
+    }
+
+    if (held_amount <= 0.0) {
+        result.success = false;
+        result.error_message = "No filled amount in adaptive entry";
         return result;
     }
 
@@ -497,6 +612,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
     result.position.foreign_amount = held_amount;
     result.position.korean_entry_price = total_korean_cost / held_amount;
     result.position.foreign_entry_price = total_foreign_value / held_amount;
+    result.position.entry_premium = calculate_effective_entry_pm(last_usdt_rate);
     result.position.is_active = true;
     result.position.realized_pnl_krw = realized_pnl_krw;
     result.korean_filled_amount = held_amount;
@@ -523,7 +639,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
     // =========================================================================
     // ADAPTIVE SPLIT EXECUTION: 청산/재진입 유기적 전환
     // - exit_pm >= dynamic threshold: exit split ($25 cover + sell, <$50 close all)
-    // - entry_pm <= -0.75% && partially exited: re-entry split ($25 short + buy)
+    // - entry_pm <= -0.99% && partially exited: re-entry split ($25 short + buy)
     // - between: wait for market update
     // Loop ends when: fully exited (0 coins remaining)
     // =========================================================================
@@ -535,6 +651,20 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
     double total_korean_proceeds = 0.0;
     double total_foreign_cost = 0.0;
     double total_exited_amount = 0.0;
+    double last_usdt_rate = signal.usdt_krw_rate;
+
+    auto calculate_effective_entry_pm = [&](double usdt_rate) {
+        if (remaining_amount <= 0.0 || total_foreign_value <= 0.0 || usdt_rate <= 0.0) {
+            return position.entry_premium;
+        }
+        double avg_foreign_entry = total_foreign_value / remaining_amount;
+        double avg_korean_entry = total_korean_cost / remaining_amount;
+        double foreign_krw = avg_foreign_entry * usdt_rate;
+        if (foreign_krw <= 0.0) {
+            return position.entry_premium;
+        }
+        return ((avg_korean_entry - foreign_krw) / foreign_krw) * 100.0;
+    };
 
     while (remaining_amount > 0 && running_.load(std::memory_order_acquire)) {
         // Get fresh prices from cache
@@ -542,17 +672,32 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
         double current_foreign_ask = signal.foreign_ask;
         double current_korean_ask = 0.0;
         double current_korean_bid = signal.korean_bid;
-        double usdt_rate = signal.usdt_krw_rate > 0 ? signal.usdt_krw_rate : TradingConfig::DEFAULT_USDT_KRW;
+        double usdt_rate = signal.usdt_krw_rate;  // From signal (guaranteed real)
+        bool quote_pair_ok = !engine_;
         if (engine_) {
             auto& cache = engine_->get_price_cache();
             auto foreign_price = cache.get_price(signal.foreign_exchange, foreign_symbol);
             auto korean_price = cache.get_price(signal.korean_exchange, position.symbol);
-            if (foreign_price.valid && foreign_price.bid > 0) current_foreign_bid = foreign_price.bid;
-            if (foreign_price.valid && foreign_price.ask > 0) current_foreign_ask = foreign_price.ask;
-            if (korean_price.valid && korean_price.ask > 0) current_korean_ask = korean_price.ask;
-            if (korean_price.valid && korean_price.bid > 0) current_korean_bid = korean_price.bid;
+            if (quote_pair_is_usable(korean_price, foreign_price)) {
+                current_foreign_bid = foreign_price.bid;
+                current_foreign_ask = foreign_price.ask;
+                current_korean_ask = korean_price.ask;
+                current_korean_bid = korean_price.bid;
+                quote_pair_ok = true;
+            }
             double bithumb_usdt = cache.get_usdt_krw(Exchange::Bithumb);
             if (bithumb_usdt > 0) usdt_rate = bithumb_usdt;
+        }
+        last_usdt_rate = usdt_rate;
+
+        if (!quote_pair_ok) {
+            if (engine_) {
+                uint64_t seq = engine_->get_update_seq();
+                engine_->wait_for_update(seq, std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+            }
+            continue;
         }
 
         // Calculate EXIT premium: sell Korean (bid), cover foreign (ask)
@@ -569,14 +714,13 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
             entry_premium = ((current_korean_ask - foreign_krw) / foreign_krw) * 100.0;
         }
 
-        // Dynamic exit threshold from actual average entry prices
-        double dynamic_exit_threshold = TradingConfig::EXIT_PREMIUM_THRESHOLD;  // fallback
+        // Dynamic exit threshold with a hard floor (+0.10% by default)
+        double dynamic_exit_threshold = TradingConfig::EXIT_PREMIUM_THRESHOLD;
         if (remaining_amount > 0 && total_foreign_value > 0 && usdt_rate > 0) {
-            double avg_foreign_entry = total_foreign_value / remaining_amount;
-            double avg_korean_entry = total_korean_cost / remaining_amount;
-            double effective_entry_pm = ((avg_korean_entry - avg_foreign_entry * usdt_rate)
-                                         / (avg_foreign_entry * usdt_rate)) * 100.0;
-            dynamic_exit_threshold = effective_entry_pm + TradingConfig::DYNAMIC_EXIT_SPREAD;
+            double effective_entry_pm = calculate_effective_entry_pm(usdt_rate);
+            dynamic_exit_threshold = std::max(
+                effective_entry_pm + TradingConfig::DYNAMIC_EXIT_SPREAD,
+                TradingConfig::EXIT_PREMIUM_THRESHOLD);
         }
 
         if (exit_premium >= dynamic_exit_threshold) {
@@ -661,6 +805,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                         snap.foreign_amount = remaining_amount;
                         snap.korean_entry_price = total_korean_cost / remaining_amount;
                         snap.foreign_entry_price = total_foreign_value / remaining_amount;
+                        snap.entry_premium = calculate_effective_entry_pm(usdt_rate);
                         snap.realized_pnl_krw = realized_pnl_krw;
                         on_position_update_(&snap);
                     } else {
@@ -771,6 +916,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                     snap.foreign_amount = remaining_amount;
                     snap.korean_entry_price = total_korean_cost / remaining_amount;
                     snap.foreign_entry_price = total_foreign_value / remaining_amount;
+                    snap.entry_premium = calculate_effective_entry_pm(usdt_rate);
                     snap.realized_pnl_krw = realized_pnl_krw;
                     on_position_update_(&snap);
                 }
@@ -803,6 +949,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
         if (remaining_amount > 0) {
             result.position.korean_entry_price = total_korean_cost / remaining_amount;
             result.position.foreign_entry_price = total_foreign_value / remaining_amount;
+            result.position.entry_premium = calculate_effective_entry_pm(last_usdt_rate);
         }
         result.position.is_active = true;
         result.position.realized_pnl_krw = realized_pnl_krw;
@@ -1101,8 +1248,10 @@ double OrderManager::calculate_pnl(const Position& pos, double exit_korean_price
     return total_pnl;
 }
 
-void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbols) {
-    Logger::info("Building external position blacklist ({} symbols)...", symbols.size());
+void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbols,
+                                               const std::unordered_set<SymbolId>& bot_managed) {
+    Logger::info("Building external position blacklist ({} symbols, {} bot-managed)...",
+                 symbols.size(), bot_managed.size());
 
     std::unordered_set<SymbolId> new_blacklist;
 
@@ -1110,6 +1259,7 @@ void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbo
     auto bithumb = get_korean_exchange(Exchange::Bithumb);
     if (bithumb) {
         for (const auto& sym : symbols) {
+            if (bot_managed.count(sym)) continue;  // Skip bot's own positions
             double balance = bithumb->get_balance(std::string(sym.get_base()));
             if (balance > 0.0001) {  // Ignore dust
                 new_blacklist.insert(sym);
@@ -1126,6 +1276,7 @@ void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbo
         for (const auto& pos : positions) {
             if (pos.foreign_amount > 0.0001) {  // Ignore dust
                 SymbolId krw_symbol(pos.symbol.get_base(), "KRW");
+                if (bot_managed.count(krw_symbol)) continue;  // Skip bot's own positions
                 new_blacklist.insert(krw_symbol);
                 Logger::warn("[BLACKLIST] {} - Bybit futures position: {:.6f}",
                              krw_symbol.to_string(), pos.foreign_amount);

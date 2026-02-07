@@ -97,7 +97,8 @@ public:
     void set_position_update_callback(PositionUpdateCallback cb) { on_position_update_ = std::move(cb); }
 
     // Build external position blacklist at startup (checks all trading symbols)
-    void refresh_external_positions(const std::vector<SymbolId>& symbols);
+    void refresh_external_positions(const std::vector<SymbolId>& symbols,
+                                    const std::unordered_set<SymbolId>& bot_managed = {});
 
 private:
     PositionUpdateCallback on_position_update_;

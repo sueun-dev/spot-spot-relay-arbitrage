@@ -4,6 +4,7 @@
 #include "kimp/utils/crypto.hpp"
 
 #include <simdjson.h>
+#include <shared_mutex>
 
 namespace kimp::exchange::bybit {
 
@@ -31,6 +32,7 @@ private:
         double min_notional{0.0};
     };
     std::unordered_map<std::string, LotSize> lot_size_cache_;
+    mutable std::shared_mutex metadata_mutex_;
 
     // Store subscribed symbols for reconnection
     std::vector<SymbolId> subscribed_tickers_;

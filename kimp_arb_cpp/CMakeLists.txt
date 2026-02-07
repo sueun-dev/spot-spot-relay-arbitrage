@@ -88,6 +88,10 @@ target_link_libraries(kimp_bot PRIVATE kimp_lib)
 add_executable(kimp_diag_trade tests/integration/diag_trade.cpp)
 target_link_libraries(kimp_diag_trade PRIVATE kimp_lib)
 
+# Gap accuracy diagnostic executable (10-minute false-positive check)
+add_executable(kimp_diag_gap tests/integration/diag_gap_accuracy.cpp)
+target_link_libraries(kimp_diag_gap PRIVATE kimp_lib)
+
 # Entry selection test
 add_executable(kimp_test_entry tests/test_entry_selection.cpp)
 target_link_libraries(kimp_test_entry PRIVATE kimp_lib)

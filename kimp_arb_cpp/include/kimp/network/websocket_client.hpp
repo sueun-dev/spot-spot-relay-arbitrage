@@ -90,6 +90,8 @@ private:
     // Lock-free write queue: MPMC for thread-safe send() from any thread
     alignas(64) memory::MPMCRingBuffer<std::string, 256> write_queue_;  // Power of 2 capacity
     alignas(64) std::atomic<bool> is_writing_{false};
+    // Must persist until async_write completion
+    std::string current_write_message_;
 
     // Callbacks
     MessageCallback on_message_;

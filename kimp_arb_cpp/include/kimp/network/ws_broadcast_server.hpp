@@ -7,6 +7,7 @@
 #include <memory>
 #include <set>
 #include <mutex>
+#include <deque>
 #include <string>
 #include <functional>
 
@@ -85,7 +86,7 @@ private:
 
     // Write queue
     std::mutex queue_mutex_;
-    std::vector<std::string> queue_;
+    std::deque<std::string> queue_;
     std::string current_message_;  // Message being written (must persist during async_write)
     bool writing_{false};
 };

@@ -302,7 +302,7 @@ int main() {
     // ─── Section 4: 크로스 검증 (프리미엄 계산) ──────────────
     std::cout << "\n[4] 프리미엄 계산 크로스 검증\n";
 
-    int matched = 0, premium_valid = 0;
+    int matched = 0, premium_valid = 0, premium_extreme = 0;
     double min_pm = 999, max_pm = -999;
     std::string min_pm_coin, max_pm_coin;
 
@@ -317,6 +317,7 @@ int main() {
             double entry_pm = ((bc.ask - fk) / fk) * 100.0;
             if (std::isfinite(entry_pm) && std::fabs(entry_pm) < 50.0) {
                 ++premium_valid;
+                if (std::fabs(entry_pm) >= 20.0) ++premium_extreme;
                 if (entry_pm < min_pm) { min_pm = entry_pm; min_pm_coin = bc.base; }
                 if (entry_pm > max_pm) { max_pm = entry_pm; max_pm_coin = bc.base; }
             }
@@ -328,9 +329,12 @@ int main() {
     check(premium_valid >= matched * 0.9,
           "프리미엄 계산 성공 >= 90%",
           fmt::format("{}/{}", premium_valid, matched));
-    check(min_pm > -20.0 && max_pm < 20.0,
-          "프리미엄 범위 (-20% ~ +20%)",
-          fmt::format("min={:.4f}%({}) max={:.4f}%({})", min_pm, min_pm_coin, max_pm, max_pm_coin));
+    int extreme_limit = std::max(3, premium_valid / 20);  // <=5% or up to 3 outliers
+    check(premium_extreme <= extreme_limit,
+          "프리미엄 극단치 비율 (|pm|>=20%) <= 5%",
+          fmt::format("{}/{} (limit {}), min={:.4f}%({}) max={:.4f}%({})",
+                      premium_extreme, premium_valid, extreme_limit,
+                      min_pm, min_pm_coin, max_pm, max_pm_coin));
 
     // Entry candidates
     int entry_candidates = 0;

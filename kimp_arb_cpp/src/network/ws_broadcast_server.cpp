@@ -214,7 +214,7 @@ void WebSocketSession::do_write() {
         }
         // Store in member variable so it persists during async_write
         current_message_ = std::move(queue_.front());
-        queue_.erase(queue_.begin());
+        queue_.pop_front();
     }
 
     ws_.text(true);

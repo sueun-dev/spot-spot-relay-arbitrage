@@ -17,12 +17,11 @@
 namespace kimp::strategy {
 
 /**
- * Thread-safe price cache using unordered_map
+ * Thread-safe sharded price cache.
  *
- * Uses shared_mutex for read-heavy workload optimization:
- * - Multiple readers can access simultaneously
- * - Writers get exclusive access
- * - No hash collision issues - guaranteed correct symbol matching
+ * Price data is partitioned into lock shards to reduce contention under high
+ * ticker throughput. Readers/writers touching different symbols run in
+ * parallel, while preserving correctness per symbol key.
  */
 class PriceCache {
 public:
@@ -69,53 +68,73 @@ private:
         return {static_cast<uint8_t>(ex), symbol};
     }
 
-    mutable std::shared_mutex mutex_;
-    std::unordered_map<PriceKey, PriceEntry, PriceKeyHash> prices_;
+    static constexpr size_t SHARD_COUNT = 64;  // Power-of-two for fast masking
+    static_assert((SHARD_COUNT & (SHARD_COUNT - 1)) == 0, "SHARD_COUNT must be power-of-two");
+
+    struct alignas(64) PriceShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<PriceKey, PriceEntry, PriceKeyHash> prices;
+    };
+
+    std::array<PriceShard, SHARD_COUNT> shards_;
+
+    static size_t shard_index(const PriceKey& key) noexcept {
+        return PriceKeyHash{}(key) & (SHARD_COUNT - 1);
+    }
+
+    PriceShard& shard_for(const PriceKey& key) noexcept {
+        return shards_[shard_index(key)];
+    }
+
+    const PriceShard& shard_for(const PriceKey& key) const noexcept {
+        return shards_[shard_index(key)];
+    }
 
     // USDT/KRW prices
     std::atomic<double> usdt_krw_upbit_{0.0};
     std::atomic<double> usdt_krw_bithumb_{0.0};
 
 public:
-    void update(Exchange ex, const SymbolId& symbol, double bid, double ask, double last) {
+    void update(Exchange ex, const SymbolId& symbol, double bid, double ask, double last,
+                uint64_t timestamp_ms = 0) {
         PriceKey key = make_key(ex, symbol);
+        auto& shard = shard_for(key);
+        const uint64_t ts = (timestamp_ms != 0)
+            ? timestamp_ms
+            : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
 
         {
-            std::shared_lock read_lock(mutex_);
-            auto it = prices_.find(key);
-            if (it != prices_.end()) {
+            std::shared_lock read_lock(shard.mutex);
+            auto it = shard.prices.find(key);
+            if (it != shard.prices.end()) {
                 // Fast path: entry exists, just update atomics
                 it->second.bid.store(bid, std::memory_order_relaxed);
                 it->second.ask.store(ask, std::memory_order_relaxed);
                 it->second.last.store(last, std::memory_order_relaxed);
-                it->second.timestamp.store(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count(),
-                    std::memory_order_release);
+                it->second.timestamp.store(ts, std::memory_order_release);
                 return;
             }
         }
 
         // Slow path: need to create entry (only at startup)
-        std::unique_lock write_lock(mutex_);
-        auto& entry = prices_[key];
+        std::unique_lock write_lock(shard.mutex);
+        auto& entry = shard.prices[key];
         entry.bid.store(bid, std::memory_order_relaxed);
         entry.ask.store(ask, std::memory_order_relaxed);
         entry.last.store(last, std::memory_order_relaxed);
-        entry.timestamp.store(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count(),
-            std::memory_order_release);
+        entry.timestamp.store(ts, std::memory_order_release);
     }
 
     void update_funding(Exchange ex, const SymbolId& symbol, double funding_rate,
                         int interval_hours, uint64_t next_funding_time) {
         PriceKey key = make_key(ex, symbol);
+        auto& shard = shard_for(key);
 
         {
-            std::shared_lock read_lock(mutex_);
-            auto it = prices_.find(key);
-            if (it != prices_.end()) {
+            std::shared_lock read_lock(shard.mutex);
+            auto it = shard.prices.find(key);
+            if (it != shard.prices.end()) {
                 it->second.funding_rate.store(funding_rate, std::memory_order_relaxed);
                 it->second.funding_interval_hours.store(interval_hours, std::memory_order_relaxed);
                 it->second.next_funding_time.store(next_funding_time, std::memory_order_relaxed);
@@ -123,8 +142,8 @@ public:
             }
         }
 
-        std::unique_lock write_lock(mutex_);
-        auto& entry = prices_[key];
+        std::unique_lock write_lock(shard.mutex);
+        auto& entry = shard.prices[key];
         entry.funding_rate.store(funding_rate, std::memory_order_relaxed);
         entry.funding_interval_hours.store(interval_hours, std::memory_order_relaxed);
         entry.next_funding_time.store(next_funding_time, std::memory_order_relaxed);
@@ -140,10 +159,11 @@ public:
 
     PriceData get_price(Exchange ex, const SymbolId& symbol) const {
         PriceKey key = make_key(ex, symbol);
+        const auto& shard = shard_for(key);
 
-        std::shared_lock lock(mutex_);
-        auto it = prices_.find(key);
-        if (it == prices_.end()) {
+        std::shared_lock lock(shard.mutex);
+        auto it = shard.prices.find(key);
+        if (it == shard.prices.end()) {
             return {};  // Not found
         }
 
@@ -166,25 +186,31 @@ public:
         } else if (ex == Exchange::Bithumb) {
             return usdt_krw_bithumb_.load(std::memory_order_acquire);
         }
-        return TradingConfig::DEFAULT_USDT_KRW;
+        return 0.0;
     }
 
     // Debug: get all stored symbols
     std::vector<std::string> get_all_keys() const {
-        std::shared_lock lock(mutex_);
         std::vector<std::string> keys;
-        keys.reserve(prices_.size());
-        for (const auto& [key, _] : prices_) {
-            keys.push_back(std::to_string(key.exchange) + ":" +
-                           std::string(key.symbol.get_base()) + "/" +
-                           std::string(key.symbol.get_quote()));
+        for (const auto& shard : shards_) {
+            std::shared_lock lock(shard.mutex);
+            keys.reserve(keys.size() + shard.prices.size());
+            for (const auto& [key, _] : shard.prices) {
+                keys.push_back(std::to_string(key.exchange) + ":" +
+                               std::string(key.symbol.get_base()) + "/" +
+                               std::string(key.symbol.get_quote()));
+            }
         }
         return keys;
     }
 
     size_t size() const {
-        std::shared_lock lock(mutex_);
-        return prices_.size();
+        size_t total = 0;
+        for (const auto& shard : shards_) {
+            std::shared_lock lock(shard.mutex);
+            total += shard.prices.size();
+        }
+        return total;
     }
 };
 
@@ -230,7 +256,7 @@ public:
         return position_count_.load(std::memory_order_acquire) > 0;
     }
 
-    const Position* get_position(const SymbolId& symbol) const {
+    std::optional<Position> get_position(const SymbolId& symbol) const {
         uint64_t hash = symbol.hash();
         for (const auto& slot : positions_) {
             if (slot.active.load(std::memory_order_acquire) &&
@@ -238,11 +264,11 @@ public:
                 std::lock_guard lock(slot.mutex);
                 if (slot.active.load(std::memory_order_relaxed) &&
                     slot.position.symbol == symbol) {
-                    return &slot.position;
+                    return slot.position;
                 }
             }
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     bool open_position(const Position& pos) {
@@ -442,9 +468,16 @@ public:
 
     struct PremiumInfo {
         SymbolId symbol;
+        double korean_bid{0.0};
+        double korean_ask{0.0};
+        double foreign_bid{0.0};
+        double foreign_ask{0.0};
         double korean_price{0.0};
         double foreign_price{0.0};
         double usdt_rate{0.0};
+        double entry_premium{0.0};
+        double exit_premium{0.0};
+        double premium_spread{0.0};   // entry - exit
         double premium{0.0};
         double funding_rate{0.0};
         int funding_interval_hours{8};
@@ -528,9 +561,9 @@ private:
     PositionTracker position_tracker_;
     CapitalTracker capital_tracker_{2000.0};  // 초기 자본 $2000
 
-    // Signal queues (lock-free)
-    memory::SPSCRingBuffer<ArbitrageSignal, 64> entry_signals_;
-    memory::SPSCRingBuffer<ExitSignal, 64> exit_signals_;
+    // Signal queues (lock-free, multi-producer safe)
+    memory::MPMCRingBuffer<ArbitrageSignal, 256> entry_signals_;
+    memory::MPMCRingBuffer<ExitSignal, 256> exit_signals_;
 
     // Callbacks
     EntryCallback on_entry_signal_;
@@ -555,6 +588,8 @@ private:
     mutable std::condition_variable update_cv_;
     std::atomic<uint64_t> update_seq_{0};
     std::array<std::atomic<double>, static_cast<size_t>(Exchange::Count)> last_usdt_log_{};
+    std::atomic<bool> usdt_full_scan_pending_{false};
+    std::atomic<uint64_t> last_usdt_update_ms_{0};
 
     // Internal methods
     void monitor_loop();

@@ -7,9 +7,71 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <fmt/format.h>
 
 namespace kimp::strategy {
+
+namespace {
+
+uint64_t steady_now_ms() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+double spread_pct(double bid, double ask) {
+    if (bid <= 0.0 || ask <= 0.0 || ask < bid) {
+        return std::numeric_limits<double>::infinity();
+    }
+    double mid = (bid + ask) * 0.5;
+    if (mid <= 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return ((ask - bid) / mid) * 100.0;
+}
+
+bool quote_is_fresh(const PriceCache::PriceData& price, uint64_t now_ms) {
+    if (!price.valid || price.timestamp == 0) {
+        return false;
+    }
+    if (now_ms < price.timestamp) {
+        return false;
+    }
+    return (now_ms - price.timestamp) <= TradingConfig::MAX_QUOTE_AGE_MS;
+}
+
+bool quote_pair_is_usable(Exchange korean_ex,
+                          Exchange foreign_ex,
+                          const PriceCache::PriceData& korean_price,
+                          const PriceCache::PriceData& foreign_price) {
+    (void)korean_ex;
+    (void)foreign_ex;
+
+    const uint64_t now_ms = steady_now_ms();
+    if (!quote_is_fresh(korean_price, now_ms) || !quote_is_fresh(foreign_price, now_ms)) {
+        return false;
+    }
+
+    const uint64_t ts_diff = korean_price.timestamp >= foreign_price.timestamp
+                                 ? korean_price.timestamp - foreign_price.timestamp
+                                 : foreign_price.timestamp - korean_price.timestamp;
+    if (ts_diff > TradingConfig::MAX_QUOTE_DESYNC_MS) {
+        return false;
+    }
+
+    const double kr_spread = spread_pct(korean_price.bid, korean_price.ask);
+    const double fr_spread = spread_pct(foreign_price.bid, foreign_price.ask);
+    if (kr_spread > TradingConfig::MAX_KOREAN_SPREAD_PCT) {
+        return false;
+    }
+    if (fr_spread > TradingConfig::MAX_FOREIGN_SPREAD_PCT) {
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
 
 // PriceCache is now fully inline in header (using std::unordered_map with string keys)
 // PositionTracker is now fully inline in header (lock-free implementation)
@@ -74,7 +136,11 @@ void ArbitrageEngine::stop() {
 }
 
 void ArbitrageEngine::on_ticker_update(const Ticker& ticker) {
-    price_cache_.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last);
+    const uint64_t ticker_ts_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            ticker.timestamp.time_since_epoch()).count());
+    price_cache_.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last,
+                        ticker_ts_ms);
 
     // Update funding rate for futures exchanges (cache even if 0)
     if (kimp::is_foreign_exchange(ticker.exchange)) {
@@ -86,10 +152,21 @@ void ArbitrageEngine::on_ticker_update(const Ticker& ticker) {
 
     // Update USDT price if this is USDT/KRW (fast char-based check)
     if (ticker.symbol.is_usdt_krw()) {
-        on_usdt_update(ticker.exchange, ticker.last);
-        // USDT rate change affects ALL symbols - check all
-        check_entry_opportunities();
-        check_exit_conditions();
+        double usdt_price = ticker.last;
+        if (ticker.bid > 0.0 && ticker.ask > 0.0 && ticker.ask >= ticker.bid) {
+            usdt_price = (ticker.bid + ticker.ask) * 0.5;  // Prefer executable mid over last trade
+        }
+        on_usdt_update(ticker.exchange, usdt_price);
+        if (!running_.load(std::memory_order_relaxed)) {
+            // Preserve legacy behavior for tests/startup paths that call on_ticker_update
+            // before monitor_loop is running.
+            check_entry_opportunities();
+            check_exit_conditions();
+        } else {
+            // Debounced in monitor_loop: coalesce bursty USDT updates into one full scan.
+            last_usdt_update_ms_.store(steady_now_ms(), std::memory_order_release);
+            usdt_full_scan_pending_.store(true, std::memory_order_release);
+        }
         update_seq_.fetch_add(1, std::memory_order_release);
         update_cv_.notify_all();
         return;
@@ -104,10 +181,25 @@ void ArbitrageEngine::on_ticker_update(const Ticker& ticker) {
 }
 
 void ArbitrageEngine::on_usdt_update(Exchange ex, double price) {
+    if (price <= 0.0) {
+        return;
+    }
+
+    double prev = price_cache_.get_usdt_krw(ex);
+    if (prev > 0.0) {
+        double jump_pct = std::fabs(price - prev) / prev * 100.0;
+        if (jump_pct > TradingConfig::MAX_USDT_JUMP_PCT) {
+            Logger::warn("USDT/KRW outlier filtered from {}: prev={:.2f}, new={:.2f}, jump={:.2f}%",
+                         ex == Exchange::Bithumb ? "Bithumb" : "Upbit",
+                         prev, price, jump_pct);
+            return;
+        }
+    }
+
     const auto idx = static_cast<size_t>(ex);
     const double last_logged = last_usdt_log_[idx].load(std::memory_order_relaxed);
     if (std::fabs(price - last_logged) >= 1.0) {
-        Logger::info("USDT/KRW update from {}: {:.2f}", ex == Exchange::Bithumb ? "Bithumb" : "Upbit", price);
+        Logger::debug("USDT/KRW update from {}: {:.2f}", ex == Exchange::Bithumb ? "Bithumb" : "Upbit", price);
         last_usdt_log_[idx].store(price, std::memory_order_relaxed);
     }
     price_cache_.update_usdt_krw(ex, price);
@@ -159,11 +251,14 @@ double ArbitrageEngine::calculate_premium(const SymbolId& symbol,
     if (!foreign_price.valid || foreign_price.bid <= 0) {
         return 0.0;
     }
+    if (!quote_pair_is_usable(korean_ex, foreign_ex, korean_price, foreign_price)) {
+        return 0.0;
+    }
 
-    // Get USDT/KRW rate
+    // Get USDT/KRW rate - must be real data
     double usdt_rate = price_cache_.get_usdt_krw(korean_ex);
     if (usdt_rate <= 0) {
-        usdt_rate = TradingConfig::DEFAULT_USDT_KRW;
+        return 0.0;  // No real USDT/KRW rate available, skip
     }
 
     return PremiumCalculator::calculate_entry_premium(
@@ -185,15 +280,49 @@ void ArbitrageEngine::monitor_loop() {
     Logger::info("ArbitrageEngine monitor loop started (backup mode - main logic is event-driven)");
 
     // BACKUP ONLY: Primary checking happens in on_ticker_update() (event-driven, 0ms latency)
-    // This loop serves as a safety net in case events are missed
-    constexpr auto backup_interval = std::chrono::milliseconds(100);
+    // This loop serves as a safety net in case events are missed.
+    // Run entry/exit backups on independent schedules to avoid 100ms full scans.
+    constexpr auto loop_interval = std::chrono::milliseconds(50);
+    constexpr auto entry_backup_interval = std::chrono::milliseconds(1500);
+    constexpr auto exit_backup_interval = std::chrono::milliseconds(250);
+    auto next_entry_backup = std::chrono::steady_clock::now();
+    auto next_exit_backup = std::chrono::steady_clock::now();
 
     while (running_.load(std::memory_order_relaxed)) {
-        // Backup check - should rarely trigger if event-driven is working
-        check_entry_opportunities();
-        check_exit_conditions();
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t now_ms = steady_now_ms();
+        const bool has_position = position_tracker_.has_any_position();
+        const bool can_open_new = position_tracker_.can_open_position();
 
-        std::this_thread::sleep_for(backup_interval);
+        // Debounced full scan after USDT updates to avoid repeated full-symbol sweeps.
+        if (usdt_full_scan_pending_.load(std::memory_order_acquire)) {
+            const uint64_t last_usdt_ms = last_usdt_update_ms_.load(std::memory_order_acquire);
+            if (last_usdt_ms != 0 &&
+                now_ms >= (last_usdt_ms + TradingConfig::USDT_FULL_SCAN_DEBOUNCE_MS)) {
+                usdt_full_scan_pending_.store(false, std::memory_order_release);
+                check_entry_opportunities();
+                check_exit_conditions();
+                next_entry_backup = now + entry_backup_interval;
+                next_exit_backup = now + exit_backup_interval;
+            }
+        }
+
+        // Backup entry scan only when there is room for new positions.
+        if (can_open_new && now >= next_entry_backup) {
+            check_entry_opportunities();
+            next_entry_backup = now + entry_backup_interval;
+        }
+
+        // Backup exit scan only when there are active positions.
+        if (has_position && now >= next_exit_backup) {
+            check_exit_conditions();
+            next_exit_backup = now + exit_backup_interval;
+        } else if (!has_position && now >= next_exit_backup) {
+            // Keep timer moving while flat to allow immediate backup check on next position.
+            next_exit_backup = now + exit_backup_interval;
+        }
+
+        std::this_thread::sleep_for(loop_interval);
     }
 
     Logger::info("ArbitrageEngine monitor loop ended");
@@ -204,7 +333,7 @@ void ArbitrageEngine::check_entry_opportunities() {
     // 병렬 포지션 관리: 조건 만족하는 모든 코인에 진입
     // - 8시간 펀딩 간격
     // - 펀딩비 양수
-    // - 프리미엄 <= -0.75%
+    // - 프리미엄 <= -0.99%
     // ==========================================================================
 
     if (!position_tracker_.can_open_position()) {
@@ -231,9 +360,10 @@ void ArbitrageEngine::check_entry_opportunities() {
 
                 auto foreign_price = price_cache_.get_price(foreign_ex, foreign_symbol);
                 if (!foreign_price.valid || foreign_price.bid <= 0) continue;
+                if (!quote_pair_is_usable(korean_ex, foreign_ex, korean_price, foreign_price)) continue;
 
                 // FILTER 1: 8시간 펀딩 간격만
-                if (foreign_price.funding_interval_hours < TradingConfig::MIN_FUNDING_INTERVAL_HOURS) {
+                if (foreign_price.funding_interval_hours != TradingConfig::MIN_FUNDING_INTERVAL_HOURS) {
                     continue;
                 }
 
@@ -242,9 +372,9 @@ void ArbitrageEngine::check_entry_opportunities() {
                 if (TradingConfig::REQUIRE_POSITIVE_FUNDING && funding_rate < 0.0) continue;
 
                 double usdt_rate = price_cache_.get_usdt_krw(korean_ex);
-                if (usdt_rate <= 0) usdt_rate = TradingConfig::DEFAULT_USDT_KRW;
+                if (usdt_rate <= 0) continue;  // No real USDT/KRW rate
 
-                // FILTER 3: 프리미엄 -0.75% 이하 (역프)
+                // FILTER 3: 프리미엄 -0.99% 이하 (역프)
                 double premium = PremiumCalculator::calculate_entry_premium(
                     korean_price.ask, foreign_price.bid, usdt_rate);
                 if (premium > TradingConfig::ENTRY_PREMIUM_THRESHOLD) continue;
@@ -295,9 +425,10 @@ void ArbitrageEngine::check_entry_opportunities() {
 
             auto foreign_price = price_cache_.get_price(foreign_ex, foreign_symbol);
             if (!foreign_price.valid || foreign_price.bid <= 0) continue;
+            if (!quote_pair_is_usable(korean_ex, foreign_ex, korean_price, foreign_price)) continue;
 
             // FILTER 1: 8시간 펀딩 간격만
-            if (foreign_price.funding_interval_hours < TradingConfig::MIN_FUNDING_INTERVAL_HOURS) {
+            if (foreign_price.funding_interval_hours != TradingConfig::MIN_FUNDING_INTERVAL_HOURS) {
                 continue;
             }
 
@@ -306,9 +437,9 @@ void ArbitrageEngine::check_entry_opportunities() {
             if (TradingConfig::REQUIRE_POSITIVE_FUNDING && funding_rate < 0.0) continue;
 
             double usdt_rate = price_cache_.get_usdt_krw(korean_ex);
-            if (usdt_rate <= 0) usdt_rate = TradingConfig::DEFAULT_USDT_KRW;
+            if (usdt_rate <= 0) continue;  // No real USDT/KRW rate
 
-            // FILTER 3: 프리미엄 -0.75% 이하 (역프)
+            // FILTER 3: 프리미엄 -0.99% 이하 (역프)
             double premium = PremiumCalculator::calculate_entry_premium(
                 korean_price.ask, foreign_price.bid, usdt_rate);
             if (premium > TradingConfig::ENTRY_PREMIUM_THRESHOLD) continue;
@@ -361,16 +492,19 @@ void ArbitrageEngine::check_exit_conditions() {
 
         auto foreign_price = price_cache_.get_price(pos.foreign_exchange, *foreign_symbol_ptr);
         if (!foreign_price.valid || foreign_price.ask <= 0) continue;
+        if (!quote_pair_is_usable(pos.korean_exchange, pos.foreign_exchange, korean_price, foreign_price)) continue;
 
         double usdt_rate = price_cache_.get_usdt_krw(pos.korean_exchange);
-        if (usdt_rate <= 0) usdt_rate = TradingConfig::DEFAULT_USDT_KRW;
+        if (usdt_rate <= 0) continue;  // No real USDT/KRW rate
 
         // Calculate exit premium
         double premium = PremiumCalculator::calculate_exit_premium(
             korean_price.bid, foreign_price.ask, usdt_rate);
 
-        // Dynamic exit threshold based on position's entry premium + fees + min profit
-        double dynamic_exit = pos.entry_premium + TradingConfig::DYNAMIC_EXIT_SPREAD;
+        // Dynamic exit threshold with a hard floor (+0.10% by default)
+        double dynamic_exit = std::max(
+            pos.entry_premium + TradingConfig::DYNAMIC_EXIT_SPREAD,
+            TradingConfig::EXIT_PREMIUM_THRESHOLD);
         if (premium < dynamic_exit) continue;
 
         // Generate signal
@@ -429,15 +563,16 @@ void ArbitrageEngine::check_symbol_opportunity(Exchange updated_ex, const Symbol
 
                 auto foreign_price = price_cache_.get_price(foreign_ex, foreign_symbol);
                 if (!foreign_price.valid || foreign_price.bid <= 0) continue;
+                if (!quote_pair_is_usable(korean_ex, foreign_ex, korean_price, foreign_price)) continue;
 
                 // Only immediate entry for coins meeting funding interval filter
-                if (foreign_price.funding_interval_hours < TradingConfig::MIN_FUNDING_INTERVAL_HOURS) continue;
+                if (foreign_price.funding_interval_hours != TradingConfig::MIN_FUNDING_INTERVAL_HOURS) continue;
 
                 double funding_rate = foreign_price.funding_rate;
                 if (TradingConfig::REQUIRE_POSITIVE_FUNDING && funding_rate < 0.0) continue;
 
                 double usdt_rate = price_cache_.get_usdt_krw(korean_ex);
-                if (usdt_rate <= 0) usdt_rate = TradingConfig::DEFAULT_USDT_KRW;
+                if (usdt_rate <= 0) continue;  // No real USDT/KRW rate
 
                 double premium = PremiumCalculator::calculate_entry_premium(
                     korean_price.ask, foreign_price.bid, usdt_rate);
@@ -466,29 +601,33 @@ void ArbitrageEngine::check_symbol_opportunity(Exchange updated_ex, const Symbol
 
     // Check EXIT opportunity (only if we have a position for this symbol)
     if (position_tracker_.has_position(korean_symbol)) {
-        const Position* pos = position_tracker_.get_position(korean_symbol);
-        if (!pos) return;
+        auto pos_opt = position_tracker_.get_position(korean_symbol);
+        if (!pos_opt) return;
+        const auto& pos = *pos_opt;
 
-        auto korean_price = price_cache_.get_price(pos->korean_exchange, korean_symbol);
+        auto korean_price = price_cache_.get_price(pos.korean_exchange, korean_symbol);
         if (!korean_price.valid || korean_price.bid <= 0) return;
 
-        auto foreign_price = price_cache_.get_price(pos->foreign_exchange, foreign_symbol);
+        auto foreign_price = price_cache_.get_price(pos.foreign_exchange, foreign_symbol);
         if (!foreign_price.valid || foreign_price.ask <= 0) return;
+        if (!quote_pair_is_usable(pos.korean_exchange, pos.foreign_exchange, korean_price, foreign_price)) return;
 
-        double usdt_rate = price_cache_.get_usdt_krw(pos->korean_exchange);
-        if (usdt_rate <= 0) usdt_rate = TradingConfig::DEFAULT_USDT_KRW;
+        double usdt_rate = price_cache_.get_usdt_krw(pos.korean_exchange);
+        if (usdt_rate <= 0) return;  // No real USDT/KRW rate
 
         double premium = PremiumCalculator::calculate_exit_premium(
             korean_price.bid, foreign_price.ask, usdt_rate);
 
-        // Dynamic exit threshold based on position's entry premium
-        double dynamic_exit = pos->entry_premium + TradingConfig::DYNAMIC_EXIT_SPREAD;
+        // Dynamic exit threshold with a hard floor (+0.10% by default)
+        double dynamic_exit = std::max(
+            pos.entry_premium + TradingConfig::DYNAMIC_EXIT_SPREAD,
+            TradingConfig::EXIT_PREMIUM_THRESHOLD);
         if (premium < dynamic_exit) return;
 
         ExitSignal signal;
         signal.symbol = korean_symbol;
-        signal.korean_exchange = pos->korean_exchange;
-        signal.foreign_exchange = pos->foreign_exchange;
+        signal.korean_exchange = pos.korean_exchange;
+        signal.foreign_exchange = pos.foreign_exchange;
         signal.premium = premium;
         signal.korean_bid = korean_price.bid;
         signal.foreign_ask = foreign_price.ask;
@@ -541,9 +680,10 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
 
             auto foreign_price = price_cache_.get_price(foreign_ex, foreign_symbol);
             if (!foreign_price.valid || foreign_price.bid <= 0) continue;
+            if (!quote_pair_is_usable(korean_ex, foreign_ex, korean_price, foreign_price)) continue;
 
             double usdt_rate = price_cache_.get_usdt_krw(korean_ex);
-            if (usdt_rate <= 0) usdt_rate = TradingConfig::DEFAULT_USDT_KRW;
+            if (usdt_rate <= 0) continue;  // No real USDT/KRW rate
 
             korean_asks.push_back(korean_price.ask);
             foreign_bids.push_back(foreign_price.bid);
@@ -587,14 +727,23 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
     for (size_t i = 0; i < count; ++i) {
         PremiumInfo info;
         info.symbol = monitored_symbols_[symbol_indices[i]];
+        info.korean_bid = korean_bids[i];
+        info.korean_ask = korean_asks[i];
+        info.foreign_bid = foreign_bids[i];
+        info.foreign_ask = foreign_asks[i];
         info.korean_price = korean_asks[i];
         info.foreign_price = foreign_bids[i];
         info.usdt_rate = usdt_rates[i];
-        info.premium = entry_premiums[i];
+        info.entry_premium = entry_premiums[i];
+        info.exit_premium = exit_premiums[i];
+        info.premium_spread = entry_premiums[i] - exit_premiums[i];
+        info.premium = entry_premiums[i];  // Backward-compatible alias
         info.funding_rate = funding_rates[i];
         info.funding_interval_hours = funding_intervals[i];
         info.next_funding_time = next_funding_times[i];
-        info.entry_signal = entry_premiums[i] <= TradingConfig::ENTRY_PREMIUM_THRESHOLD;
+        info.entry_signal = (entry_premiums[i] <= TradingConfig::ENTRY_PREMIUM_THRESHOLD) &&
+                            (funding_intervals[i] == TradingConfig::MIN_FUNDING_INTERVAL_HOURS) &&
+                            (!TradingConfig::REQUIRE_POSITIVE_FUNDING || funding_rates[i] >= 0.0);
         info.exit_signal = exit_premiums[i] >= TradingConfig::EXIT_PREMIUM_THRESHOLD;
         result.push_back(info);
     }
@@ -633,9 +782,16 @@ void ArbitrageEngine::export_to_json(const std::string& path) const {
         fmt::format_to(std::back_inserter(buffer),
             "    {{\n"
             "      \"symbol\": \"{}/{}\",\n"
+            "      \"koreanBid\": {:.2f},\n"
+            "      \"koreanAsk\": {:.2f},\n"
+            "      \"foreignBid\": {:.6f},\n"
+            "      \"foreignAsk\": {:.6f},\n"
             "      \"koreanPrice\": {:.2f},\n"
             "      \"foreignPrice\": {:.4f},\n"
             "      \"usdtRate\": {:.2f},\n"
+            "      \"entryPremium\": {:.4f},\n"
+            "      \"exitPremium\": {:.4f},\n"
+            "      \"premiumSpread\": {:.4f},\n"
             "      \"premium\": {:.4f},\n"
             "      \"fundingRate\": {:.6f},\n"
             "      \"fundingIntervalHours\": {},\n"
@@ -644,7 +800,10 @@ void ArbitrageEngine::export_to_json(const std::string& path) const {
             "      \"timestamp\": {}\n"
             "    }}",
             p.symbol.get_base(), p.symbol.get_quote(),
-            p.korean_price, p.foreign_price, p.usdt_rate, p.premium,
+            p.korean_bid, p.korean_ask,
+            p.foreign_bid, p.foreign_ask,
+            p.korean_price, p.foreign_price, p.usdt_rate,
+            p.entry_premium, p.exit_premium, p.premium_spread, p.premium,
             p.funding_rate, p.funding_interval_hours, p.next_funding_time,
             signal_str, now_ms);
 

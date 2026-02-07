@@ -283,10 +283,8 @@ public:
         conn->mark_failed();
         reconnections_.fetch_add(1, std::memory_order_relaxed);
 
-        // Schedule replacement connection
-        net::post(io_context_, [this, conn]() {
-            replace_connection(conn);
-        });
+        // Synchronous replacement so retry gets a fresh connection immediately
+        replace_connection(conn);
 
         pool_cv_.notify_one();
     }

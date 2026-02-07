@@ -228,20 +228,23 @@ void WebSocketClient::do_write() {
         return;
     }
 
+    current_write_message_ = std::move(*message);
     ws_->text(true);
     ws_->async_write(
-        net::buffer(*message),
+        net::buffer(current_write_message_),
         beast::bind_front_handler(&WebSocketClient::on_write, shared_from_this()));
 }
 
 void WebSocketClient::on_write(beast::error_code ec, std::size_t bytes_transferred) {
     if (ec) {
         handle_error("write", ec);
+        current_write_message_.clear();
         is_writing_ = false;
         reconnect();
         return;
     }
 
+    current_write_message_.clear();
     // Continue writing if there are more messages
     do_write();
 }
