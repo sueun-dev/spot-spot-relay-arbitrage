@@ -144,6 +144,14 @@ target_link_libraries(kimp_test_s6_to_s8 PRIVATE kimp_lib)
 add_executable(kimp_test_live_hedge tests/test_live_hedge_accuracy.cpp)
 target_link_libraries(kimp_test_live_hedge PRIVATE kimp_lib)
 
+# Multi-coin hedge accuracy test (REAL TRADES: 5 coins x $25 x 3 entry + split exit)
+add_executable(kimp_test_multicoin_hedge tests/test_multicoin_hedge.cpp)
+target_link_libraries(kimp_test_multicoin_hedge PRIVATE kimp_lib)
+
+# Parallel fill execution test (100-step: entry + hold + exit hedge accuracy)
+add_executable(kimp_test_parallel_fill tests/test_parallel_fill.cpp)
+target_link_libraries(kimp_test_parallel_fill PRIVATE kimp_lib)
+
 # Copy config and trade_logs directories to build dir so bot runs from build/
 add_custom_command(TARGET kimp_bot POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/config

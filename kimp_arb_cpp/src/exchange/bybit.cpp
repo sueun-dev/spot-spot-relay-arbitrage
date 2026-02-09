@@ -1,4 +1,5 @@
 #include "kimp/exchange/bybit/bybit.hpp"
+#include "kimp/exchange/bybit/bybit_trade_ws.hpp"
 #include "kimp/core/logger.hpp"
 #include "kimp/core/optimization.hpp"
 
@@ -61,10 +62,53 @@ bool BybitExchange::connect() {
     });
 
     ws_client_->connect(credentials_.ws_endpoint);
+
+    // Initialize WebSocket Trade API for low-latency order placement
+    if (!credentials_.ws_trade_endpoint.empty()) {
+        trade_ws_ = std::make_unique<BybitTradeWS>(io_context_, credentials_);
+        trade_ws_->connect();
+    }
+
+    // Connect Private WS for real-time fill data (replaces REST fill query)
+    if (!credentials_.ws_private_endpoint.empty() && !credentials_.api_key.empty()) {
+        private_ws_ = std::make_shared<network::WebSocketClient>(io_context_, "Bybit-Private-WS");
+
+        private_ws_->set_message_callback([this](std::string_view msg, network::MessageType) {
+            on_private_ws_message(msg);
+        });
+
+        private_ws_->set_connect_callback([this](bool success, const std::string& error) {
+            if (success) {
+                Logger::info("[Bybit-PrivateWS] Connected, authenticating...");
+                authenticate_private_ws();
+            } else {
+                Logger::error("[Bybit-PrivateWS] Connection failed: {}", error);
+            }
+        });
+
+        private_ws_->set_disconnect_callback([this](const std::string& reason) {
+            private_ws_authenticated_ = false;
+            Logger::warn("[Bybit-PrivateWS] Disconnected: {}", reason);
+        });
+
+        private_ws_->connect(credentials_.ws_private_endpoint);
+    }
+
     return true;
 }
 
 void BybitExchange::disconnect() {
+    // Shutdown Private WS
+    if (private_ws_) {
+        private_ws_->disconnect();
+        private_ws_authenticated_ = false;
+    }
+
+    // Shutdown Trade WS
+    if (trade_ws_) {
+        trade_ws_->disconnect();
+    }
+
     // Shutdown REST connection pool
     shutdown_rest();
 
@@ -320,11 +364,7 @@ Order BybitExchange::place_market_order(const SymbolId& symbol, Side side, Quant
         return order;
     }
 
-    std::string order_id_str;
-    parse_order_response(response.body, order, &order_id_str);
-    if (order.status == OrderStatus::Filled && !order_id_str.empty()) {
-        query_order_fill(order_id_str, order);
-    }
+    parse_order_response(response.body, order, &order.order_id_str);
     return order;
 }
 
@@ -344,6 +384,23 @@ Order BybitExchange::open_short(const SymbolId& symbol, Quantity quantity) {
     order.client_order_id = generate_order_id();
     order.create_time = std::chrono::system_clock::now();
 
+    // Try WebSocket Trade API first (~5-20ms vs ~150-300ms REST)
+    if (trade_ws_ && trade_ws_->is_connected()) {
+        int pos_idx = use_hedge_mode() ? SHORT_POSITION_IDX : 0;
+        Order ws_order = trade_ws_->place_order_sync(
+            symbol_to_bybit(symbol), Side::Sell, adj_qty, false, pos_idx);
+        if (ws_order.status != OrderStatus::Rejected) {
+            ws_order.symbol = symbol;
+            ws_order.quantity = adj_qty;
+            ws_order.client_order_id = order.client_order_id;
+            Logger::info("[Bybit-WS] Opened short {} {} - orderId: {}",
+                         symbol.to_string(), adj_qty, ws_order.order_id_str);
+            return ws_order;
+        }
+        Logger::warn("[Bybit] WS order failed, falling back to REST");
+    }
+
+    // REST fallback
     std::ostringstream body;
     body << R"({"category":"linear",)";
     body << R"("symbol":")" << symbol_to_bybit(symbol) << R"(",)";
@@ -366,14 +423,10 @@ Order BybitExchange::open_short(const SymbolId& symbol, Quantity quantity) {
         return order;
     }
 
-    std::string order_id_str;
-    parse_order_response(response.body, order, &order_id_str);
-    if (order.status == OrderStatus::Filled && !order_id_str.empty()) {
-        query_order_fill(order_id_str, order);
-    }
-    Logger::info("[Bybit] Opened short {} {} - Status: {}, avgPrice: {:.8f}, filledQty: {:.8f}",
+    parse_order_response(response.body, order, &order.order_id_str);
+    Logger::info("[Bybit-REST] Opened short {} {} - Status: {}, orderId: {}",
                  symbol.to_string(), adj_qty, static_cast<int>(order.status),
-                 order.average_price, order.filled_quantity);
+                 order.order_id_str);
     return order;
 }
 
@@ -393,6 +446,23 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
     order.client_order_id = generate_order_id();
     order.create_time = std::chrono::system_clock::now();
 
+    // Try WebSocket Trade API first (~5-20ms vs ~150-300ms REST)
+    if (trade_ws_ && trade_ws_->is_connected()) {
+        int pos_idx = use_hedge_mode() ? SHORT_POSITION_IDX : 0;
+        Order ws_order = trade_ws_->place_order_sync(
+            symbol_to_bybit(symbol), Side::Buy, adj_qty, true, pos_idx);
+        if (ws_order.status != OrderStatus::Rejected) {
+            ws_order.symbol = symbol;
+            ws_order.quantity = adj_qty;
+            ws_order.client_order_id = order.client_order_id;
+            Logger::info("[Bybit-WS] Closed short {} {} - orderId: {}",
+                         symbol.to_string(), adj_qty, ws_order.order_id_str);
+            return ws_order;
+        }
+        Logger::warn("[Bybit] WS close failed, falling back to REST");
+    }
+
+    // REST fallback
     std::ostringstream body;
     body << R"({"category":"linear",)";
     body << R"("symbol":")" << symbol_to_bybit(symbol) << R"(",)";
@@ -415,14 +485,10 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
         return order;
     }
 
-    std::string order_id_str;
-    parse_order_response(response.body, order, &order_id_str);
-    if (order.status == OrderStatus::Filled && !order_id_str.empty()) {
-        query_order_fill(order_id_str, order);
-    }
-    Logger::info("[Bybit] Closed short {} {} - Status: {}, avgPrice: {:.8f}, filledQty: {:.8f}",
+    parse_order_response(response.body, order, &order.order_id_str);
+    Logger::info("[Bybit-REST] Closed short {} {} - Status: {}, orderId: {}",
                  symbol.to_string(), adj_qty, static_cast<int>(order.status),
-                 order.average_price, order.filled_quantity);
+                 order.order_id_str);
     return order;
 }
 
@@ -444,7 +510,10 @@ double BybitExchange::normalize_order_qty(const SymbolId& symbol, double qty, bo
     }
 
     if (step > 0.0) {
-        qty = std::floor(qty / step) * step;
+        // Add small epsilon before floor to prevent floating-point precision loss
+        // e.g. 0.04/0.01 = 3.9999999996 → floor=3 → 0.03 (wrong!)
+        // With epsilon: 3.9999999996 + 1e-9 = 4.000000000 → floor=4 → 0.04 (correct)
+        qty = std::floor(qty / step + 1e-9) * step;
     }
     if (qty < min_qty) {
         return 0.0;
@@ -564,35 +633,48 @@ bool BybitExchange::close_position(const SymbolId& symbol) {
 }
 
 double BybitExchange::get_balance(const std::string& currency) {
-    std::string query = "accountType=UNIFIED";
-    auto headers = build_auth_headers(query);
-    auto response = rest_client_->get("/v5/account/wallet-balance?" + query, headers);
+    // Try UNIFIED first (Unified Trading Account), fall back to CONTRACT (legacy)
+    for (const char* acct_type : {"UNIFIED", "CONTRACT"}) {
+        std::string query = std::string("accountType=") + acct_type;
+        auto headers = build_auth_headers(query);
+        auto response = rest_client_->get("/v5/account/wallet-balance?" + query, headers);
 
-    if (!response.success) {
-        Logger::error("[Bybit] Failed to fetch balance: {}", response.error);
-        return 0.0;
-    }
+        if (!response.success) {
+            Logger::error("[Bybit] Failed to fetch balance ({}): {}", acct_type, response.error);
+            continue;
+        }
 
-    try {
-        simdjson::ondemand::parser local_parser;
-        simdjson::padded_string padded(response.body);
-        auto doc = local_parser.iterate(padded);
-        auto list = doc["result"]["list"].get_array();
+        try {
+            simdjson::ondemand::parser local_parser;
+            simdjson::padded_string padded(response.body);
+            auto doc = local_parser.iterate(padded);
 
-        for (auto account : list) {
-            auto coins = account["coin"].get_array();
-            for (auto coin : coins) {
-                std::string_view coin_name = coin["coin"].get_string().value();
-                if (coin_name == currency) {
-                    std::string_view balance_str = coin["availableToWithdraw"].get_string().value();
-                    return opt::fast_stod(balance_str);
+            int ret_code = static_cast<int>(doc["retCode"].get_int64().value());
+            if (ret_code != 0) {
+                std::string_view ret_msg = doc["retMsg"].get_string().value();
+                Logger::warn("[Bybit] Balance query retCode={} ({}): {}", ret_code, acct_type, ret_msg);
+                continue;
+            }
+
+            auto list = doc["result"]["list"].get_array();
+            for (auto account : list) {
+                auto coins = account["coin"].get_array();
+                for (auto coin : coins) {
+                    std::string_view coin_name = coin["coin"].get_string().value();
+                    if (coin_name == currency) {
+                        std::string_view balance_str = coin["walletBalance"].get_string().value();
+                        double balance = opt::fast_stod(balance_str);
+                        Logger::info("[Bybit] {} balance: {} ({})", currency, balance, acct_type);
+                        return balance;
+                    }
                 }
             }
+        } catch (const simdjson::simdjson_error& e) {
+            Logger::error("[Bybit] Failed to parse balance ({}): {}", acct_type, e.what());
         }
-    } catch (const simdjson::simdjson_error& e) {
-        Logger::error("[Bybit] Failed to parse balance: {}", e.what());
     }
 
+    Logger::warn("[Bybit] {} not found in any account type", currency);
     return 0.0;
 }
 
@@ -742,15 +824,49 @@ bool BybitExchange::parse_order_response(const std::string& response, Order& ord
 }
 
 bool BybitExchange::query_order_fill(const std::string& order_id, Order& order) {
+    // Try WS fill cache first (~50-200ms vs ~300ms+ REST)
+    if (private_ws_authenticated_.load()) {
+        std::unique_lock lock(fill_cache_mutex_);
+
+        // Check immediately
+        auto it = fill_cache_.find(order_id);
+        if (it != fill_cache_.end()) {
+            order.average_price = it->second.avg_price;
+            order.filled_quantity = it->second.filled_qty;
+            fill_cache_.erase(it);
+            Logger::info("[Bybit-WS] Fill: orderId={}, avgPrice={:.8f}, filledQty={:.8f}",
+                         order_id, order.average_price, order.filled_quantity);
+            return true;
+        }
+
+        // Wait up to 500ms for fill event from Private WS
+        bool found = fill_cache_cv_.wait_for(lock, std::chrono::milliseconds(500), [&]() {
+            return fill_cache_.find(order_id) != fill_cache_.end();
+        });
+
+        if (found) {
+            it = fill_cache_.find(order_id);
+            order.average_price = it->second.avg_price;
+            order.filled_quantity = it->second.filled_qty;
+            fill_cache_.erase(it);
+            Logger::info("[Bybit-WS] Fill (waited): orderId={}, avgPrice={:.8f}, filledQty={:.8f}",
+                         order_id, order.average_price, order.filled_quantity);
+            return true;
+        }
+
+        Logger::warn("[Bybit] WS fill cache miss for {}, falling back to REST", order_id);
+    }
+
+    // REST fallback
     constexpr int MAX_RETRIES = 5;
-    constexpr int BASE_DELAY_MS = 300;  // 300, 600, 1200, 2400ms backoff
+    constexpr int BASE_DELAY_MS = 300;
 
     std::string query = "category=linear&orderId=" + order_id;
     std::string endpoint = "/v5/order/realtime?" + query;
 
     for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
         if (attempt > 0) {
-            int delay = BASE_DELAY_MS * (1 << (attempt - 1));  // exponential backoff
+            int delay = BASE_DELAY_MS * (1 << (attempt - 1));
             Logger::warn("[Bybit] Fill query retry {}/{} for order {} (wait {}ms)",
                          attempt + 1, MAX_RETRIES, order_id, delay);
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
@@ -793,14 +909,13 @@ bool BybitExchange::query_order_fill(const std::string& order_id, Order& order) 
                 }
 
                 if (order.average_price > 0 && order.filled_quantity > 0) {
-                    Logger::info("[Bybit] Fill: orderId={}, avgPrice={:.8f}, filledQty={:.8f}",
+                    Logger::info("[Bybit-REST] Fill: orderId={}, avgPrice={:.8f}, filledQty={:.8f}",
                                  order_id, order.average_price, order.filled_quantity);
                     return true;
                 }
-                break;  // Only check first result
+                break;
             }
 
-            // List empty or avgPrice=0 — order may not be settled yet
             Logger::warn("[Bybit] Order {} fill data incomplete, attempt {}/{}",
                          order_id, attempt + 1, MAX_RETRIES);
         } catch (const simdjson::simdjson_error& e) {
@@ -811,6 +926,79 @@ bool BybitExchange::query_order_fill(const std::string& order_id, Order& order) 
     Logger::error("[Bybit] Failed to get fill price after {} retries for order {}",
                   MAX_RETRIES, order_id);
     return false;
+}
+
+void BybitExchange::authenticate_private_ws() {
+    int64_t expires = utils::Crypto::timestamp_ms() + 10000;
+    std::string val = "GET/realtime" + std::to_string(expires);
+    std::string signature = utils::Crypto::hmac_sha256(credentials_.secret_key, val);
+
+    std::ostringstream ss;
+    ss << R"({"op":"auth","args":[")" << credentials_.api_key << R"(",)";
+    ss << expires << R"(,")" << signature << R"("]})";
+
+    private_ws_->send(ss.str());
+}
+
+void BybitExchange::on_private_ws_message(std::string_view message) {
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(message);
+        auto doc = local_parser.iterate(padded);
+
+        // Auth response
+        auto op = doc["op"];
+        if (!op.error()) {
+            std::string_view op_str = op.get_string().value();
+            if (op_str == "auth") {
+                auto success = doc["success"];
+                if (!success.error() && success.get_bool().value()) {
+                    private_ws_authenticated_ = true;
+                    private_ws_->send(std::string(R"({"op":"subscribe","args":["order"]})"));
+                    Logger::info("[Bybit-PrivateWS] Authenticated, subscribed to order stream");
+                } else {
+                    Logger::error("[Bybit-PrivateWS] Authentication failed");
+                }
+            }
+            return;
+        }
+
+        // Order update
+        auto topic = doc["topic"];
+        if (!topic.error()) {
+            std::string_view topic_str = topic.get_string().value();
+            if (topic_str == "order") {
+                auto data = doc["data"].get_array();
+                for (auto item : data) {
+                    auto status_field = item["orderStatus"];
+                    if (status_field.error()) continue;
+                    std::string_view status = status_field.get_string().value();
+
+                    if (status == "Filled") {
+                        auto id_field = item["orderId"];
+                        if (id_field.error()) continue;
+                        std::string order_id(id_field.get_string().value());
+
+                        FillInfo fill;
+                        auto avg = item["avgPrice"];
+                        if (!avg.error()) fill.avg_price = opt::fast_stod(avg.get_string().value());
+                        auto qty = item["cumExecQty"];
+                        if (!qty.error()) fill.filled_qty = opt::fast_stod(qty.get_string().value());
+
+                        if (fill.avg_price > 0 && fill.filled_qty > 0) {
+                            {
+                                std::lock_guard lock(fill_cache_mutex_);
+                                fill_cache_[order_id] = fill;
+                            }
+                            fill_cache_cv_.notify_all();
+                        }
+                    }
+                }
+            }
+        }
+    } catch (const simdjson::simdjson_error&) {
+        // Ignore parse errors for non-JSON messages
+    }
 }
 
 } // namespace kimp::exchange::bybit

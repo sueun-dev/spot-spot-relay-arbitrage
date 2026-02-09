@@ -561,6 +561,23 @@ private:
     PositionTracker position_tracker_;
     CapitalTracker capital_tracker_{2000.0};  // 초기 자본 $2000
 
+    // ── Incremental entry premium cache (lock-free, O(1) per-symbol update) ──
+    // Every ticker update recomputes only the affected symbol's premium.
+    // Entry detection scans this cache-hot array instead of doing PriceCache
+    // lookups + mutex + hash per symbol.  Zero-miss, zero-delay.
+    static constexpr size_t MAX_CACHED_SYMBOLS = 256;  // 256 * 64B = 16KB, fits L1
+    struct alignas(64) CachedEntryPremium {
+        std::atomic<double> entry_premium{100.0};  // High default = no signal
+        std::atomic<double> korean_ask{0.0};
+        std::atomic<double> foreign_bid{0.0};
+        std::atomic<double> funding_rate{0.0};
+        std::atomic<double> usdt_rate{0.0};
+        std::atomic<int> funding_interval{0};
+        std::atomic<bool> qualified{false};         // All entry filters passed
+        std::atomic<bool> signal_fired{false};      // Dedup: reset when disqualified
+    };
+    std::array<CachedEntryPremium, MAX_CACHED_SYMBOLS> entry_cache_{};
+
     // Signal queues (lock-free, multi-producer safe)
     memory::MPMCRingBuffer<ArbitrageSignal, 256> entry_signals_;
     memory::MPMCRingBuffer<ExitSignal, 256> exit_signals_;
@@ -588,14 +605,16 @@ private:
     mutable std::condition_variable update_cv_;
     std::atomic<uint64_t> update_seq_{0};
     std::array<std::atomic<double>, static_cast<size_t>(Exchange::Count)> last_usdt_log_{};
-    std::atomic<bool> usdt_full_scan_pending_{false};
-    std::atomic<uint64_t> last_usdt_update_ms_{0};
 
     // Internal methods
     void monitor_loop();
-    void check_entry_opportunities();  // 조건 만족하는 모든 코인 진입
     void check_exit_conditions();      // 각 포지션 개별 청산 체크
-    void check_symbol_opportunity(Exchange updated_ex, const SymbolId& updated_symbol);
+
+    // Incremental entry system
+    void update_symbol_entry(size_t idx);          // O(1) per-symbol premium recompute
+    void update_all_entries();                      // O(N) on USDT change (infrequent)
+    void fire_entry_from_cache();                   // O(N) lightweight scan, fires signals
+    void check_symbol_exit(size_t idx);             // O(1) per-symbol exit check
 
     static bool is_korean_exchange(Exchange ex) {
         return ex == Exchange::Upbit || ex == Exchange::Bithumb;

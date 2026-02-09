@@ -927,12 +927,12 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // 13-2: Price refresh (every 1 second) - synchronized dual-exchange snapshots
+    // 13-2: Price refresh (every 4 minutes) - WS backup, USDT/KRW & funding sync
     std::atomic<bool> price_refresh_running{true};
     std::mutex price_refresh_mutex;
     std::condition_variable price_refresh_cv;
     std::thread price_refresh_thread([&]() {
-        constexpr auto interval = std::chrono::seconds(1);
+        constexpr auto interval = std::chrono::minutes(4);
         std::unique_lock<std::mutex> lock(price_refresh_mutex);
         while (price_refresh_running && !g_shutdown) {
             lock.unlock();

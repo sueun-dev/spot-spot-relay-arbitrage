@@ -261,6 +261,8 @@ struct Order {
     Quantity filled_quantity{0.0};
     Price average_price{0.0};
 
+    std::string order_id_str;  // Exchange-native order ID for async fill queries
+
     SystemTimestamp create_time{};
     SystemTimestamp update_time{};
 
@@ -310,7 +312,7 @@ struct TradingConfig {
     static constexpr double POSITION_SIZE_USD = 250.0;        // $250 per side (총 $500 per position)
     static constexpr double ORDER_SIZE_USD = 25.0;            // $25 per split
     static constexpr int SPLIT_ORDERS = 10;                   // 250 / 25 = 10 splits
-    static constexpr int ORDER_INTERVAL_MS = 1000;            // 1 second between splits
+    static constexpr int ORDER_INTERVAL_MS = 1000;            // Keep 1s split cadence for adaptive better-fill opportunities
 
     // Entry threshold
     static constexpr double ENTRY_PREMIUM_THRESHOLD = -0.99;  // Entry when premium <= -0.99%
@@ -342,7 +344,8 @@ struct TradingConfig {
     static constexpr double MAX_KOREAN_SPREAD_PCT = 1.20;     // Skip illiquid KRW books
     static constexpr double MAX_FOREIGN_SPREAD_PCT = 0.40;    // Skip illiquid futures books
     static constexpr double MAX_USDT_JUMP_PCT = 1.50;         // Filter abnormal USDT/KRW jumps
-    static constexpr uint64_t USDT_FULL_SCAN_DEBOUNCE_MS = 250;  // Coalesce bursty USDT updates
+    static constexpr uint64_t USDT_FULL_SCAN_DEBOUNCE_MS = 120;  // Coalesce bursty USDT updates with lower latency
+    static constexpr uint64_t ENTRY_FAST_SCAN_COOLDOWN_MS = 80;  // Throttle event-driven full entry scans
 };
 
 // Callback types

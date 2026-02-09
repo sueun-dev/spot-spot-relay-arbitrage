@@ -74,6 +74,9 @@ public:
 
     double get_balance(const std::string& currency) override;
 
+    // Public fill query for async/parallel execution from OrderManager
+    bool query_order_detail(const std::string& order_id, const SymbolId& symbol, Order& order);
+
 protected:
     void on_ws_message(std::string_view message) override;
     void on_ws_connected() override;
@@ -90,7 +93,6 @@ private:
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
     std::vector<std::string> parse_orderbookdepth_message(std::string_view message);
     void update_bbo(const std::string& symbol_key);
-    bool query_order_detail(const std::string& order_id, const SymbolId& symbol, Order& order);
 
 public:
     void fetch_all_orderbook_snapshots(const std::vector<SymbolId>& symbols);

@@ -54,6 +54,7 @@ RuntimeConfig ConfigLoader::load(const std::string& path) {
                 creds.enabled = e["enabled"] ? e["enabled"].as<bool>() : true;
                 if (e["ws_endpoint"]) creds.ws_endpoint = e["ws_endpoint"].as<std::string>();
                 if (e["ws_private_endpoint"]) creds.ws_private_endpoint = e["ws_private_endpoint"].as<std::string>();
+                if (e["ws_trade_endpoint"]) creds.ws_trade_endpoint = e["ws_trade_endpoint"].as<std::string>();
                 if (e["rest_endpoint"]) creds.rest_endpoint = e["rest_endpoint"].as<std::string>();
                 if (e["api_key"]) creds.api_key = expand_env_vars(e["api_key"].as<std::string>());
                 if (e["secret_key"]) creds.secret_key = expand_env_vars(e["secret_key"].as<std::string>());
@@ -111,6 +112,7 @@ RuntimeConfig ConfigLoader::load_from_env() {
         get_env("UPBIT_SECRET_KEY"),
         endpoints::UPBIT_WS,
         "",
+        "",
         endpoints::UPBIT_REST,
         true
     };
@@ -119,6 +121,7 @@ RuntimeConfig ConfigLoader::load_from_env() {
         get_env("BITHUMB_API_KEY"),
         get_env("BITHUMB_SECRET_KEY"),
         endpoints::BITHUMB_WS,
+        "",
         "",
         endpoints::BITHUMB_REST,
         true
@@ -129,6 +132,7 @@ RuntimeConfig ConfigLoader::load_from_env() {
         get_env("BYBIT_SECRET_KEY"),
         endpoints::BYBIT_WS_PUBLIC,
         endpoints::BYBIT_WS_PRIVATE,
+        endpoints::BYBIT_WS_TRADE,
         endpoints::BYBIT_REST,
         true
     };
@@ -137,6 +141,7 @@ RuntimeConfig ConfigLoader::load_from_env() {
         get_env("GATE_API_KEY"),
         get_env("GATE_SECRET_KEY"),
         endpoints::GATEIO_WS,
+        "",
         "",
         endpoints::GATEIO_REST,
         true
@@ -150,16 +155,16 @@ RuntimeConfig ConfigLoader::get_default() {
 
     // Default exchange endpoints
     config.exchanges[Exchange::Upbit] = {
-        "", "", endpoints::UPBIT_WS, "", endpoints::UPBIT_REST, false
+        "", "", endpoints::UPBIT_WS, "", "", endpoints::UPBIT_REST, false
     };
     config.exchanges[Exchange::Bithumb] = {
-        "", "", endpoints::BITHUMB_WS, "", endpoints::BITHUMB_REST, false
+        "", "", endpoints::BITHUMB_WS, "", "", endpoints::BITHUMB_REST, false
     };
     config.exchanges[Exchange::Bybit] = {
-        "", "", endpoints::BYBIT_WS_PUBLIC, endpoints::BYBIT_WS_PRIVATE, endpoints::BYBIT_REST, false
+        "", "", endpoints::BYBIT_WS_PUBLIC, endpoints::BYBIT_WS_PRIVATE, endpoints::BYBIT_WS_TRADE, endpoints::BYBIT_REST, false
     };
     config.exchanges[Exchange::GateIO] = {
-        "", "", endpoints::GATEIO_WS, "", endpoints::GATEIO_REST, false
+        "", "", endpoints::GATEIO_WS, "", "", endpoints::GATEIO_REST, false
     };
 
     return config;

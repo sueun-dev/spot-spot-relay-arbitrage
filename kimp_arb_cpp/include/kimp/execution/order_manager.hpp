@@ -122,6 +122,10 @@ private:
     // Rollback
     bool rollback_korean_buy(Exchange ex, const SymbolId& symbol, double quantity);
 
+    // Async fill price queries (parallel with hedge orders)
+    void query_foreign_fill(Exchange ex, Order& order);
+    void query_korean_fill(Exchange ex, const SymbolId& symbol, Order& order);
+
     // P&L calculation
     double calculate_pnl(const Position& pos, double exit_korean_price,
                          double exit_foreign_price, double usdt_rate);

@@ -31,6 +31,7 @@ exchanges:
     enabled: true
     ws_endpoint: "wss://stream.bybit.com/v5/public/linear"
     ws_private_endpoint: "wss://stream.bybit.com/v5/private"
+    ws_trade_endpoint: "wss://stream.bybit.com/v5/trade"
     rest_endpoint: "https://api.bybit.com"
     api_key: "${BYBIT_API_KEY}"
     secret_key: "${BYBIT_SECRET_KEY}"

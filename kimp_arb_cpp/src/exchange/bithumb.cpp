@@ -350,11 +350,9 @@ Order BithumbExchange::place_market_order(const SymbolId& symbol, Side side, Qua
         std::string_view status = doc["status"].get_string().value();
         if (status == "0000") {
             order.status = OrderStatus::Filled;
-            // Extract order_id for fill price query
             auto oid = doc["order_id"];
             if (!oid.error()) {
-                std::string order_id_str(oid.get_string().value());
-                query_order_detail(order_id_str, symbol, order);
+                order.order_id_str = std::string(oid.get_string().value());
             }
         } else {
             order.status = OrderStatus::Rejected;
@@ -421,11 +419,9 @@ Order BithumbExchange::place_market_buy_quantity(const SymbolId& symbol, Quantit
         std::string_view status = doc["status"].get_string().value();
         if (status == "0000") {
             order.status = OrderStatus::Filled;
-            // Extract order_id for fill price query
             auto oid = doc["order_id"];
             if (!oid.error()) {
-                std::string order_id_str(oid.get_string().value());
-                query_order_detail(order_id_str, symbol, order);
+                order.order_id_str = std::string(oid.get_string().value());
             }
         } else {
             order.status = OrderStatus::Rejected;

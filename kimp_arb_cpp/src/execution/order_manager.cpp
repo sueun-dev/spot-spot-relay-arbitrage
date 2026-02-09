@@ -16,6 +16,229 @@
 
 namespace {
 
+// ============================================================================
+// Async CSV Trade Logger — zero-copy queue, background file I/O
+// Hot path only: lock → push struct → notify (~1μs vs 10-15ms sync I/O)
+// ============================================================================
+class AsyncCsvWriter {
+public:
+    static AsyncCsvWriter& instance() {
+        static AsyncCsvWriter inst;
+        return inst;
+    }
+
+    struct EntryLog {
+        std::chrono::system_clock::time_point time;
+        std::string symbol;
+        double split_qty;
+        double korean_buy_price;
+        double foreign_short_price;
+        double usdt_rate;
+        double held_value_usd;
+        double position_target_usd;
+        double premium;
+    };
+
+    struct ExitLog {
+        std::chrono::system_clock::time_point time;
+        std::string symbol;
+        double split_qty;
+        double korean_entry_price;
+        double korean_exit_price;
+        double foreign_entry_price;
+        double foreign_exit_price;
+        double pnl_krw;
+        double usdt_rate;
+        bool final_split;
+    };
+
+    void push_entry(EntryLog&& log) {
+        {
+            std::lock_guard lock(mutex_);
+            entry_queue_.push_back(std::move(log));
+        }
+        cv_.notify_one();
+    }
+
+    void push_exit(ExitLog&& log) {
+        {
+            std::lock_guard lock(mutex_);
+            exit_queue_.push_back(std::move(log));
+        }
+        cv_.notify_one();
+    }
+
+    ~AsyncCsvWriter() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_one();
+        if (writer_thread_.joinable()) writer_thread_.join();
+    }
+
+private:
+    AsyncCsvWriter() : writer_thread_([this] { run(); }) {}
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<EntryLog> entry_queue_;
+    std::deque<ExitLog> exit_queue_;
+    bool stop_{false};
+    bool dirs_created_{false};
+    bool entry_header_written_{false};
+    bool exit_header_written_{false};
+    std::thread writer_thread_;
+
+    static std::string format_time(std::chrono::system_clock::time_point tp) {
+        auto t = std::chrono::system_clock::to_time_t(tp);
+        std::tm tm{};
+#if defined(_WIN32)
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      tp.time_since_epoch()) % 1000;
+        char out[40];
+        std::snprintf(out, sizeof(out), "%s.%03lld", buf,
+                      static_cast<long long>(ms.count()));
+        return std::string(out);
+    }
+
+    void ensure_dirs() {
+        if (!dirs_created_) {
+            std::filesystem::create_directories("trade_logs");
+            dirs_created_ = true;
+        }
+    }
+
+    void flush_entries(std::deque<EntryLog>& batch) {
+        if (batch.empty()) return;
+        ensure_dirs();
+        const std::string path = "trade_logs/entry_splits.csv";
+
+        if (!entry_header_written_) {
+            bool need = !std::filesystem::exists(path) ||
+                        std::filesystem::file_size(path) == 0;
+            entry_header_written_ = !need;  // if file has content, skip header
+        }
+
+        std::ofstream out(path, std::ios::app);
+        if (!out.is_open()) { batch.clear(); return; }
+
+        if (!entry_header_written_) {
+            out << "entry_time,symbol,split_qty,korean_buy_price,foreign_short_price,"
+                   "usdt_rate,held_value_usd,position_target_usd,premium\n";
+            entry_header_written_ = true;
+        }
+
+        for (const auto& e : batch) {
+            out << format_time(e.time) << ','
+                << e.symbol << ','
+                << std::fixed << std::setprecision(8) << e.split_qty << ','
+                << std::fixed << std::setprecision(2) << e.korean_buy_price << ','
+                << std::fixed << std::setprecision(8) << e.foreign_short_price << ','
+                << std::fixed << std::setprecision(2) << e.usdt_rate << ','
+                << std::fixed << std::setprecision(2) << e.held_value_usd << ','
+                << std::fixed << std::setprecision(2) << e.position_target_usd << ','
+                << std::fixed << std::setprecision(4) << e.premium
+                << '\n';
+        }
+        batch.clear();
+    }
+
+    void flush_exits(std::deque<ExitLog>& batch) {
+        if (batch.empty()) return;
+        ensure_dirs();
+        const std::string path = "trade_logs/exit_splits.csv";
+
+        if (!exit_header_written_) {
+            bool need = !std::filesystem::exists(path) ||
+                        std::filesystem::file_size(path) == 0;
+            exit_header_written_ = !need;
+        }
+
+        std::ofstream out(path, std::ios::app);
+        if (!out.is_open()) { batch.clear(); return; }
+
+        if (!exit_header_written_) {
+            out << "exit_time,symbol,split_qty,korean_entry_price,korean_exit_price,"
+                   "foreign_entry_price,foreign_exit_price,pnl_krw,pnl_usd,usdt_rate,final_split\n";
+            exit_header_written_ = true;
+        }
+
+        for (const auto& x : batch) {
+            double pnl_usd = x.usdt_rate > 0.0 ? (x.pnl_krw / x.usdt_rate) : 0.0;
+            out << format_time(x.time) << ','
+                << x.symbol << ','
+                << std::fixed << std::setprecision(8) << x.split_qty << ','
+                << std::fixed << std::setprecision(2) << x.korean_entry_price << ','
+                << std::fixed << std::setprecision(2) << x.korean_exit_price << ','
+                << std::fixed << std::setprecision(6) << x.foreign_entry_price << ','
+                << std::fixed << std::setprecision(6) << x.foreign_exit_price << ','
+                << std::fixed << std::setprecision(2) << x.pnl_krw << ','
+                << std::fixed << std::setprecision(2) << pnl_usd << ','
+                << std::fixed << std::setprecision(2) << x.usdt_rate << ','
+                << (x.final_split ? "1" : "0")
+                << '\n';
+        }
+        batch.clear();
+    }
+
+    void run() {
+        std::deque<EntryLog> entry_batch;
+        std::deque<ExitLog> exit_batch;
+        while (true) {
+            {
+                std::unique_lock lock(mutex_);
+                cv_.wait(lock, [this] {
+                    return stop_ || !entry_queue_.empty() || !exit_queue_.empty();
+                });
+                entry_batch.swap(entry_queue_);
+                exit_batch.swap(exit_queue_);
+                if (stop_ && entry_batch.empty() && exit_batch.empty()) return;
+            }
+            flush_entries(entry_batch);
+            flush_exits(exit_batch);
+        }
+    }
+};
+
+void append_entry_split_log(const kimp::SymbolId& symbol,
+                            double split_qty,
+                            double korean_buy_price,
+                            double foreign_short_price,
+                            double usdt_rate,
+                            double held_value_usd,
+                            double position_target_usd,
+                            double premium) {
+    AsyncCsvWriter::instance().push_entry({
+        std::chrono::system_clock::now(),
+        symbol.to_string(),
+        split_qty, korean_buy_price, foreign_short_price,
+        usdt_rate, held_value_usd, position_target_usd, premium
+    });
+}
+
+void append_exit_split_log(const kimp::Position& pos,
+                           double split_qty,
+                           double korean_exit_price,
+                           double foreign_exit_price,
+                           double pnl_krw,
+                           double usdt_rate,
+                           bool final_split) {
+    AsyncCsvWriter::instance().push_exit({
+        std::chrono::system_clock::now(),
+        pos.symbol.to_string(),
+        split_qty, pos.korean_entry_price, korean_exit_price,
+        pos.foreign_entry_price, foreign_exit_price,
+        pnl_krw, usdt_rate, final_split
+    });
+}
+
 std::string format_time(std::chrono::system_clock::time_point tp) {
     auto t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
@@ -78,84 +301,6 @@ bool quote_pair_is_usable(const kimp::strategy::PriceCache::PriceData& korean_pr
         return false;
     }
     return true;
-}
-
-void append_exit_split_log(const kimp::Position& pos,
-                           double split_qty,
-                           double korean_exit_price,
-                           double foreign_exit_price,
-                           double pnl_krw,
-                           double usdt_rate,
-                           bool final_split) {
-    static std::mutex log_mutex;
-    std::lock_guard<std::mutex> lock(log_mutex);
-
-    std::filesystem::create_directories("trade_logs");
-    const std::string path = "trade_logs/exit_splits.csv";
-
-    bool need_header = !std::filesystem::exists(path) ||
-                       std::filesystem::file_size(path) == 0;
-
-    std::ofstream out(path, std::ios::app);
-    if (!out.is_open()) {
-        return;
-    }
-
-    if (need_header) {
-        out << "exit_time,symbol,split_qty,korean_entry_price,korean_exit_price,"
-               "foreign_entry_price,foreign_exit_price,pnl_krw,pnl_usd,usdt_rate,final_split\n";
-    }
-
-    double pnl_usd = usdt_rate > 0.0 ? (pnl_krw / usdt_rate) : 0.0;
-    out << format_time(std::chrono::system_clock::now()) << ','
-        << pos.symbol.to_string() << ','
-        << std::fixed << std::setprecision(8) << split_qty << ','
-        << std::fixed << std::setprecision(2) << pos.korean_entry_price << ','
-        << std::fixed << std::setprecision(2) << korean_exit_price << ','
-        << std::fixed << std::setprecision(6) << pos.foreign_entry_price << ','
-        << std::fixed << std::setprecision(6) << foreign_exit_price << ','
-        << std::fixed << std::setprecision(2) << pnl_krw << ','
-        << std::fixed << std::setprecision(2) << pnl_usd << ','
-        << std::fixed << std::setprecision(2) << usdt_rate << ','
-        << (final_split ? "1" : "0")
-        << '\n';
-}
-
-void append_entry_split_log(const kimp::SymbolId& symbol,
-                            double split_qty,
-                            double korean_buy_price,
-                            double foreign_short_price,
-                            double usdt_rate,
-                            double held_value_usd,
-                            double position_target_usd,
-                            double premium) {
-    static std::mutex log_mutex;
-    std::lock_guard<std::mutex> lock(log_mutex);
-
-    std::filesystem::create_directories("trade_logs");
-    const std::string path = "trade_logs/entry_splits.csv";
-
-    bool need_header = !std::filesystem::exists(path) ||
-                       std::filesystem::file_size(path) == 0;
-
-    std::ofstream out(path, std::ios::app);
-    if (!out.is_open()) return;
-
-    if (need_header) {
-        out << "entry_time,symbol,split_qty,korean_buy_price,foreign_short_price,"
-               "usdt_rate,held_value_usd,position_target_usd,premium\n";
-    }
-
-    out << format_time(std::chrono::system_clock::now()) << ','
-        << symbol.to_string() << ','
-        << std::fixed << std::setprecision(8) << split_qty << ','
-        << std::fixed << std::setprecision(2) << korean_buy_price << ','
-        << std::fixed << std::setprecision(8) << foreign_short_price << ','
-        << std::fixed << std::setprecision(2) << usdt_rate << ','
-        << std::fixed << std::setprecision(2) << held_value_usd << ','
-        << std::fixed << std::setprecision(2) << position_target_usd << ','
-        << std::fixed << std::setprecision(4) << premium
-        << '\n';
 }
 
 } // namespace
@@ -336,12 +481,14 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
             break;
         }
 
+        auto split_start = std::chrono::steady_clock::now();
+
         if (entry_premium <= TradingConfig::ENTRY_PREMIUM_THRESHOLD && remaining_position_usd >= min_split_usd) {
             // ==================== ENTRY SPLIT ====================
             double order_size_usd = std::min(TradingConfig::ORDER_SIZE_USD, remaining_position_usd);
             double coin_amount = order_size_usd / current_foreign_bid;
 
-            // SHORT futures first
+            // SHORT futures first (no fill query — deferred to parallel)
             Order foreign_order = execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
@@ -356,14 +503,8 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                 continue;
             }
 
-            // Use foreign_order.quantity (lot-size normalized) as fallback, NOT coin_amount (pre-normalization)
-            double actual_filled = foreign_order.filled_quantity > 0 ? foreign_order.filled_quantity : foreign_order.quantity;
-            double short_price = foreign_order.average_price;
-            if (short_price <= 0) {
-                short_price = current_foreign_bid;
-                Logger::error("[ADAPTIVE-ENTRY] CRITICAL: No fill price from Bybit after retries! "
-                              "Using cache {:.8f} — P&L will be inaccurate", short_price);
-            }
+            // Use lot-size normalized quantity (known pre-fill-query)
+            double actual_filled = foreign_order.quantity;
             double krw_amount = actual_filled * current_korean_ask;
 
             if (krw_amount < TradingConfig::MIN_ORDER_KRW) {
@@ -373,16 +514,38 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                 continue;
             }
 
-            // BUY Korean spot with exact same amount
+            // PARALLEL: Bybit fill query + Bithumb BUY
+            auto bybit_fill_future = std::async(std::launch::async, [&]() {
+                query_foreign_fill(signal.foreign_exchange, foreign_order);
+            });
+
             Order korean_order = execute_korean_buy(signal.korean_exchange, signal.symbol, actual_filled, krw_amount);
 
+            // Wait for Bybit fill query to complete
+            bybit_fill_future.get();
+
+            // Bithumb fill query (runs while we process results)
+            auto bithumb_fill_future = std::async(std::launch::async, [&]() {
+                query_korean_fill(signal.korean_exchange, signal.symbol, korean_order);
+            });
+
             if (korean_order.status == OrderStatus::Filled) {
+                // Wait for Bithumb fill price
+                bithumb_fill_future.get();
+
+                double short_price = foreign_order.average_price;
+                if (short_price <= 0) {
+                    short_price = current_foreign_bid;
+                    Logger::warn("[ADAPTIVE-ENTRY] No fill price from Bybit, using cache {:.8f}", short_price);
+                }
                 double buy_price = korean_order.average_price;
                 if (buy_price <= 0) {
                     buy_price = current_korean_ask;
-                    Logger::error("[ADAPTIVE-ENTRY] CRITICAL: No fill price from Bithumb after retries! "
-                                  "Using cache {:.2f} — P&L will be inaccurate", buy_price);
+                    Logger::warn("[ADAPTIVE-ENTRY] No fill price from Bithumb, using cache {:.2f}", buy_price);
                 }
+                // Reconcile filled_quantity if available (should match order.quantity for $25 market orders)
+                if (foreign_order.filled_quantity > 0) actual_filled = foreign_order.filled_quantity;
+
                 double actual_korean_cost = actual_filled * buy_price;
 
                 held_amount += actual_filled;
@@ -394,11 +557,15 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                 double target_exit_pm = std::max(
                     effective_entry_pm + TradingConfig::DYNAMIC_EXIT_SPREAD,
                     TradingConfig::EXIT_PREMIUM_THRESHOLD);
+
+                auto split_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - split_start).count();
                 Logger::info("[ADAPTIVE-ENTRY] {} +{:.8f} coins (${:.2f}), held: ${:.2f}/${:.2f}, "
-                             "entry_pm_now: {:.4f}%, eff_entry_pm: {:.4f}%, target_exit_pm: {:.4f}%, buy_price: {:.2f}",
+                             "entry_pm_now: {:.4f}%, eff_entry_pm: {:.4f}%, target_exit_pm: {:.4f}%, "
+                             "buy_price: {:.2f}, exec_ms: {}",
                              signal.symbol.to_string(), actual_filled, order_size_usd,
                              new_held_value, position_size_usd, entry_premium, effective_entry_pm,
-                             target_exit_pm, buy_price);
+                             target_exit_pm, buy_price, split_elapsed);
 
                 // Log entry split to CSV (actual fill price)
                 append_entry_split_log(signal.symbol, actual_filled, buy_price,
@@ -429,6 +596,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                     break;
                 }
             } else {
+                bithumb_fill_future.get();  // Don't leak the future
                 Logger::error("[ADAPTIVE-ENTRY] Korean BUY failed, rolling back futures SHORT");
                 execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
             }
@@ -448,7 +616,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
             Logger::info("[ADAPTIVE-EXIT] {} exit_pm: {:.4f}% >= dynamic_threshold: {:.4f}%, exiting",
                          signal.symbol.to_string(), exit_premium, dynamic_exit_threshold);
 
-            // COVER futures first
+            // COVER futures first (no fill query — deferred to parallel)
             Order foreign_order = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, exit_coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
@@ -457,24 +625,36 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                 continue;
             }
 
-            // Use foreign_order.quantity (lot-size normalized) as fallback for hedge accuracy
-            double actual_covered = foreign_order.filled_quantity > 0 ? foreign_order.filled_quantity : foreign_order.quantity;
-            double cover_price = foreign_order.average_price;
-            if (cover_price <= 0) {
-                cover_price = current_foreign_ask;
-                Logger::error("[ADAPTIVE-EXIT] CRITICAL: No fill price from Bybit after retries! "
-                              "Using cache {:.8f} — P&L will be inaccurate", cover_price);
-            }
+            double actual_covered = foreign_order.quantity;
 
-            // SELL Korean spot
+            // PARALLEL: Bybit fill query + Bithumb SELL
+            auto bybit_fill_future = std::async(std::launch::async, [&]() {
+                query_foreign_fill(signal.foreign_exchange, foreign_order);
+            });
+
             Order korean_order = execute_korean_sell(signal.korean_exchange, signal.symbol, actual_covered);
 
+            bybit_fill_future.get();
+
+            auto bithumb_fill_future = std::async(std::launch::async, [&]() {
+                query_korean_fill(signal.korean_exchange, signal.symbol, korean_order);
+            });
+
             if (korean_order.status == OrderStatus::Filled) {
+                bithumb_fill_future.get();
+
+                // Reconcile filled_quantity if available
+                if (foreign_order.filled_quantity > 0) actual_covered = foreign_order.filled_quantity;
+
+                double cover_price = foreign_order.average_price;
+                if (cover_price <= 0) {
+                    cover_price = current_foreign_ask;
+                    Logger::warn("[ADAPTIVE-EXIT] No cover fill price from Bybit, using cache {:.8f}", cover_price);
+                }
                 double sell_price = korean_order.average_price;
                 if (sell_price <= 0) {
                     sell_price = current_korean_bid;
-                    Logger::error("[ADAPTIVE-EXIT] CRITICAL: No sell fill price from Bithumb after retries! "
-                                  "Using cache {:.2f} — P&L will be inaccurate", sell_price);
+                    Logger::warn("[ADAPTIVE-EXIT] No sell fill price from Bithumb, using cache {:.2f}", sell_price);
                 }
 
                 // P&L using average entry prices
@@ -534,13 +714,18 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                     return result;
                 }
             } else {
+                bithumb_fill_future.get();
                 // SELL failed after COVER — retry to avoid unhedged state
+                // Resolve fill prices for P&L on retry path
+                double cover_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_ask;
+
                 Logger::error("[ADAPTIVE-EXIT] Korean SELL failed after COVER, retrying... Unhedged: {:.8f} coins", actual_covered);
                 for (int retry = 1; retry <= 5; ++retry) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(300 * retry));
                     Logger::warn("[ADAPTIVE-EXIT] SELL retry {}/5 for {:.8f} coins", retry, actual_covered);
                     korean_order = execute_korean_sell(signal.korean_exchange, signal.symbol, actual_covered);
                     if (korean_order.status == OrderStatus::Filled) {
+                        query_korean_fill(signal.korean_exchange, signal.symbol, korean_order);
                         double sell_price = korean_order.average_price;
                         if (sell_price <= 0) sell_price = current_korean_bid;
 
@@ -579,8 +764,13 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
             continue;
         }
 
-        // Sleep between splits
-        std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+        // Smart sleep: deduct execution time from split interval
+        auto split_elapsed = std::chrono::steady_clock::now() - split_start;
+        auto remaining_sleep = std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS) -
+            std::chrono::duration_cast<std::chrono::milliseconds>(split_elapsed);
+        if (remaining_sleep > std::chrono::milliseconds(0)) {
+            std::this_thread::sleep_for(remaining_sleep);
+        }
     }
 
     // Shutdown interrupted entry - return partial position if any
@@ -723,6 +913,8 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                 TradingConfig::EXIT_PREMIUM_THRESHOLD);
         }
 
+        auto split_start = std::chrono::steady_clock::now();
+
         if (exit_premium >= dynamic_exit_threshold) {
             // ==================== EXIT SPLIT ====================
             double remaining_value_usd = remaining_amount * current_foreign_ask;
@@ -738,7 +930,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                 exit_coin_amount = std::min(exit_coin_amount, remaining_amount);
             }
 
-            // COVER futures first
+            // COVER futures first (no fill query — deferred to parallel)
             Order foreign_order = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, exit_coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
@@ -747,24 +939,35 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                 continue;
             }
 
-            // Use foreign_order.quantity (lot-size normalized) as fallback for hedge accuracy
-            double actual_covered = foreign_order.filled_quantity > 0 ? foreign_order.filled_quantity : foreign_order.quantity;
-            double cover_price = foreign_order.average_price;
-            if (cover_price <= 0) {
-                cover_price = current_foreign_ask;
-                Logger::error("[EXIT] CRITICAL: No cover fill price from Bybit after retries! "
-                              "Using cache {:.8f} — P&L will be inaccurate", cover_price);
-            }
+            double actual_covered = foreign_order.quantity;
 
-            // SELL Korean spot
+            // PARALLEL: Bybit fill query + Bithumb SELL
+            auto bybit_fill_future = std::async(std::launch::async, [&]() {
+                query_foreign_fill(signal.foreign_exchange, foreign_order);
+            });
+
             Order korean_order = execute_korean_sell(signal.korean_exchange, position.symbol, actual_covered);
 
+            bybit_fill_future.get();
+
+            auto bithumb_fill_future = std::async(std::launch::async, [&]() {
+                query_korean_fill(signal.korean_exchange, position.symbol, korean_order);
+            });
+
             if (korean_order.status == OrderStatus::Filled) {
+                bithumb_fill_future.get();
+
+                if (foreign_order.filled_quantity > 0) actual_covered = foreign_order.filled_quantity;
+
+                double cover_price = foreign_order.average_price;
+                if (cover_price <= 0) {
+                    cover_price = current_foreign_ask;
+                    Logger::warn("[EXIT] No cover fill price from Bybit, using cache {:.8f}", cover_price);
+                }
                 double sell_price = korean_order.average_price;
                 if (sell_price <= 0) {
                     sell_price = current_korean_bid;
-                    Logger::error("[EXIT] CRITICAL: No sell fill price from Bithumb after retries! "
-                                  "Using cache {:.2f} — P&L will be inaccurate", sell_price);
+                    Logger::warn("[EXIT] No sell fill price from Bithumb, using cache {:.2f}", sell_price);
                 }
 
                 // P&L using average entry prices
@@ -813,6 +1016,9 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                     }
                 }
             } else {
+                bithumb_fill_future.get();
+                double cover_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_ask;
+
                 // SELL failed after COVER — retry to avoid unhedged state
                 Logger::error("[EXIT] Korean SELL failed after COVER, retrying... Unhedged: {:.8f} coins", actual_covered);
                 for (int retry = 1; retry <= 5; ++retry) {
@@ -820,6 +1026,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                     Logger::warn("[EXIT] SELL retry {}/5 for {:.8f} coins", retry, actual_covered);
                     korean_order = execute_korean_sell(signal.korean_exchange, position.symbol, actual_covered);
                     if (korean_order.status == OrderStatus::Filled) {
+                        query_korean_fill(signal.korean_exchange, position.symbol, korean_order);
                         double sell_price = korean_order.average_price;
                         if (sell_price <= 0) sell_price = current_korean_bid;
 
@@ -853,12 +1060,11 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
 
         } else if (entry_premium <= TradingConfig::ENTRY_PREMIUM_THRESHOLD && remaining_amount < original_amount) {
             // ==================== RE-ENTRY SPLIT ====================
-            // Only re-enter up to original position size
             double max_reentry_coins = original_amount - remaining_amount;
             double reentry_usd = std::min(TradingConfig::ORDER_SIZE_USD, max_reentry_coins * current_foreign_bid);
             double coin_amount = reentry_usd / current_foreign_bid;
 
-            // SHORT futures first
+            // SHORT futures first (no fill query — deferred to parallel)
             Order foreign_order = execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
@@ -867,14 +1073,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                 continue;
             }
 
-            // Use foreign_order.quantity (lot-size normalized) as fallback for hedge accuracy
-            double actual_filled = foreign_order.filled_quantity > 0 ? foreign_order.filled_quantity : foreign_order.quantity;
-            double short_price = foreign_order.average_price;
-            if (short_price <= 0) {
-                short_price = current_foreign_bid;
-                Logger::error("[ADAPTIVE-REENTRY] CRITICAL: No short fill price from Bybit after retries! "
-                              "Using cache {:.8f} — P&L will be inaccurate", short_price);
-            }
+            double actual_filled = foreign_order.quantity;
             double krw_amount = actual_filled * current_korean_ask;
 
             if (krw_amount < TradingConfig::MIN_ORDER_KRW) {
@@ -884,15 +1083,33 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                 continue;
             }
 
-            // BUY Korean spot
+            // PARALLEL: Bybit fill query + Bithumb BUY
+            auto bybit_fill_future = std::async(std::launch::async, [&]() {
+                query_foreign_fill(signal.foreign_exchange, foreign_order);
+            });
+
             Order korean_order = execute_korean_buy(signal.korean_exchange, position.symbol, actual_filled, krw_amount);
 
+            bybit_fill_future.get();
+
+            auto bithumb_fill_future = std::async(std::launch::async, [&]() {
+                query_korean_fill(signal.korean_exchange, position.symbol, korean_order);
+            });
+
             if (korean_order.status == OrderStatus::Filled) {
+                bithumb_fill_future.get();
+
+                if (foreign_order.filled_quantity > 0) actual_filled = foreign_order.filled_quantity;
+
+                double short_price = foreign_order.average_price;
+                if (short_price <= 0) {
+                    short_price = current_foreign_bid;
+                    Logger::warn("[ADAPTIVE-REENTRY] No fill price from Bybit, using cache {:.8f}", short_price);
+                }
                 double buy_price = korean_order.average_price;
                 if (buy_price <= 0) {
                     buy_price = current_korean_ask;
-                    Logger::error("[ADAPTIVE-REENTRY] CRITICAL: No fill price from Bithumb after retries! "
-                                  "Using cache {:.2f} — P&L will be inaccurate", buy_price);
+                    Logger::warn("[ADAPTIVE-REENTRY] No fill price from Bithumb, using cache {:.2f}", buy_price);
                 }
                 double actual_korean_cost = actual_filled * buy_price;
 
@@ -921,6 +1138,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                     on_position_update_(&snap);
                 }
             } else {
+                bithumb_fill_future.get();
                 Logger::error("[ADAPTIVE-REENTRY] Korean BUY failed, rolling back futures SHORT");
                 execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
             }
@@ -936,8 +1154,13 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
             continue;
         }
 
-        // Sleep between splits
-        std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+        // Smart sleep: deduct execution time from split interval
+        auto split_elapsed = std::chrono::steady_clock::now() - split_start;
+        auto remaining_sleep = std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS) -
+            std::chrono::duration_cast<std::chrono::milliseconds>(split_elapsed);
+        if (remaining_sleep > std::chrono::milliseconds(0)) {
+            std::this_thread::sleep_for(remaining_sleep);
+        }
     }
 
     // Shutdown interrupted exit - return with remaining position
@@ -1229,6 +1452,26 @@ Order OrderManager::execute_foreign_cover(Exchange ex, const SymbolId& symbol, d
 bool OrderManager::rollback_korean_buy(Exchange ex, const SymbolId& symbol, double quantity) {
     auto order = execute_korean_sell(ex, symbol, quantity);
     return order.status == OrderStatus::Filled;
+}
+
+void OrderManager::query_foreign_fill(Exchange ex, Order& order) {
+    if (order.order_id_str.empty() || order.status != OrderStatus::Filled) return;
+    auto futures_ex = get_futures_exchange(ex);
+    if (!futures_ex) return;
+    if (ex == Exchange::Bybit) {
+        auto bybit = std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(futures_ex);
+        if (bybit) bybit->query_order_fill(order.order_id_str, order);
+    }
+}
+
+void OrderManager::query_korean_fill(Exchange ex, const SymbolId& symbol, Order& order) {
+    if (order.order_id_str.empty() || order.status != OrderStatus::Filled) return;
+    auto korean_ex = get_korean_exchange(ex);
+    if (!korean_ex) return;
+    if (ex == Exchange::Bithumb) {
+        auto bithumb = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(korean_ex);
+        if (bithumb) bithumb->query_order_detail(order.order_id_str, symbol, order);
+    }
 }
 
 double OrderManager::calculate_pnl(const Position& pos, double exit_korean_price,
