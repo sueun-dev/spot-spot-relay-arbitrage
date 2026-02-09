@@ -131,38 +131,64 @@ void BybitExchange::subscribe_ticker(const std::vector<SymbolId>& symbols) {
         return;
     }
 
-    // Format: {"op":"subscribe","args":["tickers.BTCUSDT","tickers.ETHUSDT"]}
-    std::ostringstream ss;
-    ss << R"({"op":"subscribe","args":[)";
+    // Bybit WS allows max 10 args per subscribe request — batch to avoid silent drops
+    constexpr size_t BATCH_SIZE = 10;
 
-    bool first = true;
-    for (const auto& sym : symbols) {
-        if (!first) ss << ",";
-        ss << "\"tickers." << symbol_to_bybit(sym) << "\"";
-        first = false;
+    for (size_t start = 0; start < symbols.size(); start += BATCH_SIZE) {
+        size_t end = std::min(start + BATCH_SIZE, symbols.size());
+
+        std::ostringstream ss;
+        ss << R"({"op":"subscribe","args":[)";
+
+        bool first = true;
+        for (size_t i = start; i < end; ++i) {
+            if (!first) ss << ",";
+            ss << "\"tickers." << symbol_to_bybit(symbols[i]) << "\"";
+            first = false;
+        }
+
+        ss << "]}";
+        ws_client_->send(ss.str());
+
+        // Small delay between batches to avoid rate limiting
+        if (end < symbols.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
 
-    ss << "]}";
-
-    Logger::debug("[Bybit] Subscribing to {} symbols", symbols.size());
-    ws_client_->send(ss.str());
+    Logger::info("[Bybit] Subscribed to {} tickers in {} batches",
+                 symbols.size(), (symbols.size() + BATCH_SIZE - 1) / BATCH_SIZE);
 }
 
 void BybitExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) {
     if (!ws_client_ || !ws_client_->is_connected()) return;
 
-    std::ostringstream ss;
-    ss << R"({"op":"subscribe","args":[)";
+    // Bybit WS allows max 10 args per subscribe request — batch to avoid silent drops
+    constexpr size_t BATCH_SIZE = 10;
 
-    bool first = true;
-    for (const auto& sym : symbols) {
-        if (!first) ss << ",";
-        ss << "\"orderbook.1." << symbol_to_bybit(sym) << "\"";
-        first = false;
+    for (size_t start = 0; start < symbols.size(); start += BATCH_SIZE) {
+        size_t end = std::min(start + BATCH_SIZE, symbols.size());
+
+        std::ostringstream ss;
+        ss << R"({"op":"subscribe","args":[)";
+
+        bool first = true;
+        for (size_t i = start; i < end; ++i) {
+            if (!first) ss << ",";
+            ss << "\"orderbook.1." << symbol_to_bybit(symbols[i]) << "\"";
+            first = false;
+        }
+
+        ss << "]}";
+        ws_client_->send(ss.str());
+
+        if (end < symbols.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
 
-    ss << "]}";
-    ws_client_->send(ss.str());
+    Logger::info("[Bybit] Subscribed to {} orderbooks in {} batches",
+                 symbols.size(), (symbols.size() + BATCH_SIZE - 1) / BATCH_SIZE);
 }
 
 std::vector<SymbolId> BybitExchange::get_available_symbols() {
