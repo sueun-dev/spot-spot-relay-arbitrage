@@ -1226,7 +1226,7 @@ int main(int argc, char* argv[]) {
                          kimp::TradingConfig::MAX_POSITIONS);
             spdlog::info("Capital: ${:.2f} | Position size: ${:.2f}/side (복리 성장)",
                          engine.get_current_capital(), engine.get_position_size_usd());
-            spdlog::info("Entry: premium <= {:.2f}% (8h funding, rate > 0)",
+            spdlog::info("Entry: premium <= {:.2f}% (>=4h funding, rate > 0)",
                          kimp::TradingConfig::ENTRY_PREMIUM_THRESHOLD);
             spdlog::info("Exit: dynamic max(entry_pm + {:.2f}% fees + {:.2f}% profit, +{:.2f}% floor)",
                          kimp::TradingConfig::ROUND_TRIP_FEE_PCT,

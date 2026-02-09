@@ -371,7 +371,7 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
     }
 
     // Funding filters
-    if (foreign_price.funding_interval_hours != TradingConfig::MIN_FUNDING_INTERVAL_HOURS) {
+    if (foreign_price.funding_interval_hours < TradingConfig::MIN_FUNDING_INTERVAL_HOURS) {
         if (cache.qualified.load(std::memory_order_relaxed)) {
             cache.qualified.store(false, std::memory_order_release);
             cache.signal_fired.store(false, std::memory_order_release);
@@ -697,7 +697,7 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
         info.funding_interval_hours = funding_intervals[i];
         info.next_funding_time = next_funding_times[i];
         info.entry_signal = (entry_premiums[i] <= TradingConfig::ENTRY_PREMIUM_THRESHOLD) &&
-                            (funding_intervals[i] == TradingConfig::MIN_FUNDING_INTERVAL_HOURS) &&
+                            (funding_intervals[i] >= TradingConfig::MIN_FUNDING_INTERVAL_HOURS) &&
                             (!TradingConfig::REQUIRE_POSITIVE_FUNDING || funding_rates[i] >= 0.0);
         info.exit_signal = exit_premiums[i] >= TradingConfig::EXIT_PREMIUM_THRESHOLD;
         result.push_back(info);

@@ -331,7 +331,7 @@ struct TradingConfig {
     static constexpr double EXIT_PREMIUM_THRESHOLD = 0.10;    // Exit floor: only when premium >= +0.10%
 
     // Entry filters
-    static constexpr int MIN_FUNDING_INTERVAL_HOURS = 8;      // Only 8h funding coins
+    static constexpr int MIN_FUNDING_INTERVAL_HOURS = 4;      // 4h and 8h funding (exclude 1h)
     static constexpr bool REQUIRE_POSITIVE_FUNDING = true;    // Only positive funding rate
 
     static constexpr double MAX_PRICE_DIFF_PERCENT = 50.0;
