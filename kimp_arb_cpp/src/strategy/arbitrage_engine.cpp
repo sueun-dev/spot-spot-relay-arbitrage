@@ -40,31 +40,45 @@ bool quote_is_fresh(const PriceCache::PriceData& price, uint64_t now_ms) {
     return (now_ms - price.timestamp) <= TradingConfig::MAX_QUOTE_AGE_MS;
 }
 
+bool quote_is_fresh_with_limit(const PriceCache::PriceData& price, uint64_t now_ms,
+                               uint64_t max_age_ms) {
+    if (!price.valid || price.timestamp == 0) return false;
+    if (now_ms < price.timestamp) return false;
+    return (now_ms - price.timestamp) <= max_age_ms;
+}
+
 bool quote_pair_is_usable(Exchange korean_ex,
                           Exchange foreign_ex,
                           const PriceCache::PriceData& korean_price,
-                          const PriceCache::PriceData& foreign_price) {
+                          const PriceCache::PriceData& foreign_price,
+                          bool is_exit = false) {
     (void)korean_ex;
     (void)foreign_ex;
 
+    const uint64_t max_age   = is_exit ? TradingConfig::MAX_QUOTE_AGE_MS_EXIT   : TradingConfig::MAX_QUOTE_AGE_MS;
+    const uint64_t max_desync = is_exit ? TradingConfig::MAX_QUOTE_DESYNC_MS_EXIT : TradingConfig::MAX_QUOTE_DESYNC_MS;
+    const double   max_kr_sp  = is_exit ? TradingConfig::MAX_KOREAN_SPREAD_PCT_EXIT  : TradingConfig::MAX_KOREAN_SPREAD_PCT;
+    const double   max_fr_sp  = is_exit ? TradingConfig::MAX_FOREIGN_SPREAD_PCT_EXIT : TradingConfig::MAX_FOREIGN_SPREAD_PCT;
+
     const uint64_t now_ms = steady_now_ms();
-    if (!quote_is_fresh(korean_price, now_ms) || !quote_is_fresh(foreign_price, now_ms)) {
+    if (!quote_is_fresh_with_limit(korean_price, now_ms, max_age) ||
+        !quote_is_fresh_with_limit(foreign_price, now_ms, max_age)) {
         return false;
     }
 
     const uint64_t ts_diff = korean_price.timestamp >= foreign_price.timestamp
                                  ? korean_price.timestamp - foreign_price.timestamp
                                  : foreign_price.timestamp - korean_price.timestamp;
-    if (ts_diff > TradingConfig::MAX_QUOTE_DESYNC_MS) {
+    if (ts_diff > max_desync) {
         return false;
     }
 
     const double kr_spread = spread_pct(korean_price.bid, korean_price.ask);
     const double fr_spread = spread_pct(foreign_price.bid, foreign_price.ask);
-    if (kr_spread > TradingConfig::MAX_KOREAN_SPREAD_PCT) {
+    if (kr_spread > max_kr_sp) {
         return false;
     }
-    if (fr_spread > TradingConfig::MAX_FOREIGN_SPREAD_PCT) {
+    if (fr_spread > max_fr_sp) {
         return false;
     }
 
@@ -425,19 +439,56 @@ void ArbitrageEngine::update_all_entries() {
 }
 
 void ArbitrageEngine::fire_entry_from_cache() {
-    if (!position_tracker_.can_open_position()) return;
     if (exchange_pairs_.empty()) return;
+    if (entry_suppressed_.load(std::memory_order_acquire)) return;
+
+    // Helper: check if a symbol has a partial position (not at $250 target)
+    auto is_partial_position = [this](const SymbolId& sym) -> bool {
+        auto pos = position_tracker_.get_position(sym);
+        if (!pos) return false;
+        double actual_usd = pos->foreign_amount * pos->foreign_entry_price;
+        return actual_usd < pos->position_size_usd * 0.95;
+    };
+
+    bool can_open_new = position_tracker_.can_open_position();
 
     const auto& [korean_ex, foreign_ex] = exchange_pairs_[0];
 
     if (TradingConfig::MAX_POSITIONS == 1) {
-        // ── Single position mode: find best qualifying symbol ──
+        // ── Single position mode ──
+        if (!can_open_new) {
+            // No room for new positions. Check if a qualifying symbol has a partial position → top-up
+            for (size_t i = 0; i < monitored_symbols_.size(); ++i) {
+                if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
+                if (!is_partial_position(monitored_symbols_[i])) continue;
+
+                auto& c = entry_cache_[i];
+                ArbitrageSignal signal;
+                signal.symbol = monitored_symbols_[i];
+                signal.korean_exchange = korean_ex;
+                signal.foreign_exchange = foreign_ex;
+                signal.premium = c.entry_premium.load(std::memory_order_relaxed);
+                signal.korean_ask = c.korean_ask.load(std::memory_order_relaxed);
+                signal.foreign_bid = c.foreign_bid.load(std::memory_order_relaxed);
+                signal.funding_rate = c.funding_rate.load(std::memory_order_relaxed);
+                signal.usdt_krw_rate = c.usdt_rate.load(std::memory_order_relaxed);
+                signal.timestamp = std::chrono::steady_clock::now();
+
+                if (on_entry_signal_) on_entry_signal_(signal);
+                entry_signals_.try_push(signal);
+                return;
+            }
+            return;  // All positions full, no partial to top up
+        }
+
+        // Can open new: find best qualifying symbol (skip fully-entered positions)
         double best_premium = 100.0;
         size_t best_idx = SIZE_MAX;
 
         for (size_t i = 0; i < monitored_symbols_.size(); ++i) {
             if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
-            if (position_tracker_.has_position(monitored_symbols_[i])) continue;
+            if (position_tracker_.has_position(monitored_symbols_[i]) &&
+                !is_partial_position(monitored_symbols_[i])) continue;
             double pm = entry_cache_[i].entry_premium.load(std::memory_order_relaxed);
             if (pm < best_premium) {
                 best_premium = pm;
@@ -447,9 +498,11 @@ void ArbitrageEngine::fire_entry_from_cache() {
 
         if (best_idx == SIZE_MAX) return;
 
-        // Dedup: don't re-fire if already signaled for this symbol
-        if (entry_cache_[best_idx].signal_fired.load(std::memory_order_acquire)) return;
-        entry_cache_[best_idx].signal_fired.store(true, std::memory_order_release);
+        // Dedup: don't re-fire if already signaled (skip dedup for partial top-ups)
+        if (!is_partial_position(monitored_symbols_[best_idx])) {
+            if (entry_cache_[best_idx].signal_fired.load(std::memory_order_acquire)) return;
+            entry_cache_[best_idx].signal_fired.store(true, std::memory_order_release);
+        }
 
         auto& c = entry_cache_[best_idx];
         ArbitrageSignal signal;
@@ -468,11 +521,19 @@ void ArbitrageEngine::fire_entry_from_cache() {
     } else {
         // ── Multi-position mode: fire for each qualifying symbol ──
         for (size_t i = 0; i < monitored_symbols_.size(); ++i) {
-            if (!position_tracker_.can_open_position()) break;
             if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
-            if (position_tracker_.has_position(monitored_symbols_[i])) continue;
-            if (entry_cache_[i].signal_fired.load(std::memory_order_acquire)) continue;
-            entry_cache_[i].signal_fired.store(true, std::memory_order_release);
+
+            bool has_pos = position_tracker_.has_position(monitored_symbols_[i]);
+            bool partial = has_pos && is_partial_position(monitored_symbols_[i]);
+
+            if (has_pos && !partial) continue;  // Fully entered, skip
+            if (!has_pos && !position_tracker_.can_open_position()) continue;  // No room for new
+
+            // Skip signal_fired dedup for partial top-ups
+            if (!partial) {
+                if (entry_cache_[i].signal_fired.load(std::memory_order_acquire)) continue;
+                entry_cache_[i].signal_fired.store(true, std::memory_order_release);
+            }
 
             auto& c = entry_cache_[i];
             ArbitrageSignal signal;
@@ -518,7 +579,7 @@ void ArbitrageEngine::check_exit_conditions() {
 
         auto foreign_price = price_cache_.get_price(pos.foreign_exchange, *foreign_symbol_ptr);
         if (!foreign_price.valid || foreign_price.ask <= 0) continue;
-        if (!quote_pair_is_usable(pos.korean_exchange, pos.foreign_exchange, korean_price, foreign_price)) continue;
+        if (!quote_pair_is_usable(pos.korean_exchange, pos.foreign_exchange, korean_price, foreign_price, /*is_exit=*/true)) continue;
 
         double usdt_rate = price_cache_.get_usdt_krw(pos.korean_exchange);
         if (usdt_rate <= 0) continue;  // No real USDT/KRW rate
@@ -566,7 +627,7 @@ void ArbitrageEngine::check_symbol_exit(size_t idx) {
 
     auto foreign_price = price_cache_.get_price(pos.foreign_exchange, foreign_symbol);
     if (!foreign_price.valid || foreign_price.ask <= 0) return;
-    if (!quote_pair_is_usable(pos.korean_exchange, pos.foreign_exchange, korean_price, foreign_price)) return;
+    if (!quote_pair_is_usable(pos.korean_exchange, pos.foreign_exchange, korean_price, foreign_price, /*is_exit=*/true)) return;
 
     double usdt_rate = price_cache_.get_usdt_krw(pos.korean_exchange);
     if (usdt_rate <= 0) return;
@@ -635,7 +696,7 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
 
             auto foreign_price = price_cache_.get_price(foreign_ex, foreign_symbol);
             if (!foreign_price.valid || foreign_price.bid <= 0) continue;
-            if (!quote_pair_is_usable(korean_ex, foreign_ex, korean_price, foreign_price)) continue;
+            // Monitor display: no freshness filter — always show all symbols with prices
 
             double usdt_rate = price_cache_.get_usdt_krw(korean_ex);
             if (usdt_rate <= 0) continue;  // No real USDT/KRW rate

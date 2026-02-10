@@ -21,6 +21,7 @@ namespace kimp::execution {
  */
 struct ExecutionResult {
     bool success{false};
+    bool position_managed{false};  // Position already managed in engine tracker by the function
     Position position;
     std::string error_message;
     double korean_filled_amount{0.0};
@@ -70,7 +71,10 @@ public:
     // Execute entry with futures FIRST for perfect hedge
     // 1. SHORT on Bybit (get exact contract size)
     // 2. BUY on Bithumb (same amount)
-    ExecutionResult execute_entry_futures_first(const ArbitrageSignal& signal);
+    // Optional initial_position for top-up: resumes from existing partial position state
+    ExecutionResult execute_entry_futures_first(
+        const ArbitrageSignal& signal,
+        const std::optional<Position>& initial_position = std::nullopt);
 
     // Execute exit with futures FIRST
     // 1. COVER on Bybit (close short)
@@ -96,12 +100,17 @@ public:
     using PositionUpdateCallback = std::function<void(const Position*)>;
     void set_position_update_callback(PositionUpdateCallback cb) { on_position_update_ = std::move(cb); }
 
+    // Trade completion callback — called when a full enter→exit cycle completes within the lifecycle loop
+    using TradeCompleteCallback = std::function<void(const Position& closed_pos, double pnl_krw, double usdt_rate)>;
+    void set_trade_complete_callback(TradeCompleteCallback cb) { on_trade_complete_ = std::move(cb); }
+
     // Build external position blacklist at startup (checks all trading symbols)
     void refresh_external_positions(const std::vector<SymbolId>& symbols,
                                     const std::unordered_set<SymbolId>& bot_managed = {});
 
 private:
     PositionUpdateCallback on_position_update_;
+    TradeCompleteCallback on_trade_complete_;
     // External position blacklist (symbols we shouldn't trade)
     // Built once at startup, checked with O(1) lookup
     std::unordered_set<SymbolId> external_position_blacklist_;

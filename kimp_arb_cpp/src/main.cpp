@@ -52,12 +52,14 @@ bool read_stdin_line(std::string& line) {
     }
     return false;
 }
-std::atomic<bool> g_entry_in_flight{false};
+std::atomic<int> g_active_loops{0};
+std::mutex g_lifecycle_threads_mutex;
+std::vector<std::thread> g_lifecycle_threads;
 
-struct EntryGuard {
-    std::atomic<bool>& flag;
-    explicit EntryGuard(std::atomic<bool>& f) : flag(f) {}
-    ~EntryGuard() { flag.store(false, std::memory_order_release); }
+struct LoopGuard {
+    std::atomic<int>& counter;
+    explicit LoopGuard(std::atomic<int>& c) : counter(c) {}
+    ~LoopGuard() { counter.fetch_sub(1, std::memory_order_acq_rel); }
 };
 
 struct LiveMonitorGuard {
@@ -555,73 +557,67 @@ int main(int argc, char* argv[]) {
     //   1. COVER futures (Bybit) - close short position
     //   2. SELL spot (Bithumb) - sell exact same amount
     if (!monitor_only) {
-        engine.set_entry_callback([&](const kimp::ArbitrageSignal& signal) {
-        bool expected = false;
-        if (!g_entry_in_flight.compare_exchange_strong(expected, true,
-                                                       std::memory_order_acq_rel)) {
-            spdlog::warn("Entry skipped: another entry is already in-flight");
-            return;
-        }
-        EntryGuard entry_guard(g_entry_in_flight);
-
-        if (engine.get_position_count() >= kimp::TradingConfig::MAX_POSITIONS) {
-            spdlog::warn("Max positions reached, skipping entry for {}", signal.symbol.to_string());
-            return;
-        }
-
-        kimp::execution::ExecutionResult result =
-            order_manager.execute_entry_futures_first(signal);
-
-        if (result.success) {
-            engine.open_position(result.position);
-            // Handle any realized P&L from exit splits during adaptive entry
-            if (std::abs(result.position.realized_pnl_krw) > 0.01) {
-                double usdt_rate = signal.usdt_krw_rate;
-                double pnl_usd = result.position.realized_pnl_krw / usdt_rate;
+        // Trade complete callback: fired each time a full enter→exit cycle completes inside the loop
+        order_manager.set_trade_complete_callback(
+            [&](const kimp::Position& closed_pos, double pnl_krw, double usdt_rate) {
+                double pnl_usd = usdt_rate > 0 ? pnl_krw / usdt_rate : 0.0;
+                double capital_before = engine.get_current_capital();
                 engine.add_realized_pnl(pnl_usd);
-                spdlog::info("[ADAPTIVE] Entry had interim exit splits: P&L {:.2f} USD", pnl_usd);
-            }
-        } else if (std::abs(result.position.realized_pnl_krw) > 0.01) {
-            // Fully exited during entry - P&L from exit splits
-            double usdt_rate = signal.usdt_krw_rate;
-            double pnl_usd = result.position.realized_pnl_krw / usdt_rate;
-            double capital_before = engine.get_current_capital();
-            engine.add_realized_pnl(pnl_usd);
-            double capital_after = engine.get_current_capital();
-            append_trade_log(result.position, pnl_usd, usdt_rate, capital_before, capital_after);
-            spdlog::info("[ADAPTIVE] Entry fully reversed: P&L {:.0f} KRW ({:.2f} USD)",
-                         result.position.realized_pnl_krw, pnl_usd);
-        } else if (!result.error_message.empty()) {
-            spdlog::error("Entry FAILED: {}", result.error_message);
-        }
-        });
+                double capital_after = engine.get_current_capital();
+                append_trade_log(closed_pos, pnl_usd, usdt_rate, capital_before, capital_after);
+                spdlog::info("[TRADE COMPLETE] {} P&L: {:.0f} KRW ({:.2f} USD), capital: ${:.2f}",
+                             closed_pos.symbol.to_string(), pnl_krw, pnl_usd, capital_after);
+            });
 
-        engine.set_exit_callback([&](const kimp::ExitSignal& signal) {
-        kimp::Position closed_pos;
-        if (!engine.close_position(signal.symbol, closed_pos)) {
-            spdlog::warn("No position to close for {}", signal.symbol.to_string());
+        engine.set_entry_callback([&](const kimp::ArbitrageSignal& signal) {
+        // Skip if this symbol already has a position (loop is managing it)
+        auto existing = engine.get_position(signal.symbol);
+        if (existing) {
             return;
         }
 
-        kimp::execution::ExecutionResult result =
-            order_manager.execute_exit_futures_first(signal, closed_pos);
+        // Atomically claim a lifecycle slot
+        int current = g_active_loops.load(std::memory_order_acquire);
+        while (current < kimp::TradingConfig::MAX_POSITIONS) {
+            if (g_active_loops.compare_exchange_weak(current, current + 1,
+                                                      std::memory_order_acq_rel)) {
+                break;
+            }
+        }
+        if (current >= kimp::TradingConfig::MAX_POSITIONS) {
+            return;
+        }
 
-        if (result.success) {
-            // Convert KRW P&L to USD and add to capital tracker (복리 성장)
-            double usdt_rate = signal.usdt_krw_rate;
-            double pnl_usd = result.position.realized_pnl_krw / usdt_rate;
-            double capital_before = engine.get_current_capital();
-            engine.add_realized_pnl(pnl_usd);
-            double capital_after = engine.get_current_capital();
+        // Suppress entry scanning if all slots now filled
+        if (g_active_loops.load(std::memory_order_acquire) >= kimp::TradingConfig::MAX_POSITIONS) {
+            engine.set_entry_suppressed(true);
+        }
 
-            append_trade_log(result.position, pnl_usd, usdt_rate, capital_before, capital_after);
-        } else {
-            // Exit failed or partial - RE-ADD position with UPDATED amounts (not original!)
-            // result.position reflects actual remaining after any partial exits
-            spdlog::error("Exit FAILED: {} - Re-adding position to tracking", result.error_message);
-            engine.open_position(result.position);
+        spdlog::info("[LIFECYCLE] Starting permanent loop for {} (slot {}/{})",
+                     signal.symbol.to_string(), g_active_loops.load(), kimp::TradingConfig::MAX_POSITIONS);
+
+        // Spawn lifecycle thread (non-blocking — returns immediately)
+        {
+            std::lock_guard<std::mutex> lock(g_lifecycle_threads_mutex);
+            g_lifecycle_threads.emplace_back([&engine, &order_manager, signal]() {
+                LoopGuard guard(g_active_loops);
+
+                auto result = order_manager.execute_entry_futures_first(signal);
+
+                // Re-enable entry scanning if slots freed up
+                if (g_active_loops.load(std::memory_order_acquire) < kimp::TradingConfig::MAX_POSITIONS) {
+                    engine.set_entry_suppressed(false);
+                }
+
+                spdlog::info("[LIFECYCLE] {} loop ended (shutdown)", signal.symbol.to_string());
+                if (!result.error_message.empty()) {
+                    spdlog::error("Lifecycle loop error: {}", result.error_message);
+                }
+            });
         }
         });
+
+        // Exit callback not needed — lifecycle loop handles exits internally
     } else {
         spdlog::info("Monitor-only mode enabled: auto-trading callbacks are disabled");
     }
@@ -988,6 +984,7 @@ int main(int argc, char* argv[]) {
     // =========================================================================
     // STARTUP RECOVERY: Check for existing positions (trade mode only)
     // =========================================================================
+    std::optional<kimp::Position> recovered_position;  // For launching lifecycle loop after engine.start()
     if (!monitor_only) {
         bool resumed_position = false;
         auto normalize_input = [](std::string value) {
@@ -1126,43 +1123,65 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (!candidates.empty()) {
+                    // Sort: bot-managed (from saved file or matching saved symbol) first, then by USD
+                    std::string saved_symbol;
+                    if (loaded_pos) saved_symbol = loaded_pos->symbol.to_string();
+
+                    // Mark candidates that match the saved position and restore original entry data
+                    for (auto& c : candidates) {
+                        if (!saved_symbol.empty() && c.pos.symbol.to_string() == saved_symbol) {
+                            c.from_saved_file = true;
+                            // Preserve original entry prices/premium from saved file
+                            // (live scan recalculates with current prices which corrupts dynamic exit threshold)
+                            c.pos.entry_premium = loaded_pos->entry_premium;
+                            c.pos.korean_entry_price = loaded_pos->korean_entry_price;
+                            c.pos.foreign_entry_price = loaded_pos->foreign_entry_price;
+                            c.pos.entry_time = loaded_pos->entry_time;
+                            c.pos.position_size_usd = loaded_pos->position_size_usd;
+                            c.pos.realized_pnl_krw = loaded_pos->realized_pnl_krw;
+                        }
+                    }
+
                     std::sort(candidates.begin(), candidates.end(),
                         [](const RecoveryCandidate& a, const RecoveryCandidate& b) {
+                            // Bot-managed positions first
+                            if (a.from_saved_file != b.from_saved_file) return a.from_saved_file;
                             if (a.matched_usd != b.matched_usd) return a.matched_usd > b.matched_usd;
                             return a.pos.entry_premium < b.pos.entry_premium;
                         });
 
-                    const auto& best = candidates.front();
-
                     std::cout << "\n";
                     std::cout << "=========================================\n";
-                    std::cout << "  RECOVERY CANDIDATE SELECTED (BEST 1)\n";
+                    std::cout << "  RECOVERY CANDIDATES\n";
                     std::cout << "=========================================\n";
-                    std::cout << fmt::format("  Candidates: {} (best by matched USD)\n", candidates.size());
-                    std::cout << fmt::format("  Symbol:     {}\n", best.pos.symbol.to_string());
-                    std::cout << fmt::format("  Bithumb:    {:.8f} coins\n", best.spot_balance);
-                    std::cout << fmt::format("  Bybit:      {:.8f} coins\n", best.futures_amount);
-                    std::cout << fmt::format("  Matched:    {:.8f} coins (${:.2f})\n",
-                                              best.matched_amount, best.matched_usd);
-                    std::cout << fmt::format("  Entry:      KRW {:.2f} / USD {:.6f}\n",
-                                              best.pos.korean_entry_price, best.pos.foreign_entry_price);
-                    std::cout << fmt::format("  Premium:    {:.4f}%\n", best.pos.entry_premium);
-                    if (best.from_saved_file) {
-                        std::cout << "  Source:     saved file fallback\n";
-                    } else {
-                        std::cout << "  Source:     live exchange scan\n";
+                    for (size_t i = 0; i < candidates.size(); ++i) {
+                        const auto& c = candidates[i];
+                        std::cout << fmt::format("  [{}] {} — {:.8f} coins (${:.2f}) pm:{:.2f}%{}\n",
+                                                  i + 1,
+                                                  c.pos.symbol.to_string(),
+                                                  c.matched_amount,
+                                                  c.matched_usd,
+                                                  c.pos.entry_premium,
+                                                  c.from_saved_file ? " ★봇포지션" : "");
                     }
                     std::cout << "=========================================\n";
-                    std::cout << "\n이 포지션으로 시작할까요? (y/n): ";
+                    std::cout << "\n복구할 번호를 입력하세요 (0=건너뛰기): ";
                     std::cout.flush();
 
-                    std::string confirm;
-                    if (read_stdin_line(confirm) && is_yes(confirm)) {
-                        engine.open_position(best.pos);
+                    std::string choice_str;
+                    int choice = 0;
+                    if (read_stdin_line(choice_str)) {
+                        try { choice = std::stoi(normalize_input(choice_str)); } catch (...) {}
+                    }
+
+                    if (choice >= 1 && choice <= static_cast<int>(candidates.size())) {
+                        const auto& selected = candidates[choice - 1];
+                        engine.open_position(selected.pos);
                         resumed_position = true;
-                        save_active_position(best.pos);
-                        spdlog::info("[RECOVERY] Restored best position: {} ({:.8f} coins, ${:.2f})",
-                                     best.pos.symbol.to_string(), best.matched_amount, best.matched_usd);
+                        recovered_position = selected.pos;
+                        save_active_position(selected.pos);
+                        spdlog::info("[RECOVERY] Restored position: {} ({:.8f} coins, ${:.2f})",
+                                     selected.pos.symbol.to_string(), selected.matched_amount, selected.matched_usd);
                     } else {
                         spdlog::info("[RECOVERY] Candidate declined, starting fresh");
                     }
@@ -1235,6 +1254,47 @@ int main(int argc, char* argv[]) {
             spdlog::info("Press Ctrl+C to stop");
         }
 
+        // Launch lifecycle loop for recovered position (if any)
+        if (!monitor_only && recovered_position.has_value()) {
+            const auto& rpos = *recovered_position;
+            double actual_usd = rpos.foreign_amount * rpos.foreign_entry_price;
+            spdlog::info("[RECOVERY] Launching lifecycle loop for {} (${:.2f}/${:.2f} filled)",
+                         rpos.symbol.to_string(), actual_usd, rpos.position_size_usd);
+
+            // Claim a lifecycle slot
+            g_active_loops.fetch_add(1, std::memory_order_acq_rel);
+            if (g_active_loops.load(std::memory_order_acquire) >= kimp::TradingConfig::MAX_POSITIONS) {
+                engine.set_entry_suppressed(true);
+            }
+
+            std::lock_guard<std::mutex> lock(g_lifecycle_threads_mutex);
+            g_lifecycle_threads.emplace_back([&order_manager, &engine, rpos]() {
+                LoopGuard guard(g_active_loops);
+
+                // Build signal from recovered position + current prices
+                kimp::ArbitrageSignal signal;
+                signal.symbol = rpos.symbol;
+                signal.korean_exchange = rpos.korean_exchange;
+                signal.foreign_exchange = rpos.foreign_exchange;
+                signal.premium = rpos.entry_premium;
+                signal.korean_ask = rpos.korean_entry_price;
+                signal.foreign_bid = rpos.foreign_entry_price;
+                signal.usdt_krw_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Bithumb);
+                signal.timestamp = std::chrono::steady_clock::now();
+
+                spdlog::info("[RECOVERY] Starting lifecycle loop for {} with initial position",
+                             rpos.symbol.to_string());
+
+                auto result = order_manager.execute_entry_futures_first(signal, rpos);
+
+                if (g_active_loops.load(std::memory_order_acquire) < kimp::TradingConfig::MAX_POSITIONS) {
+                    engine.set_entry_suppressed(false);
+                }
+                spdlog::info("[RECOVERY] {} lifecycle loop ended (shutdown)",
+                             rpos.symbol.to_string());
+            });
+        }
+
         // Main loop with console output
         LiveMonitorGuard live_monitor_guard(monitor_mode);
         int tick = 0;
@@ -1272,6 +1332,41 @@ int main(int argc, char* argv[]) {
                     }
 
                     std::cout << std::string(132, '-') << "\n";
+
+                    // ===== SELECTED (active positions) section =====
+                    auto& pos_tracker = engine.get_position_tracker();
+                    if (pos_tracker.get_position_count() > 0) {
+                        std::cout << "\n\033[1m=== Selected Positions ===\033[0m\n";
+                        std::cout << fmt::format("{:<10} {:>11} {:>11} {:>12} {:>12} {:>9} {:>9} {:>8} {:>8} {:>4} {:>7} {:>4}\n",
+                            "Symbol", "KR_bid", "KR_ask", "BY_bid", "BY_ask", "Entry%", "Exit%", "Sprd%", "Fund%", "Int", "TTE", "Sig");
+                        std::cout << std::string(132, '-') << "\n";
+
+                        // Find position coins in premium data and display them
+                        for (const auto& p : premiums) {
+                            auto pos = pos_tracker.get_position(p.symbol);
+                            if (!pos) continue;
+
+                            std::string tte2 = format_remaining_ms(p.funding_interval_hours, p.next_funding_time);
+                            const char* sig2 = p.entry_signal ? "ENT" : (p.exit_signal ? "EXT" : "-");
+                            std::cout << fmt::format("{:<10} {:>11.2f} {:>11.2f} {:>12.6f} {:>12.6f} {:>8.4f}% {:>8.4f}% {:>7.4f}% {:>7.4f}% {:>3}h {:>7} {:>4}\n",
+                                p.symbol.get_base(), p.korean_bid, p.korean_ask,
+                                p.foreign_bid, p.foreign_ask,
+                                p.entry_premium, p.exit_premium, p.premium_spread,
+                                p.funding_rate * 100, p.funding_interval_hours, tte2, sig2);
+
+                            // Position details line
+                            double pos_usd = pos->foreign_amount * pos->foreign_entry_price;
+                            double dynamic_exit = std::max(
+                                pos->entry_premium + kimp::TradingConfig::DYNAMIC_EXIT_SPREAD,
+                                kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD);
+                            double gap_to_exit = dynamic_exit - p.exit_premium;
+                            std::cout << fmt::format("  \033[36m-> Entry: {:.4f}% | Target exit: {:.4f}% | Gap: {:.4f}% | Size: ${:.2f}/${:.2f} | Coins: {:.8f}\033[0m\n",
+                                pos->entry_premium, dynamic_exit, gap_to_exit,
+                                pos_usd, pos->position_size_usd, pos->korean_amount);
+                        }
+                        std::cout << std::string(132, '-') << "\n";
+                    }
+
                     const auto& tracker = engine.get_capital_tracker();
                     std::cout << fmt::format("Positions: {}/{} | Capital: ${:.2f} (+{:.2f}%) | Size: ${:.2f}/side\n",
                         engine.get_position_count(), kimp::TradingConfig::MAX_POSITIONS,
@@ -1323,6 +1418,14 @@ int main(int argc, char* argv[]) {
 
     ws_server->stop();  // Stop WebSocket server
     order_manager.request_shutdown();  // Break adaptive loops before stopping engine
+    {
+        std::lock_guard<std::mutex> lock(g_lifecycle_threads_mutex);
+        spdlog::info("Waiting for {} lifecycle thread(s) to finish...", g_lifecycle_threads.size());
+        for (auto& t : g_lifecycle_threads) {
+            if (t.joinable()) t.join();
+        }
+        g_lifecycle_threads.clear();
+    }
     engine.stop_async_exporter();
     engine.stop();
     bithumb->disconnect();

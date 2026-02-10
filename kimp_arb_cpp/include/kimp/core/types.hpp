@@ -321,14 +321,14 @@ struct TradingConfig {
     static constexpr double BITHUMB_FEE_PCT = 0.04;           // Per trade (buy or sell)
     static constexpr double BYBIT_FEE_PCT = 0.055;            // Per trade (short or cover)
     static constexpr double ROUND_TRIP_FEE_PCT = (BITHUMB_FEE_PCT + BYBIT_FEE_PCT) * 2;  // 0.19%
-    static constexpr double MIN_NET_PROFIT_PCT = 0.60;         // 순수익 목표 0.6%
-    static constexpr double DYNAMIC_EXIT_SPREAD = ROUND_TRIP_FEE_PCT + MIN_NET_PROFIT_PCT; // 0.79%
-    // Dynamic exit: exit_pm >= max(entry_pm + 0.79%, EXIT_PREMIUM_THRESHOLD)
-    // e.g., entry -0.99% -> dynamic -0.20%, but floor applies -> exit >= +0.10%
-    // e.g., entry -0.30% -> dynamic +0.49% -> exit >= +0.49%
+    static constexpr double MIN_NET_PROFIT_PCT = 0.00;         // floor(0.10%)에서 청산 — 수수료만 커버하면 즉시 탈출
+    static constexpr double DYNAMIC_EXIT_SPREAD = ROUND_TRIP_FEE_PCT + MIN_NET_PROFIT_PCT; // 0.19%
+    // Dynamic exit: exit_pm >= max(entry_pm + 0.19%, EXIT_PREMIUM_THRESHOLD)
+    // e.g., entry -0.99% -> dynamic -0.80%, floor applies -> exit >= +0.25%
+    // e.g., entry -0.53% -> dynamic -0.34%, floor applies -> exit >= +0.25%
 
     // Fallback fixed exit threshold (used when no position entry_premium available)
-    static constexpr double EXIT_PREMIUM_THRESHOLD = 0.10;    // Exit floor: only when premium >= +0.10%
+    static constexpr double EXIT_PREMIUM_THRESHOLD = 0.25;    // Exit floor: premium >= +0.25%
 
     // Entry filters
     static constexpr int MIN_FUNDING_INTERVAL_HOURS = 4;      // 4h and 8h funding (exclude 1h)
@@ -338,14 +338,21 @@ struct TradingConfig {
     static constexpr int USDT_UPDATE_INTERVAL_MS = 180000;    // 3 minutes
     static constexpr double MIN_ORDER_KRW = 5000.0;           // Minimum order in KRW
 
-    // Quote quality guards (outlier/stale protection)
+    // Quote quality guards — ENTRY (strict: avoid bad fills on new positions)
     static constexpr uint64_t MAX_QUOTE_AGE_MS = 2500;        // Reject quotes older than 2.5s
     static constexpr uint64_t MAX_QUOTE_DESYNC_MS = 1200;     // Reject if KR/Foreign quote times differ too much
     static constexpr double MAX_KOREAN_SPREAD_PCT = 1.20;     // Skip illiquid KRW books
     static constexpr double MAX_FOREIGN_SPREAD_PCT = 0.40;    // Skip illiquid futures books
+
+    // Quote quality guards — EXIT (relaxed: must be able to close positions)
+    static constexpr uint64_t MAX_QUOTE_AGE_MS_EXIT = 8000;       // 8s (small coins tick less often)
+    static constexpr uint64_t MAX_QUOTE_DESYNC_MS_EXIT = 5000;    // 5s desync tolerance
+    static constexpr double MAX_KOREAN_SPREAD_PCT_EXIT = 3.50;    // 3.5% (spread already in bid/ask premium)
+    static constexpr double MAX_FOREIGN_SPREAD_PCT_EXIT = 1.50;   // 1.5%
     static constexpr double MAX_USDT_JUMP_PCT = 1.50;         // Filter abnormal USDT/KRW jumps
     static constexpr uint64_t USDT_FULL_SCAN_DEBOUNCE_MS = 120;  // Coalesce bursty USDT updates with lower latency
     static constexpr uint64_t ENTRY_FAST_SCAN_COOLDOWN_MS = 80;  // Throttle event-driven full entry scans
+    static constexpr uint64_t ENTRY_STALL_TIMEOUT_MS = 120000;   // 2min: finalize partial position if no split progress
 };
 
 // Callback types

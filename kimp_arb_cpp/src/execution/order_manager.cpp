@@ -283,23 +283,24 @@ bool quote_is_fresh(const kimp::strategy::PriceCache::PriceData& price, uint64_t
 }
 
 bool quote_pair_is_usable(const kimp::strategy::PriceCache::PriceData& korean_price,
-                          const kimp::strategy::PriceCache::PriceData& foreign_price) {
+                          const kimp::strategy::PriceCache::PriceData& foreign_price,
+                          bool is_exit = false) {
+    uint64_t max_age    = is_exit ? kimp::TradingConfig::MAX_QUOTE_AGE_MS_EXIT    : kimp::TradingConfig::MAX_QUOTE_AGE_MS;
+    uint64_t max_desync = is_exit ? kimp::TradingConfig::MAX_QUOTE_DESYNC_MS_EXIT : kimp::TradingConfig::MAX_QUOTE_DESYNC_MS;
+    double   max_kr_sp  = is_exit ? kimp::TradingConfig::MAX_KOREAN_SPREAD_PCT_EXIT  : kimp::TradingConfig::MAX_KOREAN_SPREAD_PCT;
+    double   max_fr_sp  = is_exit ? kimp::TradingConfig::MAX_FOREIGN_SPREAD_PCT_EXIT : kimp::TradingConfig::MAX_FOREIGN_SPREAD_PCT;
+
     uint64_t now_ms = steady_now_ms();
-    if (!quote_is_fresh(korean_price, now_ms) || !quote_is_fresh(foreign_price, now_ms)) {
-        return false;
-    }
+    if (!korean_price.valid || korean_price.timestamp == 0 ||
+        !foreign_price.valid || foreign_price.timestamp == 0) return false;
+    if ((now_ms - korean_price.timestamp) > max_age || (now_ms - foreign_price.timestamp) > max_age) return false;
+
     uint64_t ts_diff = korean_price.timestamp >= foreign_price.timestamp
                            ? korean_price.timestamp - foreign_price.timestamp
                            : foreign_price.timestamp - korean_price.timestamp;
-    if (ts_diff > kimp::TradingConfig::MAX_QUOTE_DESYNC_MS) {
-        return false;
-    }
-    if (spread_pct(korean_price.bid, korean_price.ask) > kimp::TradingConfig::MAX_KOREAN_SPREAD_PCT) {
-        return false;
-    }
-    if (spread_pct(foreign_price.bid, foreign_price.ask) > kimp::TradingConfig::MAX_FOREIGN_SPREAD_PCT) {
-        return false;
-    }
+    if (ts_diff > max_desync) return false;
+    if (spread_pct(korean_price.bid, korean_price.ask) > max_kr_sp) return false;
+    if (spread_pct(foreign_price.bid, foreign_price.ask) > max_fr_sp) return false;
     return true;
 }
 
@@ -346,13 +347,17 @@ ExecutionResult OrderManager::execute_entry(const ArbitrageSignal& signal) {
     return execute_split_entry(signal);
 }
 
-ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal& signal) {
+ExecutionResult OrderManager::execute_entry_futures_first(
+        const ArbitrageSignal& signal,
+        const std::optional<Position>& initial_position) {
     ExecutionResult result;
     result.position.symbol = signal.symbol;
     result.position.korean_exchange = signal.korean_exchange;
     result.position.foreign_exchange = signal.foreign_exchange;
-    result.position.entry_time = std::chrono::system_clock::now();
-    result.position.entry_premium = signal.premium;
+    result.position.entry_time = initial_position
+        ? initial_position->entry_time : std::chrono::system_clock::now();
+    result.position.entry_premium = initial_position
+        ? initial_position->entry_premium : signal.premium;
 
     // Dynamic position size based on current capital (복리 성장)
     double position_size_usd = engine_ ? engine_->get_position_size_usd() : TradingConfig::POSITION_SIZE_USD;
@@ -384,11 +389,19 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
     // - between: wait for market update
     // Loop ends when: fully entered ($250) or fully exited (0 coins)
     // =========================================================================
-    double held_amount = 0.0;
-    double total_korean_cost = 0.0;
-    double total_foreign_value = 0.0;
-    double realized_pnl_krw = 0.0;
+    double held_amount = initial_position ? initial_position->korean_amount : 0.0;
+    double total_korean_cost = initial_position
+        ? initial_position->korean_entry_price * initial_position->korean_amount : 0.0;
+    double total_foreign_value = initial_position
+        ? initial_position->foreign_entry_price * initial_position->foreign_amount : 0.0;
+    double realized_pnl_krw = initial_position ? initial_position->realized_pnl_krw : 0.0;
     double last_usdt_rate = signal.usdt_krw_rate;
+
+    if (initial_position) {
+        Logger::info("[TOPUP] Resuming entry for {} from {:.8f} coins (${:.2f}/{:.2f})",
+                     signal.symbol.to_string(), held_amount,
+                     held_amount * signal.foreign_bid, position_size_usd);
+    }
 
     auto calculate_effective_entry_pm = [&](double usdt_rate) {
         if (held_amount <= 0.0 || total_foreign_value <= 0.0 || usdt_rate <= 0.0) {
@@ -425,12 +438,29 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
             auto& cache = engine_->get_price_cache();
             auto foreign_price = cache.get_price(signal.foreign_exchange, foreign_symbol);
             auto korean_price = cache.get_price(signal.korean_exchange, signal.symbol);
-            if (quote_pair_is_usable(korean_price, foreign_price)) {
-                current_foreign_bid = foreign_price.bid;
-                current_foreign_ask = foreign_price.ask;
-                current_korean_ask = korean_price.ask;
-                current_korean_bid = korean_price.bid;
-                quote_pair_ok = true;
+
+            // EXIT path: skip freshness checks — just use latest cached prices.
+            // We execute at market price anyway; cached price is only for premium calc.
+            // ENTRY path: require fresh, tight-spread quotes.
+            bool has_prices = (foreign_price.bid > 0 && korean_price.ask > 0);
+            if (held_amount > 0) {
+                // Exit mode: any non-zero cached price is good enough
+                if (has_prices) {
+                    current_foreign_bid = foreign_price.bid;
+                    current_foreign_ask = foreign_price.ask;
+                    current_korean_ask = korean_price.ask;
+                    current_korean_bid = korean_price.bid;
+                    quote_pair_ok = true;
+                }
+            } else {
+                // Entry mode: strict freshness & spread checks
+                if (has_prices && quote_pair_is_usable(korean_price, foreign_price)) {
+                    current_foreign_bid = foreign_price.bid;
+                    current_foreign_ask = foreign_price.ask;
+                    current_korean_ask = korean_price.ask;
+                    current_korean_bid = korean_price.bid;
+                    quote_pair_ok = true;
+                }
             }
             double bithumb_usdt = cache.get_usdt_krw(Exchange::Bithumb);
             if (bithumb_usdt > 0) usdt_rate = bithumb_usdt;
@@ -474,12 +504,6 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
 
         double remaining_position_usd = std::max(0.0, position_size_usd - held_value_usd);
         double min_split_usd = min_executable_usd(current_foreign_bid, current_korean_ask);
-        if (held_amount > 0.0 && remaining_position_usd > 0.0 && remaining_position_usd < min_split_usd) {
-            Logger::info("[ADAPTIVE-ENTRY] {} remainder ${:.2f} is below executable minimum ${:.2f}; "
-                         "finalizing entry without extra tiny split",
-                         signal.symbol.to_string(), remaining_position_usd, min_split_usd);
-            break;
-        }
 
         auto split_start = std::chrono::steady_clock::now();
 
@@ -492,12 +516,6 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
             Order foreign_order = execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
-                if (remaining_position_usd < TradingConfig::ORDER_SIZE_USD) {
-                    Logger::warn("[ADAPTIVE-ENTRY] Tiny tail split (${:.2f}) rejected by venue filters; "
-                                 "finalizing at held ${:.2f}/${:.2f}",
-                                 remaining_position_usd, held_value_usd, position_size_usd);
-                    break;
-                }
                 Logger::error("[ADAPTIVE-ENTRY] Futures SHORT failed, retrying next cycle");
                 std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
                 continue;
@@ -572,28 +590,40 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                                        short_price, usdt_rate, new_held_value,
                                        position_size_usd, effective_entry_pm);
 
+                // Build current position snapshot
+                Position snap;
+                snap.symbol = signal.symbol;
+                snap.korean_exchange = signal.korean_exchange;
+                snap.foreign_exchange = signal.foreign_exchange;
+                snap.entry_time = result.position.entry_time;
+                snap.entry_premium = effective_entry_pm;
+                snap.position_size_usd = position_size_usd;
+                snap.korean_amount = held_amount;
+                snap.foreign_amount = held_amount;
+                snap.korean_entry_price = total_korean_cost / held_amount;
+                snap.foreign_entry_price = total_foreign_value / held_amount;
+                snap.realized_pnl_krw = realized_pnl_krw;
+                snap.is_active = true;
+
+                // Register/update position in engine tracker
+                if (engine_) {
+                    auto& tracker = engine_->get_position_tracker();
+                    Position existing;
+                    if (tracker.close_position(signal.symbol, existing)) {
+                        tracker.open_position(snap);
+                    } else {
+                        tracker.open_position(snap);
+                    }
+                }
+
                 // Save position state for crash recovery
                 if (on_position_update_) {
-                    Position snap;
-                    snap.symbol = signal.symbol;
-                    snap.korean_exchange = signal.korean_exchange;
-                    snap.foreign_exchange = signal.foreign_exchange;
-                    snap.entry_time = result.position.entry_time;
-                    snap.entry_premium = effective_entry_pm;
-                    snap.position_size_usd = position_size_usd;
-                    snap.korean_amount = held_amount;
-                    snap.foreign_amount = held_amount;
-                    snap.korean_entry_price = total_korean_cost / held_amount;
-                    snap.foreign_entry_price = total_foreign_value / held_amount;
-                    snap.realized_pnl_krw = realized_pnl_krw;
-                    snap.is_active = true;
                     on_position_update_(&snap);
                 }
 
                 if (new_held_value >= position_size_usd) {
-                    Logger::info("[ADAPTIVE-ENTRY] {} fully entered: ${:.2f}",
+                    Logger::info("[ADAPTIVE] {} fully entered: ${:.2f}, monitoring for exit",
                                  signal.symbol.to_string(), new_held_value);
-                    break;
                 }
             } else {
                 bithumb_fill_future.get();  // Don't leak the future
@@ -705,13 +735,38 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
                 }
 
                 if (held_amount <= 0) {
-                    // Fully exited during entry phase
-                    Logger::info("[ADAPTIVE] {} fully exited during entry. Total P&L: {:.0f} KRW",
+                    // Fully exited — complete trade cycle, then continue for re-entry
+                    Logger::info("[ADAPTIVE] {} fully exited. Cycle P&L: {:.0f} KRW. Continuing for re-entry...",
                                  signal.symbol.to_string(), realized_pnl_krw);
-                    result.success = false;
-                    result.position.realized_pnl_krw = realized_pnl_krw;
-                    result.position.is_active = false;
-                    return result;
+
+                    // Close position from engine tracker
+                    if (engine_) {
+                        Position closed;
+                        engine_->get_position_tracker().close_position(signal.symbol, closed);
+                    }
+
+                    // Fire trade complete callback (P&L logging)
+                    if (on_trade_complete_) {
+                        Position completed_pos;
+                        completed_pos.symbol = signal.symbol;
+                        completed_pos.korean_exchange = signal.korean_exchange;
+                        completed_pos.foreign_exchange = signal.foreign_exchange;
+                        completed_pos.entry_time = result.position.entry_time;
+                        completed_pos.exit_time = std::chrono::system_clock::now();
+                        completed_pos.entry_premium = result.position.entry_premium;
+                        completed_pos.exit_premium = exit_premium;
+                        completed_pos.position_size_usd = position_size_usd;
+                        completed_pos.realized_pnl_krw = realized_pnl_krw;
+                        completed_pos.is_active = false;
+                        on_trade_complete_(completed_pos, realized_pnl_krw, usdt_rate);
+                    }
+
+                    // Reset state for next entry cycle
+                    total_korean_cost = 0.0;
+                    total_foreign_value = 0.0;
+                    realized_pnl_krw = 0.0;
+                    result.position.entry_time = std::chrono::system_clock::now();
+                    result.position.entry_premium = 0.0;
                 }
             } else {
                 bithumb_fill_future.get();
@@ -773,10 +828,11 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
         }
     }
 
-    // Shutdown interrupted entry - return partial position if any
-    if (!running_.load(std::memory_order_acquire) && held_amount > 0) {
-        Logger::warn("[ADAPTIVE-ENTRY] Shutdown during entry, saving partial position: {:.8f} coins",
-                     held_amount);
+    // Loop exited = shutdown. Return current state.
+    result.position_managed = true;  // Position already managed inside the loop
+    if (held_amount > 0) {
+        Logger::warn("[ADAPTIVE] Shutdown with active position: {} {:.8f} coins",
+                     signal.symbol.to_string(), held_amount);
         result.success = true;
         result.position.korean_amount = held_amount;
         result.position.foreign_amount = held_amount;
@@ -785,29 +841,10 @@ ExecutionResult OrderManager::execute_entry_futures_first(const ArbitrageSignal&
         result.position.entry_premium = calculate_effective_entry_pm(last_usdt_rate);
         result.position.is_active = true;
         result.position.realized_pnl_krw = realized_pnl_krw;
-        result.korean_filled_amount = held_amount;
-        result.foreign_filled_amount = held_amount;
-        return result;
-    }
-
-    if (held_amount <= 0.0) {
+    } else {
         result.success = false;
-        result.error_message = "No filled amount in adaptive entry";
-        return result;
+        result.position.is_active = false;
     }
-
-    // Fully entered - build position
-    result.success = true;
-    result.position.korean_amount = held_amount;
-    result.position.foreign_amount = held_amount;
-    result.position.korean_entry_price = total_korean_cost / held_amount;
-    result.position.foreign_entry_price = total_foreign_value / held_amount;
-    result.position.entry_premium = calculate_effective_entry_pm(last_usdt_rate);
-    result.position.is_active = true;
-    result.position.realized_pnl_krw = realized_pnl_krw;
-    result.korean_filled_amount = held_amount;
-    result.foreign_filled_amount = held_amount;
-
     return result;
 }
 

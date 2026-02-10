@@ -506,6 +506,21 @@ public:
     void open_position(const Position& pos) { position_tracker_.open_position(pos); }
     bool close_position(const SymbolId& symbol, Position& closed);
     int get_position_count() const { return position_tracker_.get_position_count(); }
+    std::optional<Position> get_position(const SymbolId& symbol) const {
+        return position_tracker_.get_position(symbol);
+    }
+    bool update_position(const Position& pos) {
+        Position closed;
+        if (position_tracker_.close_position(pos.symbol, closed)) {
+            return position_tracker_.open_position(pos);
+        }
+        return false;
+    }
+    PositionTracker& get_position_tracker() { return position_tracker_; }
+
+    // Entry suppression: when lifecycle loop is active, skip fire_entry_from_cache()
+    void set_entry_suppressed(bool suppressed) { entry_suppressed_.store(suppressed, std::memory_order_release); }
+    bool is_entry_suppressed() const { return entry_suppressed_.load(std::memory_order_acquire); }
 
     // Capital management (복리 성장)
     void set_initial_capital(double capital_usd) { capital_tracker_.set_initial_capital(capital_usd); }
@@ -588,6 +603,7 @@ private:
 
     // Thread control
     std::atomic<bool> running_{false};
+    std::atomic<bool> entry_suppressed_{false};
     std::thread monitor_thread_;
     std::mutex cv_mutex_;
     std::condition_variable cv_;
