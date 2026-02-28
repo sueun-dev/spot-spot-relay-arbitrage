@@ -106,6 +106,19 @@ void ArbitrageEngine::add_symbol(const SymbolId& symbol) {
         return;  // Already added
     }
 
+    if (monitored_symbols_.size() >= MAX_CACHED_SYMBOLS) {
+        static std::atomic<bool> warned{false};
+        bool expected = false;
+        if (warned.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            Logger::warn(
+                "Symbol cache limit reached (MAX_CACHED_SYMBOLS={}). "
+                "Additional symbols will be ignored for entry cache path.",
+                MAX_CACHED_SYMBOLS
+            );
+        }
+        return;
+    }
+
     // Add to vectors
     size_t idx = monitored_symbols_.size();
     monitored_symbols_.push_back(symbol);
@@ -175,7 +188,14 @@ void ArbitrageEngine::on_ticker_update(const Ticker& ticker) {
 
         // USDT rate affects ALL premiums → recompute everything
         update_all_entries();
-        fire_entry_from_cache();
+        const uint64_t now_ms = steady_now_ms();
+        uint64_t next_due = next_usdt_scan_ms_.load(std::memory_order_relaxed);
+        if (now_ms >= next_due) {
+            const uint64_t next_target = now_ms + TradingConfig::USDT_FULL_SCAN_DEBOUNCE_MS;
+            if (next_usdt_scan_ms_.compare_exchange_strong(next_due, next_target, std::memory_order_acq_rel)) {
+                fire_entry_from_cache();
+            }
+        }
         check_exit_conditions();
 
         update_seq_.fetch_add(1, std::memory_order_release);
@@ -200,8 +220,24 @@ void ArbitrageEngine::on_ticker_update(const Ticker& ticker) {
         // O(1) premium recompute for this symbol
         update_symbol_entry(idx);
 
-        // O(N) lightweight scan of cache-hot atomics → fire entry signal
-        fire_entry_from_cache();
+        // O(N) cache scan is throttled; bypass throttle when a fresh qualified signal is possible.
+        bool should_scan = false;
+        if (entry_cache_[idx].qualified.load(std::memory_order_relaxed) &&
+            !entry_cache_[idx].signal_fired.load(std::memory_order_relaxed)) {
+            should_scan = true;
+        } else {
+            const uint64_t now_ms = steady_now_ms();
+            uint64_t next_due = next_entry_scan_ms_.load(std::memory_order_relaxed);
+            if (now_ms >= next_due) {
+                const uint64_t next_target = now_ms + TradingConfig::ENTRY_FAST_SCAN_COOLDOWN_MS;
+                if (next_entry_scan_ms_.compare_exchange_strong(next_due, next_target, std::memory_order_acq_rel)) {
+                    should_scan = true;
+                }
+            }
+        }
+        if (should_scan) {
+            fire_entry_from_cache();
+        }
 
         // O(1) exit check for this symbol only (if holding position)
         if (position_tracker_.has_position(monitored_symbols_[idx])) {
@@ -441,41 +477,50 @@ void ArbitrageEngine::update_all_entries() {
 void ArbitrageEngine::fire_entry_from_cache() {
     if (exchange_pairs_.empty()) return;
     if (entry_suppressed_.load(std::memory_order_acquire)) return;
+    const size_t symbol_count = monitored_symbols_.size();
+    if (symbol_count == 0) return;
 
-    // Helper: check if a symbol has a partial position (not at $250 target)
-    auto is_partial_position = [this](const SymbolId& sym) -> bool {
-        auto pos = position_tracker_.get_position(sym);
-        if (!pos) return false;
-        double actual_usd = pos->foreign_amount * pos->foreign_entry_price;
-        return actual_usd < pos->position_size_usd * 0.95;
-    };
+    // 0: no position, 1: full position, 2: partial position (eligible for top-up)
+    std::array<uint8_t, MAX_CACHED_SYMBOLS> position_state{};
+    auto active_positions = position_tracker_.get_active_positions();
+    for (const auto& pos : active_positions) {
+        auto it = korean_symbol_index_.find(pos.symbol);
+        if (it == korean_symbol_index_.end()) continue;
+        const size_t idx = it->second;
+        if (idx >= symbol_count || idx >= MAX_CACHED_SYMBOLS) continue;
 
-    bool can_open_new = position_tracker_.can_open_position();
+        const double actual_usd = pos.foreign_amount * pos.foreign_entry_price;
+        const bool partial = actual_usd < pos.position_size_usd * 0.95;
+        position_state[idx] = partial ? 2 : 1;
+    }
+    const bool can_open_new = static_cast<int>(active_positions.size()) < TradingConfig::MAX_POSITIONS;
 
     const auto& [korean_ex, foreign_ex] = exchange_pairs_[0];
+
+    auto emit_signal = [&](size_t idx) {
+        auto& c = entry_cache_[idx];
+        ArbitrageSignal signal;
+        signal.symbol = monitored_symbols_[idx];
+        signal.korean_exchange = korean_ex;
+        signal.foreign_exchange = foreign_ex;
+        signal.premium = c.entry_premium.load(std::memory_order_relaxed);
+        signal.korean_ask = c.korean_ask.load(std::memory_order_relaxed);
+        signal.foreign_bid = c.foreign_bid.load(std::memory_order_relaxed);
+        signal.funding_rate = c.funding_rate.load(std::memory_order_relaxed);
+        signal.usdt_krw_rate = c.usdt_rate.load(std::memory_order_relaxed);
+        signal.timestamp = std::chrono::steady_clock::now();
+        if (on_entry_signal_) on_entry_signal_(signal);
+        entry_signals_.try_push(signal);
+    };
 
     if (TradingConfig::MAX_POSITIONS == 1) {
         // ── Single position mode ──
         if (!can_open_new) {
             // No room for new positions. Check if a qualifying symbol has a partial position → top-up
-            for (size_t i = 0; i < monitored_symbols_.size(); ++i) {
+            for (size_t i = 0; i < symbol_count; ++i) {
                 if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
-                if (!is_partial_position(monitored_symbols_[i])) continue;
-
-                auto& c = entry_cache_[i];
-                ArbitrageSignal signal;
-                signal.symbol = monitored_symbols_[i];
-                signal.korean_exchange = korean_ex;
-                signal.foreign_exchange = foreign_ex;
-                signal.premium = c.entry_premium.load(std::memory_order_relaxed);
-                signal.korean_ask = c.korean_ask.load(std::memory_order_relaxed);
-                signal.foreign_bid = c.foreign_bid.load(std::memory_order_relaxed);
-                signal.funding_rate = c.funding_rate.load(std::memory_order_relaxed);
-                signal.usdt_krw_rate = c.usdt_rate.load(std::memory_order_relaxed);
-                signal.timestamp = std::chrono::steady_clock::now();
-
-                if (on_entry_signal_) on_entry_signal_(signal);
-                entry_signals_.try_push(signal);
+                if (position_state[i] != 2) continue;
+                emit_signal(i);
                 return;
             }
             return;  // All positions full, no partial to top up
@@ -485,10 +530,9 @@ void ArbitrageEngine::fire_entry_from_cache() {
         double best_premium = 100.0;
         size_t best_idx = SIZE_MAX;
 
-        for (size_t i = 0; i < monitored_symbols_.size(); ++i) {
+        for (size_t i = 0; i < symbol_count; ++i) {
             if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
-            if (position_tracker_.has_position(monitored_symbols_[i]) &&
-                !is_partial_position(monitored_symbols_[i])) continue;
+            if (position_state[i] == 1) continue;  // full position
             double pm = entry_cache_[i].entry_premium.load(std::memory_order_relaxed);
             if (pm < best_premium) {
                 best_premium = pm;
@@ -499,35 +543,21 @@ void ArbitrageEngine::fire_entry_from_cache() {
         if (best_idx == SIZE_MAX) return;
 
         // Dedup: don't re-fire if already signaled (skip dedup for partial top-ups)
-        if (!is_partial_position(monitored_symbols_[best_idx])) {
+        if (position_state[best_idx] != 2) {
             if (entry_cache_[best_idx].signal_fired.load(std::memory_order_acquire)) return;
             entry_cache_[best_idx].signal_fired.store(true, std::memory_order_release);
         }
-
-        auto& c = entry_cache_[best_idx];
-        ArbitrageSignal signal;
-        signal.symbol = monitored_symbols_[best_idx];
-        signal.korean_exchange = korean_ex;
-        signal.foreign_exchange = foreign_ex;
-        signal.premium = c.entry_premium.load(std::memory_order_relaxed);
-        signal.korean_ask = c.korean_ask.load(std::memory_order_relaxed);
-        signal.foreign_bid = c.foreign_bid.load(std::memory_order_relaxed);
-        signal.funding_rate = c.funding_rate.load(std::memory_order_relaxed);
-        signal.usdt_krw_rate = c.usdt_rate.load(std::memory_order_relaxed);
-        signal.timestamp = std::chrono::steady_clock::now();
-
-        if (on_entry_signal_) on_entry_signal_(signal);
-        entry_signals_.try_push(signal);
+        emit_signal(best_idx);
     } else {
         // ── Multi-position mode: fire for each qualifying symbol ──
-        for (size_t i = 0; i < monitored_symbols_.size(); ++i) {
+        for (size_t i = 0; i < symbol_count; ++i) {
             if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
 
-            bool has_pos = position_tracker_.has_position(monitored_symbols_[i]);
-            bool partial = has_pos && is_partial_position(monitored_symbols_[i]);
+            const bool has_pos = position_state[i] != 0;
+            const bool partial = position_state[i] == 2;
 
             if (has_pos && !partial) continue;  // Fully entered, skip
-            if (!has_pos && !position_tracker_.can_open_position()) continue;  // No room for new
+            if (!has_pos && !can_open_new) continue;  // No room for new
 
             // Skip signal_fired dedup for partial top-ups
             if (!partial) {
@@ -535,20 +565,7 @@ void ArbitrageEngine::fire_entry_from_cache() {
                 entry_cache_[i].signal_fired.store(true, std::memory_order_release);
             }
 
-            auto& c = entry_cache_[i];
-            ArbitrageSignal signal;
-            signal.symbol = monitored_symbols_[i];
-            signal.korean_exchange = korean_ex;
-            signal.foreign_exchange = foreign_ex;
-            signal.premium = c.entry_premium.load(std::memory_order_relaxed);
-            signal.korean_ask = c.korean_ask.load(std::memory_order_relaxed);
-            signal.foreign_bid = c.foreign_bid.load(std::memory_order_relaxed);
-            signal.funding_rate = c.funding_rate.load(std::memory_order_relaxed);
-            signal.usdt_krw_rate = c.usdt_rate.load(std::memory_order_relaxed);
-            signal.timestamp = std::chrono::steady_clock::now();
-
-            if (on_entry_signal_) on_entry_signal_(signal);
-            entry_signals_.try_push(signal);
+            emit_signal(i);
         }
     }
 }

@@ -580,7 +580,8 @@ private:
     // Every ticker update recomputes only the affected symbol's premium.
     // Entry detection scans this cache-hot array instead of doing PriceCache
     // lookups + mutex + hash per symbol.  Zero-miss, zero-delay.
-    static constexpr size_t MAX_CACHED_SYMBOLS = 256;  // 256 * 64B = 16KB, fits L1
+    // Keep this comfortably above live common-symbol counts to avoid cache index overflow.
+    static constexpr size_t MAX_CACHED_SYMBOLS = 1024;  // 1024 * 64B = 64KB
     struct alignas(64) CachedEntryPremium {
         std::atomic<double> entry_premium{100.0};  // High default = no signal
         std::atomic<double> korean_ask{0.0};
@@ -621,6 +622,8 @@ private:
     mutable std::condition_variable update_cv_;
     std::atomic<uint64_t> update_seq_{0};
     std::array<std::atomic<double>, static_cast<size_t>(Exchange::Count)> last_usdt_log_{};
+    std::atomic<uint64_t> next_entry_scan_ms_{0};     // Throttle O(N) entry cache scans
+    std::atomic<uint64_t> next_usdt_scan_ms_{0};      // Debounce bursty USDT-triggered full scans
 
     // Internal methods
     void monitor_loop();
