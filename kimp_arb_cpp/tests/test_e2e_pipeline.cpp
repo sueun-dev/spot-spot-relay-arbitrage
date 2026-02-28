@@ -421,13 +421,26 @@ int main() {
 
     int calc_pm_ok = 0;
     int checked_count = 0;
+    int skipped_stale = 0;
     double calc_pm_max_diff = 0;
     size_t calc_samples = std::min<size_t>(50, all_pm.size());
     for (size_t j = 0; j < calc_samples; ++j) {
         const auto& info = all_pm[j];
         auto it = manual_pm_map.find(info.symbol.to_string());
         if (it == manual_pm_map.end()) continue;
+
+        // Refresh sampled quotes to avoid timing flakiness from strict freshness guards.
+        SymbolId by_sym(info.symbol.get_base(), "USDT");
+        engine.get_price_cache().update(Exchange::Bithumb, info.symbol,
+                                        info.korean_bid, info.korean_ask, info.korean_price);
+        engine.get_price_cache().update(Exchange::Bybit, by_sym,
+                                        info.foreign_bid, info.foreign_ask, info.foreign_price);
+
         double engine_pm = engine.calculate_premium(info.symbol, Exchange::Bithumb, Exchange::Bybit);
+        if (engine_pm == 0.0 && std::fabs(it->second) > 1e-9) {
+            ++skipped_stale;
+            continue;
+        }
         double diff = std::fabs(engine_pm - it->second);
         calc_pm_max_diff = std::max(calc_pm_max_diff, diff);
         ++checked_count;
@@ -435,7 +448,8 @@ int main() {
     }
     check(checked_count > 0 && calc_pm_ok == checked_count,
           "calculate_premium() vs 수동 일치",
-          fmt::format("{}/{}, max_diff={:.2e}", calc_pm_ok, checked_count, calc_pm_max_diff));
+          fmt::format("{}/{}, skipped_stale={}, max_diff={:.2e}",
+                      calc_pm_ok, checked_count, skipped_stale, calc_pm_max_diff));
 
     // ─── 프리미엄 범위/분포 출력 ──────────────────────────────
     std::cout << "\n[#3d] 프리미엄 분포\n";

@@ -136,12 +136,12 @@ int main() {
 
     if (bithumb_creds.api_key.empty() || bithumb_creds.secret_key.empty() ||
         bybit_creds.api_key.empty() || bybit_creds.secret_key.empty()) {
-        std::cerr << "API keys missing:\n";
-        std::cerr << "  Bithumb api_key: " << (bithumb_creds.api_key.empty() ? "EMPTY" : "OK") << "\n";
-        std::cerr << "  Bithumb secret:  " << (bithumb_creds.secret_key.empty() ? "EMPTY" : "OK") << "\n";
-        std::cerr << "  Bybit api_key:   " << (bybit_creds.api_key.empty() ? "EMPTY" : "OK") << "\n";
-        std::cerr << "  Bybit secret:    " << (bybit_creds.secret_key.empty() ? "EMPTY" : "OK") << "\n";
-        return 1;
+        std::cout << "[SKIP] API keys missing (live trading test requires authenticated accounts)\n";
+        std::cout << "  Bithumb api_key: " << (bithumb_creds.api_key.empty() ? "EMPTY" : "OK") << "\n";
+        std::cout << "  Bithumb secret:  " << (bithumb_creds.secret_key.empty() ? "EMPTY" : "OK") << "\n";
+        std::cout << "  Bybit api_key:   " << (bybit_creds.api_key.empty() ? "EMPTY" : "OK") << "\n";
+        std::cout << "  Bybit secret:    " << (bybit_creds.secret_key.empty() ? "EMPTY" : "OK") << "\n";
+        return 0;
     }
 
     kimp::Logger::init("logs/test_hedge_accuracy.log", "info", 100, 10, 8192, true);

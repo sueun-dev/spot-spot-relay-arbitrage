@@ -151,10 +151,17 @@ int main() {
     auto& bithumb_creds = config.exchanges[kimp::Exchange::Bithumb];
     auto& bybit_creds   = config.exchanges[kimp::Exchange::Bybit];
 
+    const bool has_api_keys =
+        !bithumb_creds.api_key.empty() && !bithumb_creds.secret_key.empty() &&
+        !bybit_creds.api_key.empty() && !bybit_creds.secret_key.empty();
+    if (!has_api_keys) {
+        std::cout << "[SKIP] API keys missing (parallel live fill test requires authenticated accounts)\n";
+        return 0;
+    }
+
     // Step 2: API keys present
     STEP("API keys present",
-         !bithumb_creds.api_key.empty() && !bithumb_creds.secret_key.empty() &&
-         !bybit_creds.api_key.empty() && !bybit_creds.secret_key.empty());
+         has_api_keys);
 
     kimp::Logger::init("logs/test_parallel_fill.log", "info", 100, 10, 8192, true);
 

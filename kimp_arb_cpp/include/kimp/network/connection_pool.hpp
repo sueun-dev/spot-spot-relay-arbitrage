@@ -3,6 +3,7 @@
 #include "kimp/core/optimization.hpp"
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl/host_name_verification.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
@@ -373,6 +374,7 @@ private:
             socket.set_option(boost::asio::socket_base::keep_alive(true));
 
             // SSL handshake
+            stream->set_verify_callback(ssl::host_name_verification(host_));
             stream->handshake(ssl::stream_base::client);
 
             conn->set_stream(std::move(stream));

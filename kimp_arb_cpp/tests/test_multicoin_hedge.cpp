@@ -437,9 +437,10 @@ int main() {
     auto& bithumb_creds = config.exchanges[Exchange::Bithumb];
     auto& bybit_creds = config.exchanges[Exchange::Bybit];
 
-    if (bithumb_creds.api_key.empty() || bybit_creds.api_key.empty()) {
-        std::cerr << "API keys missing\n";
-        return 1;
+    if (bithumb_creds.api_key.empty() || bithumb_creds.secret_key.empty() ||
+        bybit_creds.api_key.empty() || bybit_creds.secret_key.empty()) {
+        std::cout << "[SKIP] API keys missing (multi-coin live hedge test requires authenticated accounts)\n";
+        return 0;
     }
 
     Logger::init("logs/test_multicoin_hedge.log", "info", 100, 10, 8192, true);

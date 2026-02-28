@@ -16,8 +16,12 @@ interface PremiumData {
 
 export async function GET() {
   try {
-    // Read premium data from the JSON file that C++ bot writes
-    const dataPath = path.join(process.cwd(), '..', 'kimp_arb_cpp', 'data', 'premiums.json')
+    // Resolve premium file path with explicit override + build/legacy fallbacks.
+    const candidates = [
+      process.env.KIMP_PREMIUMS_PATH,
+      path.join(process.cwd(), '..', 'kimp_arb_cpp', 'build', 'data', 'premiums.json'),
+      path.join(process.cwd(), '..', 'kimp_arb_cpp', 'data', 'premiums.json'),
+    ].filter((value): value is string => typeof value === 'string' && value.length > 0)
 
     let premiums: PremiumData[] = []
     let status = {
@@ -28,19 +32,28 @@ export async function GET() {
       lastUpdate: 0,
     }
 
-    try {
-      const fileContent = await fs.readFile(dataPath, 'utf-8')
-      const data = JSON.parse(fileContent)
-      premiums = data.premiums || []
-      status = {
-        connected: data.status?.connected || false,
-        upbitConnected: data.status?.upbitConnected || false,
-        bybitConnected: data.status?.bybitConnected || false,
-        symbolCount: premiums.length,
-        lastUpdate: data.status?.lastUpdate || Date.now(),
+    let loaded = false
+    for (const candidate of candidates) {
+      try {
+        const fileContent = await fs.readFile(candidate, 'utf-8')
+        const data = JSON.parse(fileContent)
+        premiums = data.premiums || []
+        status = {
+          connected: data.status?.connected || false,
+          upbitConnected: data.status?.upbitConnected || false,
+          bybitConnected: data.status?.bybitConnected || false,
+          symbolCount: premiums.length,
+          lastUpdate: data.status?.lastUpdate || Date.now(),
+        }
+        loaded = true
+        break
+      } catch {
+        // Try next path.
       }
-    } catch (e) {
-      // File doesn't exist or is invalid - return empty state
+    }
+
+    if (!loaded) {
+      // File doesn't exist or is invalid - return empty state.
       console.log('Premium data file not found, returning empty state')
     }
 

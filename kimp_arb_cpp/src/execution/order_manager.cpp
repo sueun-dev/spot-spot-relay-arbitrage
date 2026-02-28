@@ -426,6 +426,38 @@ ExecutionResult OrderManager::execute_entry_futures_first(
         return std::max(min_by_krw, MIN_BYBIT_NOTIONAL_USD);
     };
 
+    auto persist_snapshot = [&](const Position& snap) {
+        if (engine_) {
+            auto& tracker = engine_->get_position_tracker();
+            Position existing;
+            tracker.close_position(snap.symbol, existing);
+            if (snap.is_active) {
+                tracker.open_position(snap);
+            }
+        }
+
+        if (on_position_update_) {
+            if (snap.is_active) {
+                on_position_update_(&snap);
+            } else {
+                on_position_update_(nullptr);
+            }
+        }
+    };
+
+    auto trigger_critical_stop = [&](const std::string& reason, const Position& snap) {
+        Logger::error("[RISK-STOP] {}", reason);
+        running_.store(false, std::memory_order_release);
+        if (engine_) {
+            engine_->set_entry_suppressed(true);
+        }
+        persist_snapshot(snap);
+        result.position = snap;
+        result.success = false;
+        result.position_managed = true;
+        result.error_message = reason;
+    };
+
     while (running_.load(std::memory_order_acquire)) {
         // Get fresh prices from cache
         double current_foreign_bid = signal.foreign_bid;
@@ -527,7 +559,30 @@ ExecutionResult OrderManager::execute_entry_futures_first(
 
             if (krw_amount < TradingConfig::MIN_ORDER_KRW) {
                 Logger::warn("[ADAPTIVE-ENTRY] Order too small ({:.0f} KRW), rolling back futures", krw_amount);
-                execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
+                Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
+                if (rollback.status != OrderStatus::Filled) {
+                    Position mismatch;
+                    mismatch.symbol = signal.symbol;
+                    mismatch.korean_exchange = signal.korean_exchange;
+                    mismatch.foreign_exchange = signal.foreign_exchange;
+                    mismatch.entry_time = result.position.entry_time;
+                    mismatch.entry_premium = result.position.entry_premium;
+                    mismatch.position_size_usd = position_size_usd;
+                    mismatch.korean_amount = held_amount;
+                    mismatch.foreign_amount = held_amount + actual_filled;
+                    mismatch.korean_entry_price = held_amount > 0 ? (total_korean_cost / held_amount) : 0.0;
+                    double short_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_bid;
+                    double foreign_value = total_foreign_value + (actual_filled * short_price);
+                    mismatch.foreign_entry_price = mismatch.foreign_amount > 0 ? (foreign_value / mismatch.foreign_amount) : 0.0;
+                    mismatch.realized_pnl_krw = realized_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[ADAPTIVE-ENTRY] Futures rollback failed after min-order guard (manual intervention required)",
+                        mismatch
+                    );
+                    return result;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
                 continue;
             }
@@ -604,22 +659,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(
                 snap.foreign_entry_price = total_foreign_value / held_amount;
                 snap.realized_pnl_krw = realized_pnl_krw;
                 snap.is_active = true;
-
-                // Register/update position in engine tracker
-                if (engine_) {
-                    auto& tracker = engine_->get_position_tracker();
-                    Position existing;
-                    if (tracker.close_position(signal.symbol, existing)) {
-                        tracker.open_position(snap);
-                    } else {
-                        tracker.open_position(snap);
-                    }
-                }
-
-                // Save position state for crash recovery
-                if (on_position_update_) {
-                    on_position_update_(&snap);
-                }
+                persist_snapshot(snap);
 
                 if (new_held_value >= position_size_usd) {
                     Logger::info("[ADAPTIVE] {} fully entered: ${:.2f}, monitoring for exit",
@@ -628,7 +668,30 @@ ExecutionResult OrderManager::execute_entry_futures_first(
             } else {
                 bithumb_fill_future.get();  // Don't leak the future
                 Logger::error("[ADAPTIVE-ENTRY] Korean BUY failed, rolling back futures SHORT");
-                execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
+                Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
+                if (rollback.status != OrderStatus::Filled) {
+                    Position mismatch;
+                    mismatch.symbol = signal.symbol;
+                    mismatch.korean_exchange = signal.korean_exchange;
+                    mismatch.foreign_exchange = signal.foreign_exchange;
+                    mismatch.entry_time = result.position.entry_time;
+                    mismatch.entry_premium = result.position.entry_premium;
+                    mismatch.position_size_usd = position_size_usd;
+                    mismatch.korean_amount = held_amount;
+                    mismatch.foreign_amount = held_amount + actual_filled;
+                    mismatch.korean_entry_price = held_amount > 0 ? (total_korean_cost / held_amount) : 0.0;
+                    double short_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_bid;
+                    double foreign_value = total_foreign_value + (actual_filled * short_price);
+                    mismatch.foreign_entry_price = mismatch.foreign_amount > 0 ? (foreign_value / mismatch.foreign_amount) : 0.0;
+                    mismatch.realized_pnl_krw = realized_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[ADAPTIVE-ENTRY] Futures rollback failed after Korean BUY rejection (manual intervention required)",
+                        mismatch
+                    );
+                    return result;
+                }
             }
 
         } else if (exit_premium >= dynamic_exit_threshold && held_amount > 0) {
@@ -805,6 +868,25 @@ ExecutionResult OrderManager::execute_entry_futures_first(
                 if (korean_order.status != OrderStatus::Filled) {
                     Logger::error("[ADAPTIVE-EXIT] CRITICAL: Korean SELL failed after 5 retries! "
                                   "UNHEDGED {:.8f} coins — MANUAL INTERVENTION REQUIRED", actual_covered);
+                    Position mismatch;
+                    mismatch.symbol = signal.symbol;
+                    mismatch.korean_exchange = signal.korean_exchange;
+                    mismatch.foreign_exchange = signal.foreign_exchange;
+                    mismatch.entry_time = result.position.entry_time;
+                    mismatch.entry_premium = result.position.entry_premium;
+                    mismatch.position_size_usd = position_size_usd;
+                    mismatch.korean_amount = held_amount;
+                    mismatch.foreign_amount = std::max(0.0, held_amount - actual_covered);
+                    mismatch.korean_entry_price = held_amount > 0 ? (total_korean_cost / held_amount) : 0.0;
+                    mismatch.foreign_entry_price = held_amount > 0 ? (total_foreign_value / held_amount) : 0.0;
+                    mismatch.realized_pnl_krw = realized_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[ADAPTIVE-EXIT] Korean SELL failed after successful futures COVER; bot stopped for manual recovery",
+                        mismatch
+                    );
+                    return result;
                 }
             }
 
@@ -891,6 +973,38 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
             return position.entry_premium;
         }
         return ((avg_korean_entry - foreign_krw) / foreign_krw) * 100.0;
+    };
+
+    auto persist_snapshot = [&](const Position& snap) {
+        if (engine_) {
+            auto& tracker = engine_->get_position_tracker();
+            Position existing;
+            tracker.close_position(snap.symbol, existing);
+            if (snap.is_active) {
+                tracker.open_position(snap);
+            }
+        }
+
+        if (on_position_update_) {
+            if (snap.is_active) {
+                on_position_update_(&snap);
+            } else {
+                on_position_update_(nullptr);
+            }
+        }
+    };
+
+    auto trigger_critical_stop = [&](const std::string& reason, const Position& snap) {
+        Logger::error("[RISK-STOP] {}", reason);
+        running_.store(false, std::memory_order_release);
+        if (engine_) {
+            engine_->set_entry_suppressed(true);
+        }
+        persist_snapshot(snap);
+        result.position = snap;
+        result.success = false;
+        result.position_managed = true;
+        result.error_message = reason;
     };
 
     while (remaining_amount > 0 && running_.load(std::memory_order_acquire)) {
@@ -1092,6 +1206,20 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                 if (korean_order.status != OrderStatus::Filled) {
                     Logger::error("[EXIT] CRITICAL: Korean SELL failed after 5 retries! "
                                   "UNHEDGED {:.8f} coins — MANUAL INTERVENTION REQUIRED", actual_covered);
+                    Position mismatch = position;
+                    mismatch.korean_amount = remaining_amount;
+                    mismatch.foreign_amount = std::max(0.0, remaining_amount - actual_covered);
+                    mismatch.korean_entry_price = remaining_amount > 0 ? (total_korean_cost / remaining_amount) : 0.0;
+                    mismatch.foreign_entry_price = remaining_amount > 0 ? (total_foreign_value / remaining_amount) : 0.0;
+                    mismatch.entry_premium = calculate_effective_entry_pm(usdt_rate);
+                    mismatch.realized_pnl_krw = realized_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[EXIT] Korean SELL failed after successful futures COVER; bot stopped for manual recovery",
+                        mismatch
+                    );
+                    return result;
                 }
             }
 
@@ -1115,7 +1243,25 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
 
             if (krw_amount < TradingConfig::MIN_ORDER_KRW) {
                 Logger::warn("[ADAPTIVE-REENTRY] Order too small, rolling back");
-                execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
+                Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
+                if (rollback.status != OrderStatus::Filled) {
+                    Position mismatch = position;
+                    mismatch.korean_amount = remaining_amount;
+                    mismatch.foreign_amount = remaining_amount + actual_filled;
+                    mismatch.korean_entry_price = remaining_amount > 0 ? (total_korean_cost / remaining_amount) : 0.0;
+                    double short_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_bid;
+                    double foreign_value = total_foreign_value + (actual_filled * short_price);
+                    mismatch.foreign_entry_price = mismatch.foreign_amount > 0 ? (foreign_value / mismatch.foreign_amount) : 0.0;
+                    mismatch.entry_premium = calculate_effective_entry_pm(usdt_rate);
+                    mismatch.realized_pnl_krw = realized_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[ADAPTIVE-REENTRY] Futures rollback failed after min-order guard (manual intervention required)",
+                        mismatch
+                    );
+                    return result;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
                 continue;
             }
@@ -1177,7 +1323,25 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
             } else {
                 bithumb_fill_future.get();
                 Logger::error("[ADAPTIVE-REENTRY] Korean BUY failed, rolling back futures SHORT");
-                execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
+                Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
+                if (rollback.status != OrderStatus::Filled) {
+                    Position mismatch = position;
+                    mismatch.korean_amount = remaining_amount;
+                    mismatch.foreign_amount = remaining_amount + actual_filled;
+                    mismatch.korean_entry_price = remaining_amount > 0 ? (total_korean_cost / remaining_amount) : 0.0;
+                    double short_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_bid;
+                    double foreign_value = total_foreign_value + (actual_filled * short_price);
+                    mismatch.foreign_entry_price = mismatch.foreign_amount > 0 ? (foreign_value / mismatch.foreign_amount) : 0.0;
+                    mismatch.entry_premium = calculate_effective_entry_pm(usdt_rate);
+                    mismatch.realized_pnl_krw = realized_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[ADAPTIVE-REENTRY] Futures rollback failed after Korean BUY rejection (manual intervention required)",
+                        mismatch
+                    );
+                    return result;
+                }
             }
 
         } else {
@@ -1320,12 +1484,25 @@ ExecutionResult OrderManager::execute_split_entry(const ArbitrageSignal& signal)
             } else {
                 Logger::error("Rollback failed! Manual intervention required");
                 result.error_message = "Rollback failed after partial fill";
-                // Continue with what we have
+                running_.store(false, std::memory_order_release);
+                if (engine_) {
+                    engine_->set_entry_suppressed(true);
+                }
+                break;
             }
         } else if (!korean_success && foreign_success) {
             // Korean failed but foreign succeeded - close foreign position
             Logger::error("Korean order failed, closing foreign short");
-            execute_foreign_cover(signal.foreign_exchange, foreign_symbol, coin_amount);
+            Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, coin_amount);
+            if (rollback.status != OrderStatus::Filled) {
+                Logger::error("Critical rollback failed after foreign short fill (manual intervention required)");
+                result.error_message = "Critical rollback failure after foreign short fill";
+                running_.store(false, std::memory_order_release);
+                if (engine_) {
+                    engine_->set_entry_suppressed(true);
+                }
+                break;
+            }
         } else {
             // Both failed
             Logger::error("Both orders failed for split {}", i + 1);
@@ -1336,6 +1513,10 @@ ExecutionResult OrderManager::execute_split_entry(const ArbitrageSignal& signal)
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
         }
+    }
+
+    if (!result.error_message.empty()) {
+        return result;
     }
 
     // Check if we got any fill

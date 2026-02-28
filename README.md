@@ -1,194 +1,289 @@
 # Kimchi Premium Arbitrage Bot
 
-A high-frequency trading bot that exploits the price difference between Korean and foreign cryptocurrency exchanges.
+A production-focused arbitrage bot that monitors KRW spot markets and USDT perpetual markets, then executes hedged entry and exit based on premium spread rules.
 
-## What is Kimchi Premium?
+## English
 
-**Kimchi Premium** refers to the price gap between Korean crypto exchanges and international exchanges.
+### 1. What This System Does
 
-```
-Premium (%) = ((Korean Price - Foreign Price) / Foreign Price) × 100
-```
+This project trades the spread between:
+- Korean spot market: Bithumb (`BASE/KRW`)
+- Foreign perpetual market: Bybit (`BASE/USDT`)
 
-| Premium | Korean Name | Meaning | Action |
-|---------|-------------|---------|--------|
-| **Positive (+%)** | 김프 (Kimchi Premium) | Korean price > Foreign price | **EXIT** (Sell) |
-| **Negative (-%)** | 역프 (Reverse Premium) | Korean price < Foreign price | **ENTRY** (Buy) |
+It opens a hedged position when reverse premium is deep enough, then closes when exit conditions are met.
 
-### How the Arbitrage Works
+### 2. Core Formula
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     ARBITRAGE CYCLE                                  │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   ENTRY (역프 / Negative Premium)                                    │
-│   ├── Korean price is CHEAPER than foreign                          │
-│   ├── Buy SPOT on Korean exchange (Upbit)                           │
-│   └── Open SHORT on foreign exchange (Bybit)                        │
-│                                                                      │
-│                         ↓ Wait for premium reversal ↓                │
-│                                                                      │
-│   EXIT (김프 / Positive Premium)                                     │
-│   ├── Korean price is now MORE EXPENSIVE than foreign               │
-│   ├── Sell SPOT on Korean exchange                                  │
-│   └── Close SHORT on foreign exchange                               │
-│                                                                      │
-│   PROFIT = Entry Premium Gap + Exit Premium Gap                      │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
+Entry premium (for opening):
+
+```text
+entry_pm(%) = ((korean_ask - foreign_bid * usdt_krw) / (foreign_bid * usdt_krw)) * 100
 ```
 
-### Example Trade
+Exit premium (for closing):
 
-1. **Entry** at -2% premium (역프):
-   - BTC price: Korea ₩100M, Foreign $70K (≈₩102M)
-   - Buy 0.01 BTC spot on Upbit
-   - Short 0.01 BTC on Bybit
+```text
+exit_pm(%) = ((korean_bid - foreign_ask * usdt_krw) / (foreign_ask * usdt_krw)) * 100
+```
 
-2. **Exit** at +2% premium (김프):
-   - BTC price: Korea ₩104M, Foreign $70K (≈₩102M)
-   - Sell spot on Upbit (+4% gain)
-   - Close short on Bybit (0% change)
-   - **Net profit: ~4%** (minus fees)
+### 3. End-to-End Trading Logic
 
-## Features
+1. Symbol universe build
+- Load symbols from Bithumb and Bybit
+- Intersect by base symbol
+- Register common symbols as `BASE/KRW` (and map to `BASE/USDT` internally)
 
-- **Real-time monitoring** via WebSocket connections
-- **Automatic entry/exit** based on premium thresholds
-- **Hedged positions** - spot + futures short eliminates directional risk
-- **Split orders** - minimizes market impact
-- **Multi-position management** - up to 3 concurrent positions
+2. Market data ingest
+- Initial REST snapshot load from both exchanges in parallel
+- Real-time WebSocket ticker updates
+- Bithumb orderbook overlay for executable bid/ask quality
+- Periodic fallback refresh threads (price and funding)
 
-## Configuration
+3. Premium compute
+- `ArbitrageEngine` stores quotes in a sharded `PriceCache`
+- Computes entry/exit premium per symbol
+- Applies quote freshness, desync, and spread quality filters
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Entry Threshold | ≤ -1.0% | Enter when reverse premium |
-| Exit Threshold | ≥ +1.0% | Exit when kimchi premium |
-| Position Size | 50 USD | Per position (25 USD × 2 splits) |
-| Max Positions | 3 | Concurrent positions |
-| Order Interval | 1 second | Between split orders |
+4. Entry gate
+- Entry threshold: `entry_pm <= -0.99`
+- Funding constraints:
+  - `MIN_FUNDING_INTERVAL_HOURS = 4`
+  - `REQUIRE_POSITIVE_FUNDING = true`
+- Safety gate checks external/manual positions before trading
 
-## Tech Stack
+5. Split entry execution
+- Position size per side: `250 USD`
+- Split count: `10`
+- Split size: `25 USD`
+- For each split:
+  - Buy spot on Bithumb
+  - Open short on Bybit
+- If one leg fails, rollback is attempted immediately
 
-- **Language**: C++20 (HFT optimized)
-- **JSON Parser**: simdjson (fastest)
-- **WebSocket**: Beast/Asio for low-latency connections
-- **Exchanges**: Bithumb (Korea), Bybit (Foreign)
-- **Dashboard**: Next.js (real-time monitoring)
+6. Dynamic exit logic
+- Fee model:
+  - Bithumb fee: `0.04%`
+  - Bybit fee: `0.055%`
+  - Round trip fee: `0.19%`
+- Dynamic spread:
+  - `DYNAMIC_EXIT_SPREAD = 0.19%`
+- Required exit premium:
 
-## Quick Start
+```text
+required_exit_pm = max(entry_pm + DYNAMIC_EXIT_SPREAD, EXIT_PREMIUM_THRESHOLD)
+```
+
+- Exit floor:
+  - `EXIT_PREMIUM_THRESHOLD = 0.25`
+
+7. Failure handling and critical stop
+- Rollback failures are treated as critical
+- On critical mismatch:
+  - trading loop is stopped
+  - new entries are suppressed
+  - mismatch snapshot is persisted for manual intervention
+
+8. Recovery and persistence
+- Startup recovery can detect and resume existing live positions
+- Persisted outputs:
+  - `trade_logs/trades.csv`
+  - `trade_logs/entry_splits.csv`
+  - `trade_logs/exit_splits.csv`
+  - `trade_logs/active_position.json`
+  - `kimp_arb_cpp/data/premiums.json`
+
+### 4. Monitoring and Dashboard
+
+- `ArbitrageEngine` exports premium JSON every `200ms`
+- Dedicated WebSocket broadcast server pushes updates every `50ms` on port `8765`
+- Next.js dashboard reads premium data from:
+  1. `KIMP_PREMIUMS_PATH` (env override)
+  2. `../kimp_arb_cpp/build/data/premiums.json`
+  3. `../kimp_arb_cpp/data/premiums.json`
+
+### 5. Concurrency Model
+
+- Sharded `PriceCache` for reduced lock contention
+- Separate I/O, strategy, execution, refresh, and broadcast paths
+- CSV writes are protected with synchronization to prevent row corruption
+- Position and signal structures are designed for thread-safe access
+
+### 6. Build and Run
 
 ```bash
-# Build
-cd kimp_arb_cpp && mkdir build && cd build
-cmake .. && make -j8
+# C++ build
+cd kimp_arb_cpp
+cmake -S . -B build
+cmake --build build -j8
 
-# Configure
-cp config/config.yaml.example config/config.yaml
-# Edit config.yaml with your API keys
+# Run bot
+./build/kimp_bot
 
-# Run
-./kimp_bot
+# Or helper script from repository root
+cd ..
+./run_bot.sh
 ```
+
+### 7. Test Commands
+
+```bash
+cd kimp_arb_cpp
+cmake --build build -j8
+
+# Run full C++ suite
+for t in build/kimp_test_*; do "$t"; done
+
+# Dashboard production build
+cd ../dashboard
+npm run build
+```
+
+Notes:
+- Live trade tests require valid exchange API keys.
+- If keys are missing, live execution tests now report `SKIP` and exit successfully.
 
 ---
 
-# 김치 프리미엄 차익거래 봇
+## 한국어
 
-한국 거래소와 해외 거래소 간의 가격 차이를 이용한 고빈도 차익거래 봇입니다.
+### 1. 이 시스템이 하는 일
 
-## 김치 프리미엄이란?
+이 프로젝트는 아래 두 시장의 가격 괴리를 거래합니다.
+- 한국 현물: Bithumb (`BASE/KRW`)
+- 해외 무기한 선물: Bybit (`BASE/USDT`)
 
-**김치 프리미엄**은 한국 암호화폐 거래소와 해외 거래소 간의 가격 차이를 말합니다.
+역프가 충분히 깊어지면 헤지 진입하고, 청산 조건이 충족되면 양쪽 포지션을 함께 종료합니다.
 
-```
-프리미엄 (%) = ((한국 가격 - 해외 가격) / 해외 가격) × 100
-```
+### 2. 핵심 수식
 
-| 프리미엄 | 명칭 | 의미 | 행동 |
-|---------|------|------|------|
-| **양수 (+%)** | 김프 (김치 프리미엄) | 한국 가격 > 해외 가격 | **청산** (매도) |
-| **음수 (-%)** | 역프 (역프리미엄) | 한국 가격 < 해외 가격 | **진입** (매수) |
+진입 프리미엄:
 
-### 차익거래 원리
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        차익거래 사이클                                │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   진입 (역프 / 마이너스 프리미엄)                                      │
-│   ├── 한국 가격이 해외보다 저렴할 때                                   │
-│   ├── 한국 거래소(Upbit)에서 현물 매수                                │
-│   └── 해외 거래소(Bybit)에서 선물 숏 진입                             │
-│                                                                      │
-│                      ↓ 프리미엄 역전 대기 ↓                           │
-│                                                                      │
-│   청산 (김프 / 플러스 프리미엄)                                        │
-│   ├── 한국 가격이 해외보다 비싸질 때                                   │
-│   ├── 한국 거래소에서 현물 매도                                       │
-│   └── 해외 거래소에서 선물 숏 청산                                    │
-│                                                                      │
-│   수익 = 진입 프리미엄 갭 + 청산 프리미엄 갭                           │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
+```text
+entry_pm(%) = ((korean_ask - foreign_bid * usdt_krw) / (foreign_bid * usdt_krw)) * 100
 ```
 
-### 거래 예시
+청산 프리미엄:
 
-1. **진입** -2% 역프 시점:
-   - BTC 가격: 한국 1억원, 해외 $70K (≈1.02억원)
-   - Upbit에서 0.01 BTC 현물 매수
-   - Bybit에서 0.01 BTC 숏 진입
+```text
+exit_pm(%) = ((korean_bid - foreign_ask * usdt_krw) / (foreign_ask * usdt_krw)) * 100
+```
 
-2. **청산** +2% 김프 시점:
-   - BTC 가격: 한국 1.04억원, 해외 $70K (≈1.02억원)
-   - Upbit에서 현물 매도 (+4% 수익)
-   - Bybit에서 숏 청산 (0% 변동)
-   - **순수익: ~4%** (수수료 제외)
+### 3. 실제 동작 로직
 
-## 주요 기능
+1. 심볼 유니버스 구성
+- Bithumb, Bybit 심볼 목록 로드
+- 코인 베이스 기준 교집합 계산
+- 공통 심볼을 `BASE/KRW`로 등록하고 내부에서 `BASE/USDT`로 매핑
 
-- **실시간 모니터링** - WebSocket 연결
-- **자동 진입/청산** - 프리미엄 임계값 기반
-- **헤지 포지션** - 현물 + 선물 숏으로 방향성 리스크 제거
-- **분할 주문** - 시장 충격 최소화
-- **다중 포지션** - 최대 3개 동시 운영
+2. 시세 수집
+- 시작 시 양 거래소 REST 스냅샷 병렬 로드
+- 이후 WebSocket 실시간 티커 반영
+- Bithumb 오더북 오버레이로 실제 체결 가능한 bid/ask 품질 강화
+- 백업용 주기적 refresh 스레드 운영 (가격, 펀딩)
 
-## 설정 값
+3. 프리미엄 계산
+- `ArbitrageEngine`가 sharded `PriceCache`에 시세 저장
+- 심볼별 entry/exit 프리미엄 계산
+- 시세 신선도, 거래소 간 시점 차이, 스프레드 품질 필터 적용
 
-| 파라미터 | 값 | 설명 |
-|---------|------|------|
-| 진입 임계값 | ≤ -1.0% | 역프일 때 진입 |
-| 청산 임계값 | ≥ +1.0% | 김프일 때 청산 |
-| 포지션 크기 | 50 USD | 포지션당 (25 USD × 2회 분할) |
-| 최대 포지션 | 3개 | 동시 운영 |
-| 주문 간격 | 1초 | 분할 주문 사이 |
+4. 진입 조건
+- 진입 임계값: `entry_pm <= -0.99`
+- 펀딩 필터:
+  - `MIN_FUNDING_INTERVAL_HOURS = 4`
+  - `REQUIRE_POSITIVE_FUNDING = true`
+- 외부 수동 포지션과 충돌하지 않도록 안전 체크 후 진입
 
-## 기술 스택
+5. 분할 진입 실행
+- 한쪽 기준 포지션 크기: `250 USD`
+- 분할 횟수: `10`
+- 분할당 주문 크기: `25 USD`
+- 각 분할마다:
+  - Bithumb 현물 매수
+  - Bybit 선물 숏 진입
+- 한쪽 체결 실패 시 즉시 롤백 시도
 
-- **언어**: C++17 (HFT 최적화)
-- **WebSocket**: Beast/Asio 저지연 연결
-- **거래소**: Upbit (한국), Bybit (해외)
-- **대시보드**: Next.js (실시간 모니터링)
+6. 동적 청산 로직
+- 수수료 모델:
+  - Bithumb: `0.04%`
+  - Bybit: `0.055%`
+  - 왕복 합계: `0.19%`
+- 동적 스프레드:
+  - `DYNAMIC_EXIT_SPREAD = 0.19%`
+- 요구 청산 프리미엄:
 
-## 빠른 시작
+```text
+required_exit_pm = max(entry_pm + DYNAMIC_EXIT_SPREAD, EXIT_PREMIUM_THRESHOLD)
+```
+
+- 청산 하한:
+  - `EXIT_PREMIUM_THRESHOLD = 0.25`
+
+7. 장애 대응과 강제 정지
+- 롤백 실패는 치명 장애로 처리
+- 치명 불일치 발생 시:
+  - 거래 루프 정지
+  - 신규 진입 억제
+  - 불일치 스냅샷 저장 후 수동 개입 유도
+
+8. 복구와 저장
+- 시작 시 기존 실포지션을 스캔하고 복구 재개 가능
+- 주요 저장 파일:
+  - `trade_logs/trades.csv`
+  - `trade_logs/entry_splits.csv`
+  - `trade_logs/exit_splits.csv`
+  - `trade_logs/active_position.json`
+  - `kimp_arb_cpp/data/premiums.json`
+
+### 4. 모니터링과 대시보드
+
+- `ArbitrageEngine`는 `200ms` 주기로 프리미엄 JSON을 갱신
+- 전용 WebSocket 브로드캐스트 서버가 `50ms` 주기로 `8765` 포트에서 전송
+- Next.js 대시보드는 아래 순서로 프리미엄 파일을 탐색
+  1. `KIMP_PREMIUMS_PATH` 환경변수
+  2. `../kimp_arb_cpp/build/data/premiums.json`
+  3. `../kimp_arb_cpp/data/premiums.json`
+
+### 5. 동시성 모델
+
+- `PriceCache`를 shard로 분할해 락 경합 완화
+- I/O, 전략, 실행, refresh, broadcast를 분리 운영
+- CSV 기록은 동기화로 행 깨짐을 방지
+- 포지션/시그널 구조는 스레드 안전 접근 기준으로 구성
+
+### 6. 빌드와 실행
 
 ```bash
-# 빌드
-cd kimp_arb_cpp && mkdir build && cd build
-cmake .. && make -j8
+# C++ 빌드
+cd kimp_arb_cpp
+cmake -S . -B build
+cmake --build build -j8
 
-# 설정
-cp config/config.yaml.example config/config.yaml
-# config.yaml에 API 키 입력
+# 봇 실행
+./build/kimp_bot
 
-# 실행
-./kimp_bot
+# 저장소 루트 헬퍼 스크립트
+cd ..
+./run_bot.sh
 ```
 
-## 라이선스
+### 7. 테스트 실행
+
+```bash
+cd kimp_arb_cpp
+cmake --build build -j8
+
+# C++ 전체 테스트
+for t in build/kimp_test_*; do "$t"; done
+
+# 대시보드 프로덕션 빌드
+cd ../dashboard
+npm run build
+```
+
+참고:
+- 실거래 테스트는 유효한 API 키가 필요합니다.
+- 키가 없으면 라이브 실행 테스트는 `SKIP`으로 처리되고 성공 종료됩니다.
+
+## License
 
 MIT License
