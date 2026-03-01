@@ -96,6 +96,14 @@ target_link_libraries(kimp_diag_gap PRIVATE kimp_lib)
 add_executable(kimp_test_entry tests/test_entry_selection.cpp)
 target_link_libraries(kimp_test_entry PRIVATE kimp_lib)
 
+# Regression: entry signal count must not exceed available position slots
+add_executable(kimp_test_entry_capacity tests/test_entry_signal_capacity.cpp)
+target_link_libraries(kimp_test_entry_capacity PRIVATE kimp_lib)
+
+# Stress smoke test for detached async export lifetime behavior
+add_executable(kimp_test_export_async_stability tests/test_export_async_stability.cpp)
+target_link_libraries(kimp_test_export_async_stability PRIVATE kimp_lib)
+
 # Live entry selection test (fetches real-time data from APIs)
 add_executable(kimp_test_live_entry tests/test_live_entry_selection.cpp)
 target_link_libraries(kimp_test_live_entry PRIVATE kimp_lib)

@@ -85,6 +85,79 @@ bool quote_pair_is_usable(Exchange korean_ex,
     return true;
 }
 
+void write_premiums_json_file(
+    const std::string& path,
+    bool connected,
+    const std::vector<kimp::strategy::ArbitrageEngine::PremiumInfo>& premiums) {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::string buffer;
+    buffer.reserve(200 + premiums.size() * 500);
+
+    fmt::format_to(std::back_inserter(buffer),
+        "{{\n"
+        "  \"status\": {{\n"
+        "    \"connected\": {},\n"
+        "    \"upbitConnected\": true,\n"
+        "    \"bybitConnected\": true,\n"
+        "    \"symbolCount\": {},\n"
+        "    \"lastUpdate\": {}\n"
+        "  }},\n"
+        "  \"premiums\": [\n",
+        connected ? "true" : "false",
+        premiums.size(),
+        now_ms);
+
+    for (size_t i = 0; i < premiums.size(); ++i) {
+        const auto& p = premiums[i];
+        const char* signal_str = p.entry_signal ? "\"ENTRY\"" : (p.exit_signal ? "\"EXIT\"" : "null");
+
+        fmt::format_to(std::back_inserter(buffer),
+            "    {{\n"
+            "      \"symbol\": \"{}/{}\",\n"
+            "      \"koreanBid\": {:.2f},\n"
+            "      \"koreanAsk\": {:.2f},\n"
+            "      \"foreignBid\": {:.6f},\n"
+            "      \"foreignAsk\": {:.6f},\n"
+            "      \"koreanPrice\": {:.2f},\n"
+            "      \"foreignPrice\": {:.4f},\n"
+            "      \"usdtRate\": {:.2f},\n"
+            "      \"entryPremium\": {:.4f},\n"
+            "      \"exitPremium\": {:.4f},\n"
+            "      \"premiumSpread\": {:.4f},\n"
+            "      \"premium\": {:.4f},\n"
+            "      \"fundingRate\": {:.6f},\n"
+            "      \"fundingIntervalHours\": {},\n"
+            "      \"nextFundingTime\": {},\n"
+            "      \"signal\": {},\n"
+            "      \"timestamp\": {}\n"
+            "    }}",
+            p.symbol.get_base(), p.symbol.get_quote(),
+            p.korean_bid, p.korean_ask,
+            p.foreign_bid, p.foreign_ask,
+            p.korean_price, p.foreign_price, p.usdt_rate,
+            p.entry_premium, p.exit_premium, p.premium_spread, p.premium,
+            p.funding_rate, p.funding_interval_hours, p.next_funding_time,
+            signal_str, now_ms);
+
+        if (i < premiums.size() - 1) {
+            buffer += ",\n";
+        } else {
+            buffer += "\n";
+        }
+    }
+
+    buffer += "  ]\n}\n";
+
+    std::ofstream file(path, std::ios::out | std::ios::trunc);
+    if (!file.is_open()) {
+        Logger::error("Failed to open file for export: {}", path);
+        return;
+    }
+    file.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+}
+
 } // namespace
 
 // PriceCache is now fully inline in header (using std::unordered_map with string keys)
@@ -493,7 +566,17 @@ void ArbitrageEngine::fire_entry_from_cache() {
         const bool partial = actual_usd < pos.position_size_usd * 0.95;
         position_state[idx] = partial ? 2 : 1;
     }
-    const bool can_open_new = static_cast<int>(active_positions.size()) < TradingConfig::MAX_POSITIONS;
+    int pending_new_signals = 0;
+    for (size_t i = 0; i < symbol_count; ++i) {
+        if (position_state[i] != 0) continue;
+        if (entry_cache_[i].signal_fired.load(std::memory_order_acquire)) {
+            ++pending_new_signals;
+        }
+    }
+
+    const int used_slots = static_cast<int>(active_positions.size()) + pending_new_signals;
+    const bool can_open_new = used_slots < TradingConfig::MAX_POSITIONS;
+    int free_slots = std::max(0, TradingConfig::MAX_POSITIONS - used_slots);
 
     const auto& [korean_ex, foreign_ex] = exchange_pairs_[0];
 
@@ -557,7 +640,7 @@ void ArbitrageEngine::fire_entry_from_cache() {
             const bool partial = position_state[i] == 2;
 
             if (has_pos && !partial) continue;  // Fully entered, skip
-            if (!has_pos && !can_open_new) continue;  // No room for new
+            if (!has_pos && free_slots <= 0) continue;  // No room for new
 
             // Skip signal_fired dedup for partial top-ups
             if (!partial) {
@@ -566,6 +649,9 @@ void ArbitrageEngine::fire_entry_from_cache() {
             }
 
             emit_signal(i);
+            if (!has_pos && free_slots > 0) {
+                --free_slots;
+            }
         }
     }
 }
@@ -786,83 +872,17 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
 
 void ArbitrageEngine::export_to_json(const std::string& path) const {
     auto premiums = get_all_premiums();
-    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
-    // Pre-allocate buffer (estimated ~500 bytes per symbol + 200 header)
-    std::string buffer;
-    buffer.reserve(200 + premiums.size() * 500);
-
-    // Build JSON in memory first (faster than multiple file writes)
-    fmt::format_to(std::back_inserter(buffer),
-        "{{\n"
-        "  \"status\": {{\n"
-        "    \"connected\": {},\n"
-        "    \"upbitConnected\": true,\n"
-        "    \"bybitConnected\": true,\n"
-        "    \"symbolCount\": {},\n"
-        "    \"lastUpdate\": {}\n"
-        "  }},\n"
-        "  \"premiums\": [\n",
-        running_.load() ? "true" : "false",
-        premiums.size(),
-        now_ms);
-
-    for (size_t i = 0; i < premiums.size(); ++i) {
-        const auto& p = premiums[i];
-        const char* signal_str = p.entry_signal ? "\"ENTRY\"" : (p.exit_signal ? "\"EXIT\"" : "null");
-
-        fmt::format_to(std::back_inserter(buffer),
-            "    {{\n"
-            "      \"symbol\": \"{}/{}\",\n"
-            "      \"koreanBid\": {:.2f},\n"
-            "      \"koreanAsk\": {:.2f},\n"
-            "      \"foreignBid\": {:.6f},\n"
-            "      \"foreignAsk\": {:.6f},\n"
-            "      \"koreanPrice\": {:.2f},\n"
-            "      \"foreignPrice\": {:.4f},\n"
-            "      \"usdtRate\": {:.2f},\n"
-            "      \"entryPremium\": {:.4f},\n"
-            "      \"exitPremium\": {:.4f},\n"
-            "      \"premiumSpread\": {:.4f},\n"
-            "      \"premium\": {:.4f},\n"
-            "      \"fundingRate\": {:.6f},\n"
-            "      \"fundingIntervalHours\": {},\n"
-            "      \"nextFundingTime\": {},\n"
-            "      \"signal\": {},\n"
-            "      \"timestamp\": {}\n"
-            "    }}",
-            p.symbol.get_base(), p.symbol.get_quote(),
-            p.korean_bid, p.korean_ask,
-            p.foreign_bid, p.foreign_ask,
-            p.korean_price, p.foreign_price, p.usdt_rate,
-            p.entry_premium, p.exit_premium, p.premium_spread, p.premium,
-            p.funding_rate, p.funding_interval_hours, p.next_funding_time,
-            signal_str, now_ms);
-
-        if (i < premiums.size() - 1) {
-            buffer += ",\n";
-        } else {
-            buffer += "\n";
-        }
-    }
-
-    buffer += "  ]\n}\n";
-
-    // Single write to file
-    std::ofstream file(path, std::ios::out | std::ios::trunc);
-    if (!file.is_open()) {
-        Logger::error("Failed to open file for export: {}", path);
-        return;
-    }
-    file.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    write_premiums_json_file(path, running_.load(), premiums);
 }
 
 // Async JSON Export Implementation
 void ArbitrageEngine::export_to_json_async(const std::string& path) {
-    // Fire and forget - export runs in background
-    std::thread([this, path]() {
-        export_to_json(path);
+    // Snapshot data before launching detached writer to avoid touching `this`
+    // after ArbitrageEngine lifetime ends.
+    auto premiums = get_all_premiums();
+    const bool connected = running_.load();
+    std::thread([path, connected, premiums = std::move(premiums)]() mutable {
+        write_premiums_json_file(path, connected, premiums);
     }).detach();
 }
 
