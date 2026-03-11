@@ -2,6 +2,7 @@
 
 #include "kimp/core/types.hpp"
 #include "kimp/exchange/exchange_base.hpp"
+#include "kimp/memory/atomic_bitset.hpp"
 #include "kimp/memory/ring_buffer.hpp"
 
 #include <array>
@@ -319,6 +320,19 @@ public:
         }
         return result;
     }
+
+    template <typename Fn>
+    void for_each_active_position(Fn&& fn) const {
+        for (const auto& slot : positions_) {
+            if (!slot.active.load(std::memory_order_acquire)) {
+                continue;
+            }
+            std::lock_guard lock(slot.mutex);
+            if (slot.active.load(std::memory_order_relaxed)) {
+                fn(slot.position);
+            }
+        }
+    }
 };
 
 /**
@@ -593,6 +607,8 @@ private:
         std::atomic<bool> signal_fired{false};      // Dedup: reset when disqualified
     };
     std::array<CachedEntryPremium, MAX_CACHED_SYMBOLS> entry_cache_{};
+    memory::AtomicBitset<MAX_CACHED_SYMBOLS> entry_candidate_bits_;
+    memory::AtomicBitset<MAX_CACHED_SYMBOLS> entry_signal_fired_bits_;
 
     // Signal queues (lock-free, multi-producer safe)
     memory::MPMCRingBuffer<ArbitrageSignal, 256> entry_signals_;
@@ -634,6 +650,7 @@ private:
     void update_all_entries();                      // O(N) on USDT change (infrequent)
     void fire_entry_from_cache();                   // O(N) lightweight scan, fires signals
     void check_symbol_exit(size_t idx);             // O(1) per-symbol exit check
+    void sync_entry_state_bits(size_t idx, bool qualifies, bool signal_fired);
 
     static bool is_korean_exchange(Exchange ex) {
         return ex == Exchange::Upbit || ex == Exchange::Bithumb;

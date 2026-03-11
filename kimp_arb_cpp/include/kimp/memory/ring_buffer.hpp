@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <new>
 #include <type_traits>
+#include <utility>
 
 namespace kimp::memory {
 
@@ -248,6 +249,32 @@ public:
         }
 
         cell->data = item;
+        cell->sequence.store(pos + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool try_push(T&& item) noexcept {
+        Cell* cell;
+        std::size_t pos = enqueue_pos_.load(std::memory_order_relaxed);
+
+        for (;;) {
+            cell = &buffer_[pos & MASK];
+            std::size_t seq = cell->sequence.load(std::memory_order_acquire);
+            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+
+            if (diff == 0) {
+                if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed)) {
+                    break;
+                }
+            } else if (diff < 0) {
+                return false;  // Buffer full
+            } else {
+                pos = enqueue_pos_.load(std::memory_order_relaxed);
+            }
+        }
+
+        cell->data = std::move(item);
         cell->sequence.store(pos + 1, std::memory_order_release);
         return true;
     }
