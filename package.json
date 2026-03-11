@@ -1,0 +1,9 @@
+{
+  "name": "kimchi-premium-arbitrage-engine",
+  "private": true,
+  "scripts": {
+    "relay:monitor": "node ./scripts/spot-relay-live.mjs --json-out ./data/spot-relay-live.json",
+    "relay:dashboard": "npm --prefix ./dashboard run dev",
+    "relay:web": "./scripts/run-spot-relay-web.sh"
+  }
+}

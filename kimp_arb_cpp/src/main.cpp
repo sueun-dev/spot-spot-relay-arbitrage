@@ -6,6 +6,7 @@
 #include "kimp/exchange/bithumb/bithumb.hpp"
 #include "kimp/exchange/bybit/bybit.hpp"
 #include "kimp/strategy/arbitrage_engine.hpp"
+#include "kimp/strategy/spot_relay_scanner.hpp"
 #include "kimp/execution/order_manager.hpp"
 #include "kimp/network/ws_broadcast_server.hpp"
 
@@ -344,6 +345,15 @@ std::string expand_env(const std::string& val) {
     return val;
 }
 
+std::string expand_env_if_present(const std::string& val) {
+    if (val.size() > 3 && val[0] == '$' && val[1] == '{' && val.back() == '}') {
+        std::string env_name = val.substr(2, val.size() - 3);
+        const char* env_val = std::getenv(env_name.c_str());
+        return env_val ? std::string(env_val) : std::string();
+    }
+    return val;
+}
+
 // NOTE: Trading parameters (thresholds, position sizes, fees) are compile-time
 // constants in TradingConfig (types.hpp). YAML only controls credentials,
 // logging, and threading. Rebuild to change trading parameters.
@@ -397,11 +407,11 @@ std::optional<kimp::RuntimeConfig> load_config(const std::string& path,
             if (e["rest_endpoint"]) creds.rest_endpoint = e["rest_endpoint"].as<std::string>();
             if (e["api_key"]) {
                 std::string raw = e["api_key"].as<std::string>();
-                creds.api_key = require_private_keys ? expand_env(raw) : raw;
+                creds.api_key = require_private_keys ? expand_env(raw) : expand_env_if_present(raw);
             }
             if (e["secret_key"]) {
                 std::string raw = e["secret_key"].as<std::string>();
-                creds.secret_key = require_private_keys ? expand_env(raw) : raw;
+                creds.secret_key = require_private_keys ? expand_env(raw) : expand_env_if_present(raw);
             }
 
             if (require_private_keys &&
@@ -431,6 +441,7 @@ int main(int argc, char* argv[]) {
     std::string config_path = "config/config.yaml";
     bool monitor_mode = true;
     bool monitor_only = false;
+    bool scan_spot_relay = false;
     int monitor_interval_sec = 2;
 
     for (int i = 1; i < argc; ++i) {
@@ -448,6 +459,10 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--monitor-only") {
             monitor_only = true;
             monitor_mode = true;
+        } else if (arg == "--scan-spot-relay") {
+            scan_spot_relay = true;
+            monitor_only = true;
+            monitor_mode = false;
         } else if (arg == "--monitor-interval-sec") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --monitor-interval-sec requires a numeric argument\n";
@@ -466,6 +481,7 @@ int main(int argc, char* argv[]) {
                       << "  -m, --monitor        Enable full console monitor (default: ON)\n"
                       << "      --no-monitor     Disable console monitor\n"
                       << "      --monitor-only   Monitor only (no position prompts, no auto-trading)\n"
+                      << "      --scan-spot-relay  Scan Bithumb↔Bybit spot-transfer candidates\n"
                       << "      --monitor-interval-sec <n>  Monitor refresh interval (default: 2)\n"
                       << "  -h, --help           Show this help\n";
             return 0;
@@ -478,7 +494,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    auto config_opt = load_config(config_path, !monitor_only);
+    auto config_opt = load_config(config_path, !(monitor_only || scan_spot_relay));
     if (!config_opt) {
         return 1;
     }
@@ -506,6 +522,18 @@ int main(int argc, char* argv[]) {
     spdlog::info("=== KIMP Arbitrage Bot Starting ===");
     spdlog::info("Premium calculation: {} (4-8x faster batch processing)",
                  kimp::SIMDPremiumCalculator::get_simd_type());
+
+    if (scan_spot_relay) {
+        kimp::strategy::SpotRelayScanner scanner;
+        kimp::strategy::SpotRelayScanner::Options options;
+        if (!scanner.run(config, options, std::cout)) {
+            spdlog::error("Spot relay scan failed");
+            kimp::Logger::shutdown();
+            return 1;
+        }
+        kimp::Logger::shutdown();
+        return 0;
+    }
 
     net::io_context io_context;
     auto work_guard = net::make_work_guard(io_context);

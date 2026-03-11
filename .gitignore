@@ -20,6 +20,7 @@ test_entry
 kimp_arb_cpp/logs/
 kimp_arb_cpp/data/
 kimp_arb_cpp/trade_logs/
+data/
 *.log
 
 # IDE
@@ -43,3 +44,4 @@ dashboard/out/
 *.tmp
 *.temp
 /tmp/
+.codex/
