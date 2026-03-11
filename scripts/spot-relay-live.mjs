@@ -2,12 +2,17 @@
 import crypto from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import {
+  buildFeeModelLabel,
+  normalizeFeeEvents,
+} from './lib/spot-relay-math.mjs';
+import { buildRelaySnapshot } from './lib/spot-relay-snapshot.mjs';
 
-const BITHUMB_WS_URL = 'wss://pubwss.bithumb.com/pub/ws';
-const BYBIT_SPOT_WS_URL = 'wss://stream.bybit.com/v5/public/spot';
-const BITHUMB_ORDERBOOK_URL = 'https://api.bithumb.com/public/orderbook/ALL_KRW?count=5';
-const BYBIT_INSTRUMENTS_URL = 'https://api.bybit.com/v5/market/instruments-info?category=spot&limit=1000';
-const BYBIT_FEE_RATE_URL = 'https://api.bybit.com/v5/account/fee-rate';
+const DEFAULT_BITHUMB_WS_URL = 'wss://pubwss.bithumb.com/pub/ws';
+const DEFAULT_BYBIT_SPOT_WS_URL = 'wss://stream.bybit.com/v5/public/spot';
+const DEFAULT_BITHUMB_ORDERBOOK_URL = 'https://api.bithumb.com/public/orderbook/ALL_KRW?count=5';
+const DEFAULT_BYBIT_INSTRUMENTS_URL = 'https://api.bybit.com/v5/market/instruments-info?category=spot&limit=1000';
+const DEFAULT_BYBIT_FEE_RATE_URL = 'https://api.bybit.com/v5/account/fee-rate';
 const BITHUMB_TAKER_FEE_RATE = 0.0004;
 const BYBIT_DEFAULT_SPOT_TAKER_FEE_RATE = 0.001;
 const BYBIT_FEE_RATE_DELAY_MS = 220;
@@ -25,6 +30,15 @@ const positiveOnly = !args.includeNegative;
 const bithumbFeeRate = args.bithumbFeeRate ?? BITHUMB_TAKER_FEE_RATE;
 const bybitFeeOverride = args.bybitFeeRate ?? null;
 const targetUsdt = args.targetUsdt ?? 70;
+const feeEvents = normalizeFeeEvents({
+  bithumb: args.bithumbFeeEvents,
+  bybit: args.bybitFeeEvents,
+});
+const bithumbWsUrl = args.bithumbWsUrl ?? DEFAULT_BITHUMB_WS_URL;
+const bybitWsUrl = args.bybitWsUrl ?? DEFAULT_BYBIT_SPOT_WS_URL;
+const bithumbOrderbookUrl = args.bithumbOrderbookUrl ?? DEFAULT_BITHUMB_ORDERBOOK_URL;
+const bybitInstrumentsUrl = args.bybitInstrumentsUrl ?? DEFAULT_BYBIT_INSTRUMENTS_URL;
+const bybitFeeRateUrl = args.bybitFeeRateUrl ?? DEFAULT_BYBIT_FEE_RATE_URL;
 const jsonOutPath = args.jsonOut
   ? path.resolve(args.jsonOut)
   : path.resolve(process.cwd(), 'data', 'spot-relay-live.json');
@@ -55,7 +69,7 @@ main().catch((error) => {
 });
 
 async function main() {
-  const snapshot = await fetchJson(BITHUMB_ORDERBOOK_URL);
+  const snapshot = await fetchJson(bithumbOrderbookUrl);
   if (snapshot.status !== '0000') {
     throw new Error('Bithumb orderbook snapshot failed');
   }
@@ -119,10 +133,24 @@ function parseArgs(argv) {
       parsed.bithumbFeeRate = Number(argv[++i]);
     } else if (arg === '--bybit-fee-rate' && argv[i + 1]) {
       parsed.bybitFeeRate = Number(argv[++i]);
+    } else if (arg === '--bithumb-fee-events' && argv[i + 1]) {
+      parsed.bithumbFeeEvents = Number(argv[++i]);
+    } else if (arg === '--bybit-fee-events' && argv[i + 1]) {
+      parsed.bybitFeeEvents = Number(argv[++i]);
     } else if (arg === '--target-usdt' && argv[i + 1]) {
       parsed.targetUsdt = Number(argv[++i]);
     } else if (arg === '--json-out' && argv[i + 1]) {
       parsed.jsonOut = argv[++i];
+    } else if (arg === '--bithumb-ws-url' && argv[i + 1]) {
+      parsed.bithumbWsUrl = argv[++i];
+    } else if (arg === '--bybit-ws-url' && argv[i + 1]) {
+      parsed.bybitWsUrl = argv[++i];
+    } else if (arg === '--bithumb-orderbook-url' && argv[i + 1]) {
+      parsed.bithumbOrderbookUrl = argv[++i];
+    } else if (arg === '--bybit-instruments-url' && argv[i + 1]) {
+      parsed.bybitInstrumentsUrl = argv[++i];
+    } else if (arg === '--bybit-fee-rate-url' && argv[i + 1]) {
+      parsed.bybitFeeRateUrl = argv[++i];
     } else if (arg === '--include-negative') {
       parsed.includeNegative = true;
     }
@@ -145,7 +173,7 @@ async function fetchBybitMarginEnabledBases() {
   let cursor = '';
 
   while (true) {
-    const url = new URL(BYBIT_INSTRUMENTS_URL);
+    const url = new URL(bybitInstrumentsUrl);
     if (cursor) {
       url.searchParams.set('cursor', cursor);
     }
@@ -213,7 +241,7 @@ async function fetchBybitSpotTakerFeeRate(symbol, apiKey, apiSecret) {
     .update(signaturePayload)
     .digest('hex');
 
-  const response = await fetch(`${BYBIT_FEE_RATE_URL}?${queryString}`, {
+  const response = await fetch(`${bybitFeeRateUrl}?${queryString}`, {
     headers: {
       'user-agent': 'kimchi-premium-arb/spot-relay-live',
       'X-BAPI-API-KEY': apiKey,
@@ -246,6 +274,10 @@ function getBybitFeeSummary() {
     return `Bybit taker=per-symbol API (${bybitFeeState.exactSymbols}/${bybitFeeState.totalSymbols} exact, fallback ${pct}%)`;
   }
   return `Bybit taker=${pct}% (${bybitFeeState.source})`;
+}
+
+function getFeeModelSummary() {
+  return `${buildFeeModelLabel(feeEvents)} 기준`;
 }
 
 function sleep(ms) {
@@ -288,7 +320,7 @@ function seedBithumbBooks(data) {
 }
 
 function connectBithumb() {
-  bithumbWs = new WebSocket(BITHUMB_WS_URL);
+  bithumbWs = new WebSocket(bithumbWsUrl);
 
   bithumbWs.addEventListener('open', () => {
     const symbols = [...candidateBases, 'USDT'].map((base) => `${base}_KRW`);
@@ -364,7 +396,7 @@ function connectBithumb() {
 }
 
 function connectBybit() {
-  bybitWs = new WebSocket(BYBIT_SPOT_WS_URL);
+  bybitWs = new WebSocket(bybitWsUrl);
 
   bybitWs.addEventListener('open', () => {
     const batchSize = 10;
@@ -455,85 +487,27 @@ function recomputeBestAsk(book) {
 
 function render() {
   const now = Date.now();
-  const usdt = bithumbBooks.get('USDT');
-  const usdtBid = usdt?.bestBid || 0;
-
-  let bithumbSeen = 0;
-  let bybitSeen = 0;
-  let bothSeen = 0;
-  const freshRows = [];
-  for (const base of candidateBases) {
-    const kr = bithumbBooks.get(base);
-    const by = bybitBooks.get(base);
-    const krSeen = !!kr && kr.bestAsk > 0;
-    const bySeen = !!by && by.bid > 0;
-
-    if (krSeen) bithumbSeen += 1;
-    if (bySeen) bybitSeen += 1;
-    if (krSeen && bySeen) bothSeen += 1;
-
-    if (!krSeen || !bySeen || usdtBid <= 0) continue;
-    if (now - kr.ts > staleMs || now - by.ts > staleMs || now - (usdt?.ts || 0) > staleMs) continue;
-
-    const matchQty = Math.min(kr.bestAskQty, by.bidQty);
-    if (matchQty <= 0) continue;
-
-    const bithumbTopKrw = kr.bestAsk * kr.bestAskQty;
-    const bithumbTopUsdt = usdtBid > 0 ? bithumbTopKrw / usdtBid : 0;
-    const bybitTopUsdt = by.bid * by.bidQty;
-    const bybitTopKrw = by.bid * usdtBid * by.bidQty;
-    const matchBuyKrw = kr.bestAsk * matchQty;
-    const matchSellKrw = by.bid * usdtBid * matchQty;
-    const matchSellUsdt = by.bid * matchQty;
-    const maxTradableUsdtAtBest = by.bid * matchQty;
-    const targetCoinQty = by.bid > 0 ? targetUsdt / by.bid : 0;
-    const bithumbCanFillTarget = kr.bestAskQty >= targetCoinQty;
-    const bybitCanFillTarget = by.bidQty >= targetCoinQty;
-    const bothCanFillTarget = bithumbCanFillTarget && bybitCanFillTarget;
-    const bybitTakerFeeRate = getBybitTakerFeeRate(base);
-    const bithumbTradeFeeKrw = matchBuyKrw * bithumbFeeRate;
-    const bybitTradeFeeUsdt = matchSellUsdt * bybitTakerFeeRate;
-    const bybitTradeFeeKrw = matchSellKrw * bybitTakerFeeRate;
-    const grossEdgePct = ((matchSellKrw - matchBuyKrw) / matchBuyKrw) * 100;
-    const netProfitKrw =
-      (matchSellKrw - bybitTradeFeeKrw) -
-      (matchBuyKrw + bithumbTradeFeeKrw);
-    const netCostKrw = matchBuyKrw + bithumbTradeFeeKrw;
-    const netEdgePct = netCostKrw > 0 ? (netProfitKrw / netCostKrw) * 100 : 0;
-    freshRows.push({
-      base,
-      bithumbAsk: kr.bestAsk,
-      bithumbAskQty: kr.bestAskQty,
-      bithumbTopKrw,
-      bithumbTopUsdt,
-      bybitBid: by.bid,
-      bybitBidQty: by.bidQty,
-      bybitTopUsdt,
-      bybitTopKrw,
-      matchQty,
-      maxTradableUsdtAtBest,
-      targetCoinQty,
-      bithumbCanFillTarget,
-      bybitCanFillTarget,
-      bothCanFillTarget,
-      bithumbTradeFeeKrw,
-      bybitTradeFeeUsdt,
-      bybitTradeFeeKrw,
-      bybitTakerFeeRate,
-      usdtBid,
-      grossEdgePct,
-      netEdgePct,
-      netProfitKrw,
-      ageMs: Math.max(now - kr.ts, now - by.ts),
-    });
-  }
-
-  freshRows.sort((a, b) => b.netEdgePct - a.netEdgePct);
-  const shownRows = positiveOnly
-    ? freshRows.filter((row) => row.netEdgePct > 0)
-    : freshRows;
+  const {
+    usdtBid,
+    bithumbSeen,
+    bybitSeen,
+    bothSeen,
+    freshRows,
+    shownRows,
+    filteredNegative,
+  } = buildRelaySnapshot({
+    candidateBases,
+    bithumbBooks,
+    bybitBooks,
+    now,
+    staleMs,
+    targetUsdt,
+    bithumbFeeRate,
+    feeEvents,
+    getBybitTakerFeeRate,
+    positiveOnly,
+  });
   const visibleRows = displayTop ? shownRows.slice(0, displayTop) : shownRows;
-  const filteredNegative = freshRows.length - shownRows.length;
   persistSnapshot({
     ts: now,
     summary: {
@@ -548,8 +522,11 @@ function render() {
       positiveOnly,
       targetUsdt,
       usdtBid,
-      exchangeRateLabel: '원화/달러',
+      exchangeRateLabel: '원화/USDT',
       bithumbFeeRate,
+      bithumbFeeEvents: feeEvents.bithumb,
+      bybitFeeEvents: feeEvents.bybit,
+      feeModelLabel: getFeeModelSummary(),
       bybitFeeSummary: getBybitFeeSummary(),
     },
     rows: freshRows,
@@ -562,17 +539,18 @@ function render() {
   }
   console.log(
     `=== Spot Relay Live | ${new Date().toLocaleTimeString('ko-KR')} | ` +
-    `tracked=${candidateBases.length} | bithumbSeen=${bithumbSeen} | bybitSeen=${bybitSeen} | bothSeen=${bothSeen} | fresh=${freshRows.length} | ${positiveOnly ? 'positiveShown' : 'shown'}=${shownRows.length} | 환율=${fmtFloat(usdtBid, priceDigits)} 원화/달러 ===`
+    `tracked=${candidateBases.length} | bithumbSeen=${bithumbSeen} | bybitSeen=${bybitSeen} | bothSeen=${bothSeen} | fresh=${freshRows.length} | ${positiveOnly ? 'positiveShown' : 'shown'}=${shownRows.length} | 환율=${fmtFloat(usdtBid, priceDigits)} 원화/USDT ===`
   );
   console.log(
-    `Fees: Bithumb taker=${(bithumbFeeRate * 100).toFixed(4)}% | ${getBybitFeeSummary()}`
+    `Fees: Bithumb taker=${(bithumbFeeRate * 100).toFixed(4)}% x ${feeEvents.bithumb}회 | ${getBybitFeeSummary()} x ${feeEvents.bybit}회`
   );
+  console.log(`Fee model: ${getFeeModelSummary()} 반영`);
   console.log(
     positiveOnly
       ? 'Logic: Bithumb best ask buy vs Bybit spot best bid sell, positive net edges only by default'
       : 'Logic: Bithumb best ask buy vs Bybit spot best bid sell, showing both positive and negative net edges'
   );
-  console.log(`Target: ${fmtFloat(targetUsdt, 2)} 달러 기준 1틱 체결 가능 여부 포함`);
+  console.log(`Target: ${fmtFloat(targetUsdt, 2)} USDT 기준 1틱 체결 가능 여부 포함`);
   if (positiveOnly) {
     console.log(`Filter: positive net only, negative/zero filtered=${filteredNegative}`);
   }
@@ -581,20 +559,21 @@ function render() {
     { title: '빗썸 매수가(원화)', minWidth: 16, value: (row) => fmtFloat(row.bithumbAsk, priceDigits) },
     { title: '빗썸 수량(코인)', minWidth: 16, value: (row) => fmtFloat(row.bithumbAskQty, qtyDigits) },
     { title: '빗썸 총액(원화)', minWidth: 16, value: (row) => fmtFloat(row.bithumbTopKrw, 0) },
-    { title: '빗썸 총액(달러)', minWidth: 16, value: (row) => fmtFloat(row.bithumbTopUsdt, 4) },
-    { title: '바이비트 매도가(달러)', minWidth: 18, value: (row) => fmtFloat(row.bybitBid, priceDigits) },
+    { title: '빗썸 총액(USDT)', minWidth: 16, value: (row) => fmtFloat(row.bithumbTopUsdt, 4) },
+    { title: '바이비트 매도가(USDT)', minWidth: 18, value: (row) => fmtFloat(row.bybitBid, priceDigits) },
     { title: '바이비트 수량(코인)', minWidth: 18, value: (row) => fmtFloat(row.bybitBidQty, qtyDigits) },
-    { title: '바이비트 총액(달러)', minWidth: 18, value: (row) => fmtFloat(row.bybitTopUsdt, 4) },
+    { title: '바이비트 총액(USDT)', minWidth: 18, value: (row) => fmtFloat(row.bybitTopUsdt, 4) },
     { title: '바이비트 총액(원화)', minWidth: 18, value: (row) => fmtFloat(row.bybitTopKrw, 0) },
     { title: '체결수량(코인)', minWidth: 14, value: (row) => fmtFloat(row.matchQty, qtyDigits) },
-    { title: '1틱 최대진입(달러)', minWidth: 18, value: (row) => fmtFloat(row.maxTradableUsdtAtBest, 4) },
-    { title: `${fmtFloat(targetUsdt, 2)}달러 필요수량`, minWidth: 18, value: (row) => fmtFloat(row.targetCoinQty, 8) },
+    { title: '1틱 최대진입(USDT)', minWidth: 18, value: (row) => fmtFloat(row.maxTradableUsdtAtBest, 4) },
+    { title: `${fmtFloat(targetUsdt, 2)}USDT 필요수량`, minWidth: 18, value: (row) => fmtFloat(row.targetCoinQty, 8) },
     { title: '양쪽1틱가능', minWidth: 12, value: (row) => row.bothCanFillTarget ? '가능' : '불가' },
     { title: '총차익(%)', minWidth: 12, value: (row) => `${row.grossEdgePct.toFixed(edgeDigits)}%` },
     { title: '순차익(%)', minWidth: 12, value: (row) => `${row.netEdgePct.toFixed(edgeDigits)}%` },
-    { title: '빗썸 수수료(원화)', minWidth: 16, value: (row) => fmtFloat(row.bithumbTradeFeeKrw, 2) },
-    { title: '바이비트 수수료(달러)', minWidth: 18, value: (row) => fmtFloat(row.bybitTradeFeeUsdt, 6) },
-    { title: '바이비트 수수료(원화)', minWidth: 18, value: (row) => fmtFloat(row.bybitTradeFeeKrw, 2) },
+    { title: '빗썸 총수수료(원화)', minWidth: 18, value: (row) => fmtFloat(row.bithumbTotalFeeKrw, 2) },
+    { title: '바이비트 총수수료(USDT)', minWidth: 20, value: (row) => fmtFloat(row.bybitTotalFeeUsdt, 6) },
+    { title: '바이비트 총수수료(원화)', minWidth: 20, value: (row) => fmtFloat(row.bybitTotalFeeKrw, 2) },
+    { title: '총수수료(원화)', minWidth: 16, value: (row) => fmtFloat(row.totalFeeKrw, 2) },
     { title: '순손익(원화)', minWidth: 14, value: (row) => fmtFloat(row.netProfitKrw, 2) },
     { title: '지연(ms)', minWidth: 8, value: (row) => String(row.ageMs) },
   ]);
