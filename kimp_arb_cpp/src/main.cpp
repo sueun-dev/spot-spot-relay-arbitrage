@@ -7,6 +7,7 @@
 #include "kimp/exchange/bybit/bybit.hpp"
 #include "kimp/strategy/arbitrage_engine.hpp"
 #include "kimp/strategy/spot_relay_scanner.hpp"
+#include "kimp/execution/lifecycle_executor.hpp"
 #include "kimp/execution/order_manager.hpp"
 #include "kimp/network/ws_broadcast_server.hpp"
 
@@ -18,6 +19,7 @@
 #include <csignal>
 #include <atomic>
 #include <thread>
+#include <algorithm>
 #include <filesystem>
 #include <unordered_set>
 #include <future>
@@ -28,6 +30,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cmath>
+#include <optional>
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -54,13 +57,25 @@ bool read_stdin_line(std::string& line) {
     return false;
 }
 std::atomic<int> g_active_loops{0};
-std::mutex g_lifecycle_threads_mutex;
-std::vector<std::thread> g_lifecycle_threads;
 
 struct LoopGuard {
     std::atomic<int>& counter;
-    explicit LoopGuard(std::atomic<int>& c) : counter(c) {}
-    ~LoopGuard() { counter.fetch_sub(1, std::memory_order_acq_rel); }
+    kimp::strategy::ArbitrageEngine* engine{nullptr};
+
+    explicit LoopGuard(std::atomic<int>& c, kimp::strategy::ArbitrageEngine* e)
+        : counter(c), engine(e) {}
+
+    ~LoopGuard() {
+        const int remaining = counter.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (engine && remaining < kimp::TradingConfig::MAX_POSITIONS) {
+            engine->set_entry_suppressed(false);
+        }
+    }
+};
+
+struct LifecycleTask {
+    kimp::ArbitrageSignal signal;
+    std::optional<kimp::Position> initial_position;
 };
 
 struct LiveMonitorGuard {
@@ -574,6 +589,46 @@ int main(int argc, char* argv[]) {
         }
     });
 
+    kimp::execution::LifecycleExecutor<LifecycleTask> lifecycle_executor(
+        [&](LifecycleTask&& task, std::size_t worker_index) {
+            LoopGuard guard(g_active_loops, &engine);
+
+            const auto pickup_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - task.signal.timestamp).count();
+            spdlog::debug("[LIFECYCLE] {} picked up by worker {} in {}us",
+                          task.signal.symbol.to_string(), worker_index, pickup_us);
+
+            auto result = order_manager.execute_entry_futures_first(
+                task.signal, task.initial_position);
+
+            spdlog::debug("[LIFECYCLE] {} worker {} finished",
+                          task.signal.symbol.to_string(), worker_index);
+            if (!result.error_message.empty()) {
+                spdlog::error("Lifecycle loop error: {}", result.error_message);
+            }
+        });
+
+    auto try_claim_lifecycle_slot = [&engine]() -> bool {
+        int current = g_active_loops.load(std::memory_order_acquire);
+        while (current < kimp::TradingConfig::MAX_POSITIONS) {
+            if (g_active_loops.compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel)) {
+                if (current + 1 >= kimp::TradingConfig::MAX_POSITIONS) {
+                    engine.set_entry_suppressed(true);
+                }
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto release_claimed_lifecycle_slot = [&engine]() {
+        const int remaining = g_active_loops.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (remaining < kimp::TradingConfig::MAX_POSITIONS) {
+            engine.set_entry_suppressed(false);
+        }
+    };
+
     // Auto-trading callbacks (disabled in monitor-only mode)
     // IMPORTANT: For perfect hedge, execute futures FIRST to get exact contract size
     //
@@ -598,51 +653,26 @@ int main(int argc, char* argv[]) {
             });
 
         engine.set_entry_callback([&](const kimp::ArbitrageSignal& signal) {
-        // Skip if this symbol already has a position (loop is managing it)
-        auto existing = engine.get_position(signal.symbol);
-        if (existing) {
-            return;
-        }
-
-        // Atomically claim a lifecycle slot
-        int current = g_active_loops.load(std::memory_order_acquire);
-        while (current < kimp::TradingConfig::MAX_POSITIONS) {
-            if (g_active_loops.compare_exchange_weak(current, current + 1,
-                                                      std::memory_order_acq_rel)) {
-                break;
+            auto existing = engine.get_position(signal.symbol);
+            if (existing) {
+                return;
             }
-        }
-        if (current >= kimp::TradingConfig::MAX_POSITIONS) {
-            return;
-        }
 
-        // Suppress entry scanning if all slots now filled
-        if (g_active_loops.load(std::memory_order_acquire) >= kimp::TradingConfig::MAX_POSITIONS) {
-            engine.set_entry_suppressed(true);
-        }
+            if (!try_claim_lifecycle_slot()) {
+                return;
+            }
 
-        spdlog::info("[LIFECYCLE] Starting permanent loop for {} (slot {}/{})",
-                     signal.symbol.to_string(), g_active_loops.load(), kimp::TradingConfig::MAX_POSITIONS);
+            if (!lifecycle_executor.enqueue(LifecycleTask{signal, std::nullopt})) {
+                release_claimed_lifecycle_slot();
+                spdlog::error("[LIFECYCLE] enqueue failed for {}", signal.symbol.to_string());
+                return;
+            }
 
-        // Spawn lifecycle thread (non-blocking — returns immediately)
-        {
-            std::lock_guard<std::mutex> lock(g_lifecycle_threads_mutex);
-            g_lifecycle_threads.emplace_back([&engine, &order_manager, signal]() {
-                LoopGuard guard(g_active_loops);
-
-                auto result = order_manager.execute_entry_futures_first(signal);
-
-                // Re-enable entry scanning if slots freed up
-                if (g_active_loops.load(std::memory_order_acquire) < kimp::TradingConfig::MAX_POSITIONS) {
-                    engine.set_entry_suppressed(false);
-                }
-
-                spdlog::info("[LIFECYCLE] {} loop ended (shutdown)", signal.symbol.to_string());
-                if (!result.error_message.empty()) {
-                    spdlog::error("Lifecycle loop error: {}", result.error_message);
-                }
-            });
-        }
+            spdlog::debug("[LIFECYCLE] queued {} (slot {}/{}, pending={})",
+                          signal.symbol.to_string(),
+                          g_active_loops.load(std::memory_order_acquire),
+                          kimp::TradingConfig::MAX_POSITIONS,
+                          lifecycle_executor.pending());
         });
 
         // Exit callback not needed — lifecycle loop handles exits internally
@@ -1260,6 +1290,31 @@ int main(int argc, char* argv[]) {
     }
 
     if (!g_shutdown) {
+        if (!monitor_only) {
+            kimp::execution::LifecycleExecutorOptions executor_options;
+            executor_options.worker_count =
+                static_cast<std::size_t>(std::max(1, kimp::TradingConfig::MAX_POSITIONS));
+            executor_options.push_spin_count = 512;
+            executor_options.empty_spin_count = 4096;
+            executor_options.idle_wait = std::chrono::microseconds(150);
+
+            lifecycle_executor.start(executor_options, [thread_config](std::size_t worker_index) {
+                int core_id = thread_config.execution_core;
+                const int total_cores = static_cast<int>(std::thread::hardware_concurrency());
+                if (core_id >= 0 && total_cores > 0) {
+                    core_id = std::min(core_id + static_cast<int>(worker_index), total_cores - 1);
+                    if (kimp::opt::pin_to_core(core_id)) {
+                        spdlog::info("Lifecycle worker {} pinned to core {}", worker_index, core_id);
+                    }
+                }
+                if (kimp::opt::set_realtime_priority()) {
+                    spdlog::info("Lifecycle worker {} set to realtime priority", worker_index);
+                }
+            });
+            spdlog::info("Started {} low-latency lifecycle worker(s)",
+                         lifecycle_executor.worker_count());
+        }
+
         // Start engine
         engine.start();
 
@@ -1289,17 +1344,9 @@ int main(int argc, char* argv[]) {
             spdlog::info("[RECOVERY] Launching lifecycle loop for {} (${:.2f}/${:.2f} filled)",
                          rpos.symbol.to_string(), actual_usd, rpos.position_size_usd);
 
-            // Claim a lifecycle slot
-            g_active_loops.fetch_add(1, std::memory_order_acq_rel);
-            if (g_active_loops.load(std::memory_order_acquire) >= kimp::TradingConfig::MAX_POSITIONS) {
-                engine.set_entry_suppressed(true);
-            }
-
-            std::lock_guard<std::mutex> lock(g_lifecycle_threads_mutex);
-            g_lifecycle_threads.emplace_back([&order_manager, &engine, rpos]() {
-                LoopGuard guard(g_active_loops);
-
-                // Build signal from recovered position + current prices
+            if (!try_claim_lifecycle_slot()) {
+                spdlog::error("[RECOVERY] No lifecycle slot available for {}", rpos.symbol.to_string());
+            } else {
                 kimp::ArbitrageSignal signal;
                 signal.symbol = rpos.symbol;
                 signal.korean_exchange = rpos.korean_exchange;
@@ -1310,17 +1357,14 @@ int main(int argc, char* argv[]) {
                 signal.usdt_krw_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Bithumb);
                 signal.timestamp = std::chrono::steady_clock::now();
 
-                spdlog::info("[RECOVERY] Starting lifecycle loop for {} with initial position",
-                             rpos.symbol.to_string());
-
-                auto result = order_manager.execute_entry_futures_first(signal, rpos);
-
-                if (g_active_loops.load(std::memory_order_acquire) < kimp::TradingConfig::MAX_POSITIONS) {
-                    engine.set_entry_suppressed(false);
+                if (!lifecycle_executor.enqueue(LifecycleTask{signal, rpos})) {
+                    release_claimed_lifecycle_slot();
+                    spdlog::error("[RECOVERY] enqueue failed for {}", rpos.symbol.to_string());
+                } else {
+                    spdlog::info("[RECOVERY] Queued lifecycle loop for {}",
+                                 rpos.symbol.to_string());
                 }
-                spdlog::info("[RECOVERY] {} lifecycle loop ended (shutdown)",
-                             rpos.symbol.to_string());
-            });
+            }
         }
 
         // Main loop with console output
@@ -1446,14 +1490,7 @@ int main(int argc, char* argv[]) {
 
     ws_server->stop();  // Stop WebSocket server
     order_manager.request_shutdown();  // Break adaptive loops before stopping engine
-    {
-        std::lock_guard<std::mutex> lock(g_lifecycle_threads_mutex);
-        spdlog::info("Waiting for {} lifecycle thread(s) to finish...", g_lifecycle_threads.size());
-        for (auto& t : g_lifecycle_threads) {
-            if (t.joinable()) t.join();
-        }
-        g_lifecycle_threads.clear();
-    }
+    lifecycle_executor.stop();
     engine.stop_async_exporter();
     engine.stop();
     bithumb->disconnect();

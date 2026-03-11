@@ -100,6 +100,18 @@ target_link_libraries(kimp_test_entry PRIVATE kimp_lib)
 add_executable(kimp_test_entry_capacity tests/test_entry_signal_capacity.cpp)
 target_link_libraries(kimp_test_entry_capacity PRIVATE kimp_lib)
 
+# Regression: lifecycle executor must reuse fixed workers and drain queue
+add_executable(kimp_test_lifecycle_executor tests/test_lifecycle_executor.cpp)
+target_link_libraries(kimp_test_lifecycle_executor PRIVATE kimp_lib)
+
+# Regression: atomic bitset must keep deterministic set iteration/counts
+add_executable(kimp_test_atomic_bitset tests/test_atomic_bitset.cpp)
+target_link_libraries(kimp_test_atomic_bitset PRIVATE kimp_lib)
+
+# Regression: bitmap-based entry selection must preserve slot semantics
+add_executable(kimp_test_entry_bitmap tests/test_entry_selection_bitmap.cpp)
+target_link_libraries(kimp_test_entry_bitmap PRIVATE kimp_lib)
+
 # Stress smoke test for detached async export lifetime behavior
 add_executable(kimp_test_export_async_stability tests/test_export_async_stability.cpp)
 target_link_libraries(kimp_test_export_async_stability PRIVATE kimp_lib)

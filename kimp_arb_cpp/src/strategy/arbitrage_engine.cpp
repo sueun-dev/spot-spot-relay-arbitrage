@@ -1,4 +1,5 @@
 #include "kimp/strategy/arbitrage_engine.hpp"
+#include "kimp/strategy/entry_selection_bitmap.hpp"
 #include "kimp/core/logger.hpp"
 #include "kimp/core/optimization.hpp"
 #include "kimp/core/simd_premium.hpp"
@@ -452,14 +453,29 @@ void ArbitrageEngine::monitor_loop() {
 // ── Incremental entry system ──
 // update_symbol_entry: O(1) recompute premium for one symbol
 // update_all_entries:  O(N) recompute all (called on USDT change)
-// fire_entry_from_cache: O(N) lightweight scan of cache-hot atomics
+// fire_entry_from_cache: bitmap-guided scan of cache-hot atomics
+
+void ArbitrageEngine::sync_entry_state_bits(size_t idx, bool qualifies, bool signal_fired) {
+    if (idx >= MAX_CACHED_SYMBOLS) return;
+    entry_candidate_bits_.set(idx, qualifies && !signal_fired);
+    entry_signal_fired_bits_.set(idx, signal_fired);
+}
 
 void ArbitrageEngine::update_symbol_entry(size_t idx) {
     if (idx >= monitored_symbols_.size()) return;
     auto& cache = entry_cache_[idx];
+    auto clear_state = [&]() {
+        const bool was_qualified = cache.qualified.load(std::memory_order_relaxed);
+        const bool was_fired = cache.signal_fired.load(std::memory_order_relaxed);
+        if (was_qualified || was_fired) {
+            cache.qualified.store(false, std::memory_order_release);
+            cache.signal_fired.store(false, std::memory_order_release);
+        }
+        sync_entry_state_bits(idx, false, false);
+    };
 
     if (exchange_pairs_.empty()) {
-        cache.qualified.store(false, std::memory_order_release);
+        clear_state();
         return;
     }
     const auto& [korean_ex, foreign_ex] = exchange_pairs_[0];
@@ -469,53 +485,35 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
 
     auto korean_price = price_cache_.get_price(korean_ex, symbol);
     if (!korean_price.valid || korean_price.ask <= 0) {
-        if (cache.qualified.load(std::memory_order_relaxed)) {
-            cache.qualified.store(false, std::memory_order_release);
-            cache.signal_fired.store(false, std::memory_order_release);
-        }
+        clear_state();
         return;
     }
 
     auto foreign_price = price_cache_.get_price(foreign_ex, foreign_symbol);
     if (!foreign_price.valid || foreign_price.bid <= 0) {
-        if (cache.qualified.load(std::memory_order_relaxed)) {
-            cache.qualified.store(false, std::memory_order_release);
-            cache.signal_fired.store(false, std::memory_order_release);
-        }
+        clear_state();
         return;
     }
 
     if (!quote_pair_is_usable(korean_ex, foreign_ex, korean_price, foreign_price)) {
-        if (cache.qualified.load(std::memory_order_relaxed)) {
-            cache.qualified.store(false, std::memory_order_release);
-            cache.signal_fired.store(false, std::memory_order_release);
-        }
+        clear_state();
         return;
     }
 
     // Funding filters
     if (foreign_price.funding_interval_hours < TradingConfig::MIN_FUNDING_INTERVAL_HOURS) {
-        if (cache.qualified.load(std::memory_order_relaxed)) {
-            cache.qualified.store(false, std::memory_order_release);
-            cache.signal_fired.store(false, std::memory_order_release);
-        }
+        clear_state();
         return;
     }
 
     if (TradingConfig::REQUIRE_POSITIVE_FUNDING && foreign_price.funding_rate < 0.0) {
-        if (cache.qualified.load(std::memory_order_relaxed)) {
-            cache.qualified.store(false, std::memory_order_release);
-            cache.signal_fired.store(false, std::memory_order_release);
-        }
+        clear_state();
         return;
     }
 
     double usdt_rate = price_cache_.get_usdt_krw(korean_ex);
     if (usdt_rate <= 0) {
-        if (cache.qualified.load(std::memory_order_relaxed)) {
-            cache.qualified.store(false, std::memory_order_release);
-            cache.signal_fired.store(false, std::memory_order_release);
-        }
+        clear_state();
         return;
     }
 
@@ -536,9 +534,12 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
     cache.qualified.store(qualifies, std::memory_order_release);
 
     // Reset signal_fired when qualification state changes (re-enable signal)
+    bool signal_fired = cache.signal_fired.load(std::memory_order_relaxed);
     if (was_qualified != qualifies) {
         cache.signal_fired.store(false, std::memory_order_release);
+        signal_fired = false;
     }
+    sync_entry_state_bits(idx, qualifies, signal_fired);
 }
 
 void ArbitrageEngine::update_all_entries() {
@@ -555,28 +556,24 @@ void ArbitrageEngine::fire_entry_from_cache() {
 
     // 0: no position, 1: full position, 2: partial position (eligible for top-up)
     std::array<uint8_t, MAX_CACHED_SYMBOLS> position_state{};
-    auto active_positions = position_tracker_.get_active_positions();
-    for (const auto& pos : active_positions) {
+    int active_positions = 0;
+    position_tracker_.for_each_active_position([&](const Position& pos) {
+        ++active_positions;
         auto it = korean_symbol_index_.find(pos.symbol);
-        if (it == korean_symbol_index_.end()) continue;
+        if (it == korean_symbol_index_.end()) return;
         const size_t idx = it->second;
-        if (idx >= symbol_count || idx >= MAX_CACHED_SYMBOLS) continue;
+        if (idx >= symbol_count || idx >= MAX_CACHED_SYMBOLS) return;
 
         const double actual_usd = pos.foreign_amount * pos.foreign_entry_price;
         const bool partial = actual_usd < pos.position_size_usd * 0.95;
         position_state[idx] = partial ? 2 : 1;
-    }
+    });
     int pending_new_signals = 0;
-    for (size_t i = 0; i < symbol_count; ++i) {
-        if (position_state[i] != 0) continue;
-        if (entry_cache_[i].signal_fired.load(std::memory_order_acquire)) {
+    entry_signal_fired_bits_.for_each_set(symbol_count, [&](size_t idx) {
+        if (position_state[idx] == 0) {
             ++pending_new_signals;
         }
-    }
-
-    const int used_slots = static_cast<int>(active_positions.size()) + pending_new_signals;
-    const bool can_open_new = used_slots < TradingConfig::MAX_POSITIONS;
-    int free_slots = std::max(0, TradingConfig::MAX_POSITIONS - used_slots);
+    });
 
     const auto& [korean_ex, foreign_ex] = exchange_pairs_[0];
 
@@ -595,64 +592,31 @@ void ArbitrageEngine::fire_entry_from_cache() {
         if (on_entry_signal_) on_entry_signal_(signal);
         entry_signals_.try_push(signal);
     };
+    const auto selection = select_entry_candidates<MAX_CACHED_SYMBOLS>(
+        symbol_count,
+        TradingConfig::MAX_POSITIONS,
+        entry_candidate_bits_,
+        entry_signal_fired_bits_,
+        position_state,
+        [&](size_t idx) {
+            return entry_cache_[idx].entry_premium.load(std::memory_order_relaxed);
+        },
+        [&](size_t idx) {
+            return entry_cache_[idx].qualified.load(std::memory_order_acquire);
+        });
 
-    if (TradingConfig::MAX_POSITIONS == 1) {
-        // ── Single position mode ──
-        if (!can_open_new) {
-            // No room for new positions. Check if a qualifying symbol has a partial position → top-up
-            for (size_t i = 0; i < symbol_count; ++i) {
-                if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
-                if (position_state[i] != 2) continue;
-                emit_signal(i);
-                return;
-            }
-            return;  // All positions full, no partial to top up
+    for (size_t n = 0; n < selection.count; ++n) {
+        const size_t idx = selection.indices[n];
+        const bool partial = position_state[idx] == 2;
+
+        if (!entry_cache_[idx].qualified.load(std::memory_order_acquire)) continue;
+        if (!partial && entry_cache_[idx].signal_fired.load(std::memory_order_acquire)) continue;
+
+        if (!partial) {
+            entry_cache_[idx].signal_fired.store(true, std::memory_order_release);
+            sync_entry_state_bits(idx, true, true);
         }
-
-        // Can open new: find best qualifying symbol (skip fully-entered positions)
-        double best_premium = 100.0;
-        size_t best_idx = SIZE_MAX;
-
-        for (size_t i = 0; i < symbol_count; ++i) {
-            if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
-            if (position_state[i] == 1) continue;  // full position
-            double pm = entry_cache_[i].entry_premium.load(std::memory_order_relaxed);
-            if (pm < best_premium) {
-                best_premium = pm;
-                best_idx = i;
-            }
-        }
-
-        if (best_idx == SIZE_MAX) return;
-
-        // Dedup: don't re-fire if already signaled (skip dedup for partial top-ups)
-        if (position_state[best_idx] != 2) {
-            if (entry_cache_[best_idx].signal_fired.load(std::memory_order_acquire)) return;
-            entry_cache_[best_idx].signal_fired.store(true, std::memory_order_release);
-        }
-        emit_signal(best_idx);
-    } else {
-        // ── Multi-position mode: fire for each qualifying symbol ──
-        for (size_t i = 0; i < symbol_count; ++i) {
-            if (!entry_cache_[i].qualified.load(std::memory_order_acquire)) continue;
-
-            const bool has_pos = position_state[i] != 0;
-            const bool partial = position_state[i] == 2;
-
-            if (has_pos && !partial) continue;  // Fully entered, skip
-            if (!has_pos && free_slots <= 0) continue;  // No room for new
-
-            // Skip signal_fired dedup for partial top-ups
-            if (!partial) {
-                if (entry_cache_[i].signal_fired.load(std::memory_order_acquire)) continue;
-                entry_cache_[i].signal_fired.store(true, std::memory_order_release);
-            }
-
-            emit_signal(i);
-            if (!has_pos && free_slots > 0) {
-                --free_slots;
-            }
-        }
+        emit_signal(idx);
     }
 }
 
