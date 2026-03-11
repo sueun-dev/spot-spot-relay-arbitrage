@@ -31,23 +31,51 @@ endif()
 find_package(Boost REQUIRED COMPONENTS json)
 find_package(OpenSSL REQUIRED)
 
-# Find other packages via pkg-config
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(SIMDJSON REQUIRED IMPORTED_TARGET simdjson)
-pkg_check_modules(SPDLOG REQUIRED IMPORTED_TARGET spdlog)
-pkg_check_modules(FMT REQUIRED IMPORTED_TARGET fmt)
-pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
+set(KIMP_SIMDJSON_TARGET "")
+set(KIMP_SPDLOG_TARGET "")
+set(KIMP_FMT_TARGET "")
+set(KIMP_YAML_CPP_TARGET "")
+
+find_package(simdjson CONFIG QUIET)
+if(TARGET simdjson::simdjson)
+    set(KIMP_SIMDJSON_TARGET simdjson::simdjson)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SIMDJSON REQUIRED IMPORTED_TARGET simdjson)
+    set(KIMP_SIMDJSON_TARGET PkgConfig::SIMDJSON)
+endif()
+
+find_package(spdlog CONFIG QUIET)
+if(TARGET spdlog::spdlog)
+    set(KIMP_SPDLOG_TARGET spdlog::spdlog)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SPDLOG REQUIRED IMPORTED_TARGET spdlog)
+    set(KIMP_SPDLOG_TARGET PkgConfig::SPDLOG)
+endif()
+
+find_package(fmt CONFIG QUIET)
+if(TARGET fmt::fmt)
+    set(KIMP_FMT_TARGET fmt::fmt)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FMT REQUIRED IMPORTED_TARGET fmt)
+    set(KIMP_FMT_TARGET PkgConfig::FMT)
+endif()
+
+find_package(yaml-cpp CONFIG QUIET)
+if(TARGET yaml-cpp::yaml-cpp)
+    set(KIMP_YAML_CPP_TARGET yaml-cpp::yaml-cpp)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
+    set(KIMP_YAML_CPP_TARGET PkgConfig::YAML_CPP)
+endif()
 
 # Include directories
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/third_party/jwt-cpp/include
-    ${Boost_INCLUDE_DIRS}
-    ${OPENSSL_INCLUDE_DIR}
-    ${SIMDJSON_INCLUDE_DIRS}
-    ${SPDLOG_INCLUDE_DIRS}
-    ${FMT_INCLUDE_DIRS}
-    ${YAML_CPP_INCLUDE_DIRS}
 )
 
 # Collect source files
@@ -74,10 +102,10 @@ target_link_libraries(kimp_lib
         Boost::headers
         OpenSSL::SSL
         OpenSSL::Crypto
-        PkgConfig::SIMDJSON
-        PkgConfig::SPDLOG
-        PkgConfig::FMT
-        PkgConfig::YAML_CPP
+        ${KIMP_SIMDJSON_TARGET}
+        ${KIMP_SPDLOG_TARGET}
+        ${KIMP_FMT_TARGET}
+        ${KIMP_YAML_CPP_TARGET}
 )
 
 # Main executable

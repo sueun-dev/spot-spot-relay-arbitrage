@@ -10,11 +10,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <condition_variable>
 
 namespace kimp::network {
 
@@ -133,6 +135,40 @@ public:
     using SslStream = PooledConnection::SslStream;
 
 private:
+    static bool file_exists(const char* path) {
+        return path && *path && std::filesystem::exists(path);
+    }
+
+    void configure_verify_paths() {
+        boost::system::error_code ec;
+        ssl_context_.set_default_verify_paths(ec);
+
+        const char* explicit_cert_file = std::getenv("SSL_CERT_FILE");
+        if (file_exists(explicit_cert_file)) {
+            ssl_context_.load_verify_file(explicit_cert_file, ec);
+            if (!ec) {
+                return;
+            }
+        }
+
+        static constexpr const char* kCertCandidates[] = {
+            "/etc/ssl/cert.pem",
+            "/private/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+        };
+
+        for (const char* candidate : kCertCandidates) {
+            if (!file_exists(candidate)) {
+                continue;
+            }
+            ssl_context_.load_verify_file(candidate, ec);
+            if (!ec) {
+                return;
+            }
+        }
+    }
+
     net::io_context& io_context_;
     ssl::context ssl_context_;
     std::string host_;
@@ -170,7 +206,7 @@ public:
         , config_(config) {
 
         // Configure SSL
-        ssl_context_.set_default_verify_paths();
+        configure_verify_paths();
         ssl_context_.set_verify_mode(ssl::verify_peer);
     }
 
