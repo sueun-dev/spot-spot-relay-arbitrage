@@ -16,6 +16,9 @@ interface RelaySummary {
   usdtBid: number
   exchangeRateLabel: string
   bithumbFeeRate: number
+  bithumbFeeEvents: number
+  bybitFeeEvents: number
+  feeModelLabel: string
   bybitFeeSummary: string
 }
 
@@ -37,9 +40,10 @@ interface RelayRow {
   bothCanFillTarget: boolean
   grossEdgePct: number
   netEdgePct: number
-  bithumbTradeFeeKrw: number
-  bybitTradeFeeUsdt: number
-  bybitTradeFeeKrw: number
+  bithumbTotalFeeKrw: number
+  bybitTotalFeeUsdt: number
+  bybitTotalFeeKrw: number
+  totalFeeKrw: number
   netProfitKrw: number
   ageMs: number
 }
@@ -64,8 +68,11 @@ const EMPTY_PAYLOAD: RelayPayload = {
     positiveOnly: true,
     targetUsdt: 70,
     usdtBid: 0,
-    exchangeRateLabel: '원화/달러',
+    exchangeRateLabel: '원화/USDT',
     bithumbFeeRate: 0.0004,
+    bithumbFeeEvents: 1,
+    bybitFeeEvents: 3,
+    feeModelLabel: '빗썸 1회 + 바이비트 3회 기준',
     bybitFeeSummary: '',
   },
   rows: [],
@@ -111,14 +118,14 @@ export default function RelayDashboardPage() {
 
   return (
     <main className="min-h-screen bg-black text-zinc-100">
-      <div className="mx-auto flex max-w-[1800px] flex-col gap-6 px-6 py-8">
+      <div className="mx-auto flex max-w-[1920px] flex-col gap-6 px-5 py-6">
         <header className="border border-zinc-800 bg-zinc-950/90 p-5">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <p className="text-xs uppercase tracking-[0.35em] text-zinc-500">Spot Relay Monitor</p>
               <h1 className="mt-2 text-3xl font-semibold text-white">빗썸 → 바이비트 실시간 중계 대시보드</h1>
               <p className="mt-2 text-sm text-zinc-400">
-                양쪽 웹소켓 수신 현황, 1틱 호가 잔량, 70달러 기준 진입 가능 여부, 순손익 기준 상위 코인을 한 화면에서 본다.
+                양쪽 웹소켓 수신 현황, 1틱 호가 잔량, 70 USDT 기준 진입 가능 여부, 빗썸 1회와 바이비트 3회 수수료 반영 순손익을 한 화면에서 본다.
               </p>
             </div>
             <div className="text-right text-sm text-zinc-400">
@@ -135,14 +142,15 @@ export default function RelayDashboardPage() {
           <MetricCard label="양쪽 수신" value={String(payload.summary.bothSeen)} />
           <MetricCard label="Fresh" value={String(payload.summary.fresh)} />
           <MetricCard label="양수 순차익" value={String(payload.summary.positiveShown)} accent="lime" />
-          <MetricCard label="목표 달러" value={`${fmt(payload.summary.targetUsdt, 2)} USD`} accent="lime" />
+          <MetricCard label="목표 USDT" value={`${fmt(payload.summary.targetUsdt, 2)} USDT`} accent="lime" />
         </section>
 
         <section className="border border-zinc-800 bg-zinc-950/90 p-4 text-sm text-zinc-300">
-          <div>빗썸 수수료: {(payload.summary.bithumbFeeRate * 100).toFixed(4)}%</div>
-          <div>바이비트 수수료: {payload.summary.bybitFeeSummary || '대기 중'}</div>
+          <div>수수료 모델: {payload.summary.feeModelLabel || '대기 중'}</div>
+          <div>빗썸 수수료: {(payload.summary.bithumbFeeRate * 100).toFixed(4)}% x {payload.summary.bithumbFeeEvents}회</div>
+          <div>바이비트 수수료: {(payload.summary.bybitFeeSummary || '대기 중')} x {payload.summary.bybitFeeEvents}회</div>
           <div>필터 제외: {payload.summary.filteredNegative}개</div>
-          <div>1틱 기준 목표 금액: {fmt(payload.summary.targetUsdt, 2)} 달러</div>
+          <div>1틱 기준 목표 금액: {fmt(payload.summary.targetUsdt, 2)} USDT</div>
         </section>
 
         <section className="flex flex-wrap items-center justify-between gap-3">
@@ -166,72 +174,90 @@ export default function RelayDashboardPage() {
         </section>
 
         <section className="overflow-hidden border border-zinc-800 bg-zinc-950/90">
-          <div className="overflow-x-auto">
-            <table className="min-w-full border-collapse text-sm">
-              <thead className="sticky top-0 bg-zinc-900 text-zinc-300">
-                <tr className="border-b border-zinc-800">
-                  {[
-                    '코인',
-                    '빗썸 매수가(원화)',
-                    '빗썸 수량(코인)',
-                    '빗썸 총액(원화)',
-                    '빗썸 총액(달러)',
-                    '바이비트 매도가(달러)',
-                    '바이비트 수량(코인)',
-                    '바이비트 총액(달러)',
-                    '바이비트 총액(원화)',
-                    '체결수량(코인)',
-                    '1틱 최대진입(달러)',
-                    `${fmt(payload.summary.targetUsdt, 2)}달러 필요수량`,
-                    '양쪽 1틱 가능',
-                    '총차익(%)',
-                    '순차익(%)',
-                    '빗썸 수수료(원화)',
-                    '바이비트 수수료(달러)',
-                    '바이비트 수수료(원화)',
-                    '순손익(원화)',
-                    '지연(ms)',
-                  ].map((label) => (
-                    <th key={label} className="whitespace-nowrap px-4 py-3 text-right font-medium first:text-left">
-                      {label}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row) => (
-                  <tr key={row.base} className="border-b border-zinc-900 text-zinc-100">
-                    <td className="whitespace-nowrap px-4 py-3 text-left font-semibold text-white">{row.base}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bithumbAsk, 8)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bithumbAskQty, 8)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bithumbTopKrw, 0)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bithumbTopUsdt, 4)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bybitBid, 8)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bybitBidQty, 8)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bybitTopUsdt, 4)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bybitTopKrw, 0)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.matchQty, 8)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right text-cyan-300">{fmt(row.maxTradableUsdtAtBest, 4)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.targetCoinQty, 8)}</td>
-                    <td className={`whitespace-nowrap px-4 py-3 text-right font-semibold ${row.bothCanFillTarget ? 'text-lime-300' : 'text-rose-300'}`}>
-                      {row.bothCanFillTarget ? '가능' : '불가'}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right text-cyan-300">{pct(row.grossEdgePct)}</td>
-                    <td className={`whitespace-nowrap px-4 py-3 text-right ${row.netEdgePct > 0 ? 'text-lime-300' : 'text-rose-300'}`}>
-                      {pct(row.netEdgePct)}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bithumbTradeFeeKrw, 2)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bybitTradeFeeUsdt, 6)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{fmt(row.bybitTradeFeeKrw, 2)}</td>
-                    <td className={`whitespace-nowrap px-4 py-3 text-right ${row.netProfitKrw > 0 ? 'text-lime-300' : 'text-rose-300'}`}>
-                      {fmt(row.netProfitKrw, 2)}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right text-zinc-400">{row.ageMs}</td>
-                  </tr>
+          <table className="w-full table-fixed border-collapse text-[11px] leading-tight xl:text-xs">
+            <colgroup>
+              <col className="w-[4.5rem]" />
+              <col className="w-[18%]" />
+              <col className="w-[18%]" />
+              <col className="w-[16%]" />
+              <col className="w-[12%]" />
+              <col className="w-[18%]" />
+              <col className="w-[13%]" />
+            </colgroup>
+            <thead className="sticky top-0 bg-zinc-900 text-zinc-300">
+              <tr className="border-b border-zinc-800">
+                {['코인', '빗썸 1틱', '바이비트 1틱', '실행', '차익', '수수료', '순손익'].map((label) => (
+                  <th key={label} className="px-2 py-2 text-left font-medium">
+                    {label}
+                  </th>
                 ))}
-              </tbody>
-            </table>
-          </div>
+              </tr>
+            </thead>
+            <tbody className="align-top tabular-nums">
+              {rows.map((row) => (
+                <tr key={row.base} className="border-b border-zinc-900 text-zinc-100">
+                  <td className="px-2 py-3 text-left text-sm font-semibold text-white">{row.base}</td>
+                  <td className="px-2 py-3">
+                    <CompactCell
+                      lines={[
+                        ['매수', `${fmt(row.bithumbAsk, 8)} 원화`],
+                        ['수량', fmt(row.bithumbAskQty, 8)],
+                        ['총액', `${fmt(row.bithumbTopKrw, 0)} 원화`],
+                        ['환산', `${fmt(row.bithumbTopUsdt, 4)} USDT`],
+                      ]}
+                    />
+                  </td>
+                  <td className="px-2 py-3">
+                    <CompactCell
+                      lines={[
+                        ['매도', `${fmt(row.bybitBid, 8)} USDT`],
+                        ['수량', fmt(row.bybitBidQty, 8)],
+                        ['총액', `${fmt(row.bybitTopUsdt, 4)} USDT`],
+                        ['환산', `${fmt(row.bybitTopKrw, 0)} 원화`],
+                      ]}
+                    />
+                  </td>
+                  <td className="px-2 py-3">
+                    <CompactCell
+                      lines={[
+                        ['체결', fmt(row.matchQty, 8)],
+                        ['1틱최대', `${fmt(row.maxTradableUsdtAtBest, 4)} USDT`],
+                        ['목표수량', fmt(row.targetCoinQty, 8)],
+                        ['가능', row.bothCanFillTarget ? '가능' : '불가'],
+                      ]}
+                      tone={row.bothCanFillTarget ? 'lime' : 'rose'}
+                      highlightLast
+                    />
+                  </td>
+                  <td className="px-2 py-3">
+                    <CompactCell
+                      lines={[
+                        ['총', pct(row.grossEdgePct)],
+                        ['순', pct(row.netEdgePct)],
+                        ['지연', `${row.ageMs} ms`],
+                      ]}
+                      tone={row.netEdgePct > 0 ? 'lime' : 'rose'}
+                      highlightFirst
+                      highlightSecond
+                    />
+                  </td>
+                  <td className="px-2 py-3">
+                    <CompactCell
+                      lines={[
+                        ['빗썸', `${fmt(row.bithumbTotalFeeKrw, 2)} 원화`],
+                        ['By', `${fmt(row.bybitTotalFeeUsdt, 6)} USDT`],
+                        ['By환산', `${fmt(row.bybitTotalFeeKrw, 2)} 원화`],
+                        ['합계', `${fmt(row.totalFeeKrw, 2)} 원화`],
+                      ]}
+                    />
+                  </td>
+                  <td className={`px-2 py-3 text-right text-sm font-semibold ${row.netProfitKrw > 0 ? 'text-lime-300' : 'text-rose-300'}`}>
+                    <div>{fmt(row.netProfitKrw, 2)} 원화</div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
           {!loading && rows.length === 0 && (
             <div className="px-6 py-10 text-center text-zinc-500">표시할 행이 없다.</div>
           )}
@@ -267,6 +293,49 @@ function filterButtonClass(active: boolean) {
   return active
     ? 'border border-lime-400 bg-lime-400/10 px-4 py-2 text-sm text-lime-200'
     : 'border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm text-zinc-300'
+}
+
+function CompactCell({
+  lines,
+  tone = 'zinc',
+  highlightFirst = false,
+  highlightSecond = false,
+  highlightLast = false,
+}: {
+  lines: Array<[string, string]>
+  tone?: 'zinc' | 'lime' | 'rose'
+  highlightFirst?: boolean
+  highlightSecond?: boolean
+  highlightLast?: boolean
+}) {
+  const toneClass =
+    tone === 'lime'
+      ? 'text-lime-300'
+      : tone === 'rose'
+        ? 'text-rose-300'
+        : 'text-zinc-100'
+
+  return (
+    <div className="space-y-1">
+      {lines.map(([label, value], index) => {
+        const highlighted =
+          (highlightFirst && index === 0) ||
+          (highlightSecond && index === 1) ||
+          (highlightLast && index === lines.length - 1)
+
+        return (
+          <div key={`${label}-${index}`} className="flex items-start justify-between gap-2">
+            <span className="shrink-0 text-[10px] uppercase tracking-[0.18em] text-zinc-500 xl:text-[11px]">
+              {label}
+            </span>
+            <span className={`text-right ${highlighted ? toneClass : 'text-zinc-100'}`}>
+              {value}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 function fmt(value: number, digits: number) {

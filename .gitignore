@@ -36,6 +36,7 @@ data/
 .LSOverride
 
 # Dashboard (Next.js)
+node_modules/
 dashboard/node_modules/
 dashboard/.next/
 dashboard/out/
@@ -45,3 +46,4 @@ dashboard/out/
 *.temp
 /tmp/
 .codex/
+.playwright-cli/
