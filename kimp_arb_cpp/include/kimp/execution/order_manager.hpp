@@ -41,7 +41,7 @@ class OrderManager {
 public:
     using ExchangePtr = std::shared_ptr<exchange::IExchange>;
     using KoreanExchangePtr = std::shared_ptr<exchange::KoreanExchangeBase>;
-    using FuturesExchangePtr = std::shared_ptr<exchange::ForeignFuturesExchangeBase>;
+    using ShortExchangePtr = std::shared_ptr<exchange::ForeignFuturesExchangeBase>;
 
 private:
     // Exchange references
@@ -68,21 +68,21 @@ public:
     // Execute exit (close position) - parallel execution
     ExecutionResult execute_exit(const ExitSignal& signal, const Position& position);
 
-    // Execute entry with futures FIRST for perfect hedge
-    // 1. SHORT on Bybit (get exact contract size)
+    // Execute entry with foreign short FIRST for hedge sizing
+    // 1. SHORT on Bybit spot margin
     // 2. BUY on Bithumb (same amount)
     // Optional initial_position for top-up: resumes from existing partial position state
     ExecutionResult execute_entry_futures_first(
         const ArbitrageSignal& signal,
         const std::optional<Position>& initial_position = std::nullopt);
 
-    // Execute exit with futures FIRST
-    // 1. COVER on Bybit (close short)
+    // Execute exit with foreign short leg FIRST
+    // 1. COVER on Bybit spot margin
     // 2. SELL on Bithumb (same amount)
     ExecutionResult execute_exit_futures_first(const ExitSignal& signal, const Position& position);
 
-    // Pre-set leverage to 1x for all tradable symbols at startup
-    void pre_set_leverage(const std::vector<SymbolId>& symbols);
+    // Prepare Bybit spot margin account before live trading
+    bool prepare_foreign_shorting(const std::vector<SymbolId>& symbols);
 
     // Request graceful shutdown of any running adaptive loops
     void request_shutdown() { running_.store(false, std::memory_order_release); }
@@ -91,7 +91,7 @@ public:
     // SAFETY CHECK - Prevent trading coins with existing external positions
     // =========================================================================
     // Check if we already have positions outside the bot's tracking
-    // (e.g., manually bought spot or existing futures positions)
+    // (e.g., manually bought spot or existing short liabilities)
     // Returns true if safe to trade, false if should skip
     bool is_safe_to_trade(const SymbolId& symbol, Exchange korean_ex, Exchange foreign_ex);
 
@@ -117,7 +117,7 @@ private:
     std::mutex blacklist_mutex_;
     // Get typed exchange
     KoreanExchangePtr get_korean_exchange(Exchange ex);
-    FuturesExchangePtr get_futures_exchange(Exchange ex);
+    ShortExchangePtr get_futures_exchange(Exchange ex);
 
     // Split order execution
     ExecutionResult execute_split_entry(const ArbitrageSignal& signal);

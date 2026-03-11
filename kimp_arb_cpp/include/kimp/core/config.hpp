@@ -83,7 +83,7 @@ constexpr const char* BITHUMB_WS = "wss://pubwss.bithumb.com/pub/ws";
 constexpr const char* BITHUMB_REST = "https://api.bithumb.com";
 
 // Bybit
-constexpr const char* BYBIT_WS_PUBLIC = "wss://stream.bybit.com/v5/public/linear";
+constexpr const char* BYBIT_WS_PUBLIC = "wss://stream.bybit.com/v5/public/spot";
 constexpr const char* BYBIT_WS_PRIVATE = "wss://stream.bybit.com/v5/private";
 constexpr const char* BYBIT_WS_TRADE = "wss://stream.bybit.com/v5/trade";
 constexpr const char* BYBIT_REST = "https://api.bybit.com";

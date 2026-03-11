@@ -16,19 +16,15 @@ namespace kimp::exchange::bybit {
  *
  * Features:
  * - HMAC-SHA256 authentication
- * - USDT perpetual futures
+ * - USDT spot markets
+ * - Spot margin short execution (`isLeverage=1`)
  * - WebSocket for real-time data
- * - Position management with positionIdx
+ * - Borrow liability tracking via wallet balance
  */
 class BybitExchange : public ForeignFuturesExchangeBase {
 private:
     simdjson::ondemand::parser json_parser_;
     simdjson::padded_string json_buffer_{8192};
-
-    static constexpr int SHORT_POSITION_IDX = 2;
-
-    // Cache funding intervals (symbol -> interval in hours) from instruments-info
-    std::unordered_map<std::string, int> funding_interval_cache_;
     struct LotSize {
         double min_qty{0.0};
         double qty_step{0.0};
@@ -55,11 +51,14 @@ private:
 
     // Store subscribed symbols for reconnection
     std::vector<SymbolId> subscribed_tickers_;
+    std::vector<SymbolId> subscribed_orderbooks_;
     std::mutex subscription_mutex_;
+    std::atomic<bool> spot_margin_mode_ready_{false};
+    std::mutex spot_margin_mutex_;
 
 public:
     BybitExchange(net::io_context& ioc, ExchangeCredentials creds)
-        : ForeignFuturesExchangeBase(Exchange::Bybit, MarketType::Perpetual, "Bybit", ioc, std::move(creds)) {
+        : ForeignFuturesExchangeBase(Exchange::Bybit, MarketType::Spot, "Bybit", ioc, std::move(creds)) {
     }
 
     bool connect() override;
@@ -94,10 +93,12 @@ protected:
 
 private:
     std::string generate_signature(int64_t timestamp, const std::string& params) const;
+    std::string resolve_public_ws_endpoint() const;
 
     std::unordered_map<std::string, std::string> build_auth_headers(
         const std::string& params = "") const;
 
+    bool ensure_spot_margin_mode();
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
     bool parse_order_response(const std::string& response, Order& order, std::string* order_id_out = nullptr);
     double normalize_order_qty(const SymbolId& symbol, double qty, bool is_open) const;

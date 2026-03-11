@@ -5,6 +5,36 @@
 
 namespace kimp::network {
 
+void WebSocketClient::configure_verify_paths() {
+    boost::system::error_code ec;
+    ssl_context_.set_default_verify_paths(ec);
+
+    const char* explicit_cert_file = std::getenv("SSL_CERT_FILE");
+    if (file_exists(explicit_cert_file)) {
+        ssl_context_.load_verify_file(explicit_cert_file, ec);
+        if (!ec) {
+            return;
+        }
+    }
+
+    static constexpr const char* kCertCandidates[] = {
+        "/etc/ssl/cert.pem",
+        "/private/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    };
+
+    for (const char* candidate : kCertCandidates) {
+        if (!file_exists(candidate)) {
+            continue;
+        }
+        ssl_context_.load_verify_file(candidate, ec);
+        if (!ec) {
+            return;
+        }
+    }
+}
+
 bool WebSocketClient::parse_url(const std::string& url) {
     // Parse wss://host:port/path or wss://host/path
     std::regex url_regex(R"(wss?://([^:/]+)(?::(\d+))?(/.*)?)", std::regex::icase);

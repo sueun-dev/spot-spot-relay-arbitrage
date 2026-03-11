@@ -165,7 +165,7 @@ void test_section7_connect_pattern() {
     TEST("Bithumb ID correct", bithumb->get_exchange_id() == kimp::Exchange::Bithumb);
     TEST("Bybit ID correct", bybit->get_exchange_id() == kimp::Exchange::Bybit);
     TEST("Bithumb is Spot", bithumb->get_market_type() == kimp::MarketType::Spot);
-    TEST("Bybit is Perpetual", bybit->get_market_type() == kimp::MarketType::Perpetual);
+    TEST("Bybit is Spot", bybit->get_market_type() == kimp::MarketType::Spot);
 }
 
 void test_section7_polling_logic() {
@@ -498,30 +498,29 @@ void test_section8_price_cache_thread_safety() {
 void test_section8_funding_cache_and_leverage() {
     std::cout << "\n--- Section 8.8: Funding cache & pre_set_leverage pattern ---\n";
 
-    // Verify funding interval cache concept
-    // (actual API call not tested, just the data flow)
+    // Verify cached metadata path for Bybit spot prices
     kimp::strategy::PriceCache cache;
     kimp::SymbolId sol_usdt("SOL", "USDT");
 
-    // Simulate what bybit.cpp does: cache funding during get_available_symbols
+    // Simulate what bybit.cpp does for spot metadata
     cache.update(kimp::Exchange::Bybit, sol_usdt, 187.0, 188.0, 187.5);
-    cache.update_funding(kimp::Exchange::Bybit, sol_usdt, 0.0001, 8, 1700000000000ULL);
+    cache.update_funding(kimp::Exchange::Bybit, sol_usdt, 0.0, 0, 0);
 
     auto data = cache.get_price(kimp::Exchange::Bybit, sol_usdt);
-    TEST("Funding rate cached", data.valid && std::abs(data.funding_rate - 0.0001) < 1e-10);
-    TEST("Funding interval = 8h", data.funding_interval_hours == 8);
-    TEST("Next funding time stored", data.next_funding_time == 1700000000000ULL);
+    TEST("Spot metadata cached", data.valid && std::abs(data.funding_rate - 0.0) < 1e-10);
+    TEST("Funding interval = 0h", data.funding_interval_hours == 0);
+    TEST("Next funding time stored", data.next_funding_time == 0);
 
-    // pre_set_leverage pattern: just verify the concept
+    // prepare_foreign_shorting pattern: just verify the symbol conversion concept
     // (actual API call tested in integration tests)
     std::vector<kimp::SymbolId> symbols;
     symbols.emplace_back("SOL", "KRW");
     symbols.emplace_back("BTC", "KRW");
 
-    // Convert KRW→USDT (same pattern as pre_set_leverage)
+    // Convert KRW→USDT (same pattern as prepare_foreign_shorting)
     for (const auto& sym : symbols) {
         kimp::SymbolId foreign(sym.get_base(), "USDT");
-        // Would call bybit->set_leverage(foreign, 1)
+        // Would call bybit->set_leverage(foreign, 2)
         TEST(("Leverage symbol: " + foreign.to_string() + " correct").c_str(),
              std::string(foreign.get_quote()) == "USDT");
     }
@@ -531,8 +530,8 @@ void test_section8_dynamic_exit_threshold() {
     std::cout << "\n--- Section 8.9: Dynamic exit threshold ---\n";
 
     // Verify TradingConfig constants
-    TEST_NEAR("ROUND_TRIP_FEE = 0.19%",
-              kimp::TradingConfig::ROUND_TRIP_FEE_PCT, 0.19, 0.001);
+    TEST_NEAR("ROUND_TRIP_FEE = 0.28%",
+              kimp::TradingConfig::ROUND_TRIP_FEE_PCT, 0.28, 0.001);
     TEST_NEAR("DYNAMIC_EXIT_SPREAD = fee + min_profit",
               kimp::TradingConfig::DYNAMIC_EXIT_SPREAD,
               kimp::TradingConfig::ROUND_TRIP_FEE_PCT + kimp::TradingConfig::MIN_NET_PROFIT_PCT,
@@ -564,10 +563,10 @@ void test_section8_dynamic_exit_threshold() {
               kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD, 1e-10);
 
     // Verify entry filter constants
-    TEST("MIN_FUNDING_INTERVAL = 4h",
-         kimp::TradingConfig::MIN_FUNDING_INTERVAL_HOURS == 4);
-    TEST("REQUIRE_POSITIVE_FUNDING = true",
-         kimp::TradingConfig::REQUIRE_POSITIVE_FUNDING == true);
+    TEST("MIN_FUNDING_INTERVAL = 0h",
+         kimp::TradingConfig::MIN_FUNDING_INTERVAL_HOURS == 0);
+    TEST("REQUIRE_POSITIVE_FUNDING = false",
+         kimp::TradingConfig::REQUIRE_POSITIVE_FUNDING == false);
     TEST("SPLIT_ORDERS = 10", kimp::TradingConfig::SPLIT_ORDERS == 10);
     TEST_NEAR("ORDER_SIZE * SPLITS = POSITION_SIZE",
               kimp::TradingConfig::ORDER_SIZE_USD * kimp::TradingConfig::SPLIT_ORDERS,

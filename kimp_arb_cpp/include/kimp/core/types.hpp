@@ -319,8 +319,8 @@ struct TradingConfig {
 
     // Fee structure (bid/ask spread already in premium calc, slippage ~0 at $25 splits)
     static constexpr double BITHUMB_FEE_PCT = 0.04;           // Per trade (buy or sell)
-    static constexpr double BYBIT_FEE_PCT = 0.055;            // Per trade (short or cover)
-    static constexpr double ROUND_TRIP_FEE_PCT = (BITHUMB_FEE_PCT + BYBIT_FEE_PCT) * 2;  // 0.19%
+    static constexpr double BYBIT_FEE_PCT = 0.10;             // Spot taker per trade (sell short or buy cover)
+    static constexpr double ROUND_TRIP_FEE_PCT = (BITHUMB_FEE_PCT + BYBIT_FEE_PCT) * 2;  // 0.28%
     static constexpr double MIN_NET_PROFIT_PCT = 0.00;         // floor(0.10%)에서 청산 — 수수료만 커버하면 즉시 탈출
     static constexpr double DYNAMIC_EXIT_SPREAD = ROUND_TRIP_FEE_PCT + MIN_NET_PROFIT_PCT; // 0.19%
     // Dynamic exit: exit_pm >= max(entry_pm + 0.19%, EXIT_PREMIUM_THRESHOLD)
@@ -330,9 +330,9 @@ struct TradingConfig {
     // Fallback fixed exit threshold (used when no position entry_premium available)
     static constexpr double EXIT_PREMIUM_THRESHOLD = 0.25;    // Exit floor: premium >= +0.25%
 
-    // Entry filters
-    static constexpr int MIN_FUNDING_INTERVAL_HOURS = 4;      // 4h and 8h funding (exclude 1h)
-    static constexpr bool REQUIRE_POSITIVE_FUNDING = true;    // Only positive funding rate
+    // Spot/spot execution uses no funding filters.
+    static constexpr int MIN_FUNDING_INTERVAL_HOURS = 0;
+    static constexpr bool REQUIRE_POSITIVE_FUNDING = false;
 
     static constexpr double MAX_PRICE_DIFF_PERCENT = 50.0;
     static constexpr int USDT_UPDATE_INTERVAL_MS = 180000;    // 3 minutes
@@ -342,7 +342,7 @@ struct TradingConfig {
     static constexpr uint64_t MAX_QUOTE_AGE_MS = 2500;        // Reject quotes older than 2.5s
     static constexpr uint64_t MAX_QUOTE_DESYNC_MS = 1200;     // Reject if KR/Foreign quote times differ too much
     static constexpr double MAX_KOREAN_SPREAD_PCT = 1.20;     // Skip illiquid KRW books
-    static constexpr double MAX_FOREIGN_SPREAD_PCT = 0.40;    // Skip illiquid futures books
+    static constexpr double MAX_FOREIGN_SPREAD_PCT = 0.40;    // Skip illiquid Bybit spot books
 
     // Quote quality guards — EXIT (relaxed: must be able to close positions)
     static constexpr uint64_t MAX_QUOTE_AGE_MS_EXIT = 8000;       // 8s (small coins tick less often)

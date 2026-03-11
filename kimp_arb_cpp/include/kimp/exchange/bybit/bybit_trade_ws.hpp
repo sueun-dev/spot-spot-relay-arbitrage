@@ -63,7 +63,7 @@ public:
      * Returns Order with status Filled (on ACK success) or Rejected (on failure/timeout)
      */
     Order place_order_sync(const std::string& symbol, Side side, double qty,
-                           bool reduce_only, int position_idx);
+                           bool is_leverage);
 
 private:
     void authenticate();

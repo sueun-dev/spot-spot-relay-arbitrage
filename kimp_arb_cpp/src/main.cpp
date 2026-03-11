@@ -553,7 +553,7 @@ int main(int argc, char* argv[]) {
     net::io_context io_context;
     auto work_guard = net::make_work_guard(io_context);
 
-    // Create exchanges (Bithumb: Korean spot, Bybit: Foreign futures)
+    // Create exchanges (Bithumb: Korean spot, Bybit: spot margin short venue)
     // load_config guarantees both entries exist; check enabled flag only
     auto& bithumb_creds = config.exchanges[kimp::Exchange::Bithumb];
     auto& bybit_creds = config.exchanges[kimp::Exchange::Bybit];
@@ -630,15 +630,13 @@ int main(int argc, char* argv[]) {
     };
 
     // Auto-trading callbacks (disabled in monitor-only mode)
-    // IMPORTANT: For perfect hedge, execute futures FIRST to get exact contract size
-    //
     // Entry sequence:
-    //   1. SHORT futures (Bybit) - get exact coin amount from contract size
-    //   2. BUY spot (Bithumb) - buy exact same amount
+    //   1. SELL borrowed spot on Bybit margin
+    //   2. BUY spot on Bithumb with the same coin amount
     //
     // Exit sequence:
-    //   1. COVER futures (Bybit) - close short position
-    //   2. SELL spot (Bithumb) - sell exact same amount
+    //   1. BUY spot on Bybit to cover the borrowed amount
+    //   2. SELL spot on Bithumb with the same coin amount
     if (!monitor_only) {
         // Trade complete callback: fired each time a full enter→exit cycle completes inside the loop
         order_manager.set_trade_complete_callback(
@@ -788,8 +786,15 @@ int main(int argc, char* argv[]) {
     }
 
     if (!monitor_only) {
-        // Pre-set leverage to 1x for all symbols at startup (avoid per-trade REST latency)
-        order_manager.pre_set_leverage(common_symbols);
+        // Prepare Bybit spot margin account once at startup (avoid first-trade setup latency)
+        if (!order_manager.prepare_foreign_shorting(common_symbols)) {
+            spdlog::error("Bybit spot margin setup failed");
+            bithumb->disconnect();
+            bybit->disconnect();
+            stop_io_threads();
+            kimp::Logger::shutdown();
+            return 1;
+        }
 
         // Build external position blacklist (prevents trading coins with existing manual positions)
         // Exclude bot-managed positions (from saved position file) so they don't get blacklisted
@@ -803,7 +808,7 @@ int main(int argc, char* argv[]) {
         }
         order_manager.refresh_external_positions(common_symbols, bot_managed_symbols);
     } else {
-        spdlog::info("Monitor-only mode: skipping leverage preset and external position blacklist");
+        spdlog::info("Monitor-only mode: skipping spot-margin setup and external position blacklist");
     }
 
     // Start async JSON exporter FIRST (before any price loading or trading)
@@ -946,42 +951,14 @@ int main(int argc, char* argv[]) {
         bybit_subs.emplace_back(std::string(s.get_base()), "USDT");
     }
     bybit->subscribe_ticker(bybit_subs);
-    spdlog::info("Subscribed to {} Bybit tickers", bybit_subs.size());
+    bybit->subscribe_orderbook(bybit_subs);
+    spdlog::info("Subscribed to {} Bybit spot symbols (ticker + orderbook)", bybit_subs.size());
 
     // =========================================================================
     // STEP 13: Background Refresh Threads (REST fallback for data maintenance)
     // =========================================================================
 
-    // 13-1: Funding refresh (every 5 minutes) - Bybit funding_rate/interval update
-    std::atomic<bool> funding_refresh_running{true};
-    std::mutex funding_refresh_mutex;
-    std::condition_variable funding_refresh_cv;
-    std::thread funding_refresh_thread([&]() {
-        constexpr auto interval = std::chrono::minutes(5);
-        std::unique_lock<std::mutex> lock(funding_refresh_mutex);
-        while (funding_refresh_running && !g_shutdown) {
-            lock.unlock();
-
-            // Refresh funding info via REST (cached, not on trading path)
-            auto bybit_tickers_refresh = bybit->fetch_all_tickers();
-            if (!bybit_tickers_refresh.empty()) {
-                auto& cache = engine.get_price_cache();
-                for (const auto& ticker : bybit_tickers_refresh) {
-                    if (common_bases.count(std::string(ticker.symbol.get_base()))) {
-                        cache.update_funding(ticker.exchange, ticker.symbol,
-                            ticker.funding_rate, ticker.funding_interval_hours, ticker.next_funding_time);
-                    }
-                }
-            }
-
-            lock.lock();
-            funding_refresh_cv.wait_for(lock, interval, [&] {
-                return !funding_refresh_running || g_shutdown.load();
-            });
-        }
-    });
-
-    // 13-2: Price refresh (every 4 minutes) - WS backup, USDT/KRW & funding sync
+    // 13: Price refresh (every 4 minutes) - WS backup, USDT/KRW sync
     std::atomic<bool> price_refresh_running{true};
     std::mutex price_refresh_mutex;
     std::condition_variable price_refresh_cv;
@@ -1025,10 +1002,6 @@ int main(int argc, char* argv[]) {
                 if (common_bases.count(std::string(ticker.symbol.get_base()))) {
                     cache.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last,
                                  snapshot_ms);
-                    if (std::isfinite(ticker.funding_rate) || ticker.next_funding_time != 0) {
-                        cache.update_funding(ticker.exchange, ticker.symbol,
-                            ticker.funding_rate, ticker.funding_interval_hours, ticker.next_funding_time);
-                    }
                 }
             }
 
@@ -1071,7 +1044,7 @@ int main(int argc, char* argv[]) {
                 struct RecoveryCandidate {
                     kimp::Position pos;
                     double spot_balance{0.0};
-                    double futures_amount{0.0};
+                    double short_amount{0.0};
                     double matched_amount{0.0};
                     double matched_usd{0.0};
                     bool from_saved_file{false};
@@ -1103,10 +1076,10 @@ int main(int argc, char* argv[]) {
                     kimp::SymbolId usdt_symbol(coin, "USDT");
 
                     double spot_balance = bithumb->get_balance(coin);
-                    double futures_amount = bybit_pos.foreign_amount;
-                    if (spot_balance <= 0.0001 || futures_amount <= 0.0001) continue;
+                    double short_amount = bybit_pos.foreign_amount;
+                    if (spot_balance <= 0.0001 || short_amount <= 0.0001) continue;
 
-                    double amount = std::min(spot_balance, futures_amount);
+                    double amount = std::min(spot_balance, short_amount);
 
                     auto korean_price = engine.get_price_cache().get_price(
                         kimp::Exchange::Bithumb, krw_symbol);
@@ -1149,7 +1122,7 @@ int main(int argc, char* argv[]) {
                     RecoveryCandidate c;
                     c.pos = pos;
                     c.spot_balance = spot_balance;
-                    c.futures_amount = futures_amount;
+                    c.short_amount = short_amount;
                     c.matched_amount = amount;
                     c.matched_usd = pos.position_size_usd;
                     if (c.matched_usd <= 0.0 && foreign_fallback > 0.0) {
@@ -1169,8 +1142,8 @@ int main(int argc, char* argv[]) {
                         RecoveryCandidate c;
                         c.pos = *loaded_pos;
                         c.spot_balance = loaded_pos->korean_amount;
-                        c.futures_amount = loaded_pos->foreign_amount;
-                        c.matched_amount = std::min(c.spot_balance, c.futures_amount);
+                        c.short_amount = loaded_pos->foreign_amount;
+                        c.matched_amount = std::min(c.spot_balance, c.short_amount);
                         c.matched_usd = loaded_pos->position_size_usd;
                         if (c.matched_usd <= 0.0) {
                             c.matched_usd = loaded_pos->korean_amount * loaded_pos->foreign_entry_price;
@@ -1472,13 +1445,6 @@ int main(int argc, char* argv[]) {
     broadcast_running = false;
     if (broadcast_thread.joinable()) {
         broadcast_thread.join();
-    }
-
-    // Stop funding refresh thread
-    funding_refresh_running = false;
-    funding_refresh_cv.notify_all();
-    if (funding_refresh_thread.joinable()) {
-        funding_refresh_thread.join();
     }
 
     // Stop price refresh thread

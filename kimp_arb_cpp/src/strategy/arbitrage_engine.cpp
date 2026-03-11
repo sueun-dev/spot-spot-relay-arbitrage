@@ -500,17 +500,6 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
         return;
     }
 
-    // Funding filters
-    if (foreign_price.funding_interval_hours < TradingConfig::MIN_FUNDING_INTERVAL_HOURS) {
-        clear_state();
-        return;
-    }
-
-    if (TradingConfig::REQUIRE_POSITIVE_FUNDING && foreign_price.funding_rate < 0.0) {
-        clear_state();
-        return;
-    }
-
     double usdt_rate = price_cache_.get_usdt_krw(korean_ex);
     if (usdt_rate <= 0) {
         clear_state();
@@ -824,9 +813,7 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
         info.funding_rate = funding_rates[i];
         info.funding_interval_hours = funding_intervals[i];
         info.next_funding_time = next_funding_times[i];
-        info.entry_signal = (entry_premiums[i] <= TradingConfig::ENTRY_PREMIUM_THRESHOLD) &&
-                            (funding_intervals[i] >= TradingConfig::MIN_FUNDING_INTERVAL_HOURS) &&
-                            (!TradingConfig::REQUIRE_POSITIVE_FUNDING || funding_rates[i] >= 0.0);
+        info.entry_signal = entry_premiums[i] <= TradingConfig::ENTRY_PREMIUM_THRESHOLD;
         info.exit_signal = exit_premiums[i] >= TradingConfig::EXIT_PREMIUM_THRESHOLD;
         result.push_back(info);
     }

@@ -17,6 +17,8 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <filesystem>
+#include <cstdlib>
 
 namespace kimp::network {
 
@@ -109,7 +111,7 @@ public:
         , name_(std::move(name)) {
 
         // Configure SSL context
-        ssl_context_.set_default_verify_paths();
+        configure_verify_paths();
         ssl_context_.set_verify_mode(ssl::verify_peer);
     }
 
@@ -145,6 +147,12 @@ public:
     void disable_reconnect() { should_reconnect_ = false; }
 
 private:
+    static bool file_exists(const char* path) {
+        return path && *path && std::filesystem::exists(path);
+    }
+
+    void configure_verify_paths();
+
     // Parse URL into host, port, path
     bool parse_url(const std::string& url);
 

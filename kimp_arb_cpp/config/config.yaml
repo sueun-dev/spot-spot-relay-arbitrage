@@ -29,7 +29,7 @@ exchanges:
 
   bybit:
     enabled: true
-    ws_endpoint: "wss://stream.bybit.com/v5/public/linear"
+    ws_endpoint: "wss://stream.bybit.com/v5/public/spot"
     ws_private_endpoint: "wss://stream.bybit.com/v5/private"
     ws_trade_endpoint: "wss://stream.bybit.com/v5/trade"
     rest_endpoint: "https://api.bybit.com"

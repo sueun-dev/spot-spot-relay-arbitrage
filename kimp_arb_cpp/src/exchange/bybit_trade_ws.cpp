@@ -72,7 +72,7 @@ void BybitTradeWS::authenticate() {
 }
 
 Order BybitTradeWS::place_order_sync(const std::string& symbol, Side side, double qty,
-                                      bool reduce_only, int position_idx) {
+                                      bool is_leverage) {
     Order order;
     order.exchange = Exchange::Bybit;
     order.side = side;
@@ -102,17 +102,16 @@ Order BybitTradeWS::place_order_sync(const std::string& symbol, Side side, doubl
     ss << R"("header":{"X-BAPI-TIMESTAMP":")" << utils::Crypto::timestamp_ms() << R"("},)";
     ss << R"("op":"order.create",)";
     ss << R"("args":[{)";
-    ss << R"("category":"linear",)";
+    ss << R"("category":"spot",)";
     ss << R"("symbol":")" << symbol << R"(",)";
     ss << R"("side":")" << (side == Side::Buy ? "Buy" : "Sell") << R"(",)";
     ss << R"("orderType":"Market",)";
     ss << R"("qty":")" << std::fixed << std::setprecision(8) << qty << R"(",)";
-    if (reduce_only) {
-        ss << R"("reduceOnly":true,)";
+    if (is_leverage) {
+        ss << R"("isLeverage":1,)";
     }
-    if (position_idx > 0) {
-        ss << R"("positionIdx":)" << position_idx << R"(,)";
-    }
+    ss << R"("orderFilter":"Order",)";
+    ss << R"("marketUnit":"baseCoin",)";
     ss << R"("timeInForce":"GTC")";
     ss << R"(}]})";
 

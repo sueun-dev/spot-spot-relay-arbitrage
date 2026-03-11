@@ -3,9 +3,8 @@
  *
  * 검증 항목:
  * 1. 전체 코인 스캔 → 가장 낮은 프리미엄(역프 최대) 1개 선택
- * 2. 펀딩 간격 8시간 미만 필터링
- * 3. 펀딩비 음수 필터링
- * 4. 프리미엄 -0.75% 초과 필터링
+ * 2. 펀딩 간격/펀딩비와 무관하게 가격 기준만으로 선별
+ * 3. 프리미엄 임계값 초과 필터링
  *
  * 가격 기준 (현실적 데이터):
  * - 빗썸 USDT/KRW: 1,450원
@@ -134,22 +133,22 @@ void test_selects_lowest_premium() {
 }
 
 // ============================================================
-// TEST 2: 펀딩 간격 8시간 미만 필터링
+// TEST 2: 펀딩 간격과 무관하게 가격 기준만으로 선별
 // ============================================================
 void test_filters_short_funding_interval() {
-    std::cout << "TEST 2: 펀딩 간격 8h 미만 필터링... ";
+    std::cout << "TEST 2: 펀딩 간격 무시, 가격 기준 선별... ";
 
     TestHarness h;
     h.add_coin("BTC");
     h.add_coin("ETH");
     h.set_usdt_rate(USDT_KRW);
 
-    // BTC: 4시간 펀딩 → 필터링 (프리미엄 더 낮아도)
+    // BTC: 4시간 funding 이지만 더 낮은 프리미엄 → 선택되어야 함
     // ask=138,000,000  bid=97,000 → foreign_krw=140,650,000 → premium=-1.88%
     h.set_korean_price("BTC", 137900000, 138000000);
     h.set_foreign_price("BTC", 97000, 97050, 0.0001, 4);  // 4h!
 
-    // ETH: 8시간 펀딩 → 통과
+    // ETH: premium 덜 좋음
     // ask=3,920,000  bid=2,750 → foreign_krw=3,987,500 → premium=-1.69%
     h.set_korean_price("ETH", 3910000, 3920000);
     h.set_foreign_price("ETH", 2750, 2755, 0.0001, 8);
@@ -157,45 +156,45 @@ void test_filters_short_funding_interval() {
     h.trigger_check();
 
     assert(h.captured_signal.has_value());
-    assert(h.captured_signal->symbol.get_base() == "ETH");
+    assert(h.captured_signal->symbol.get_base() == "BTC");
 
-    std::cout << "PASS (BTC 4h 필터링, ETH 8h 통과, premium="
+    std::cout << "PASS (BTC 4h funding 무시, 가격 기준 선택, premium="
               << h.captured_signal->premium << "%)" << std::endl;
 }
 
 // ============================================================
-// TEST 3: 펀딩비 음수 필터링
+// TEST 3: 펀딩비와 무관하게 가격 기준만으로 선별
 // ============================================================
 void test_filters_negative_funding() {
-    std::cout << "TEST 3: 펀딩비 음수 필터링... ";
+    std::cout << "TEST 3: 펀딩비 무시, 가격 기준 선별... ";
 
     TestHarness h;
     h.add_coin("BTC");
     h.add_coin("ETH");
     h.set_usdt_rate(USDT_KRW);
 
-    // BTC: 음수 펀딩비 → 필터링 (프리미엄 더 낮아도)
+    // BTC: 음수 funding 이지만 더 낮은 프리미엄 → 선택되어야 함
     h.set_korean_price("BTC", 137900000, 138000000);
     h.set_foreign_price("BTC", 97000, 97050, -0.0005, 8);  // 음수!
 
-    // ETH: 양수 펀딩비 → 통과
+    // ETH: premium 덜 좋음
     h.set_korean_price("ETH", 3920000, 3930000);
     h.set_foreign_price("ETH", 2750, 2755, 0.0001, 8);
 
     h.trigger_check();
 
     assert(h.captured_signal.has_value());
-    assert(h.captured_signal->symbol.get_base() == "ETH");
+    assert(h.captured_signal->symbol.get_base() == "BTC");
 
-    std::cout << "PASS (BTC 음수 펀딩 필터링, ETH 양수 통과, premium="
+    std::cout << "PASS (BTC 음수 funding 무시, 가격 기준 선택, premium="
               << h.captured_signal->premium << "%)" << std::endl;
 }
 
 // ============================================================
-// TEST 4: 프리미엄 -0.75% 초과 → 진입 안함
+// TEST 4: 프리미엄 임계값 초과 → 진입 안함
 // ============================================================
 void test_filters_premium_above_threshold() {
-    std::cout << "TEST 4: 프리미엄 -0.75% 초과 → 진입 불가... ";
+    std::cout << "TEST 4: 프리미엄 임계값 초과 → 진입 불가... ";
 
     TestHarness h;
     h.add_coin("BTC");
@@ -217,14 +216,14 @@ void test_filters_premium_above_threshold() {
     double btc_prem = h.calc_premium(140500000, 97000, USDT_KRW);
     double eth_prem = h.calc_premium(3975000, 2750, USDT_KRW);
     std::cout << "PASS (BTC=" << btc_prem << "%, ETH=" << eth_prem
-              << "%, 모두 > -0.75% → 시그널 없음)" << std::endl;
+              << "%, 모두 threshold 초과 → 시그널 없음)" << std::endl;
 }
 
 // ============================================================
-// TEST 5: 모든 필터 종합 → 조건 만족하는 것 중 best 선택
+// TEST 5: 가격/threshold 기준으로 best 선택
 // ============================================================
 void test_combined_filters_select_best() {
-    std::cout << "TEST 5: 종합 필터 → 조건 만족하는 것 중 best... ";
+    std::cout << "TEST 5: 가격/threshold 기준 best 선택... ";
 
     TestHarness h;
     h.add_coin("BTC");
@@ -234,16 +233,16 @@ void test_combined_filters_select_best() {
     h.add_coin("DOGE");
     h.set_usdt_rate(USDT_KRW);
 
-    // BTC: premium=-1.88% but 4h 펀딩 → 필터링
+    // BTC: premium=-1.88%, funding 값은 참고용
     h.set_korean_price("BTC", 137900000, 138000000);
     h.set_foreign_price("BTC", 97000, 97050, 0.0001, 4);
 
-    // ETH: premium=-1.44%, 8h, 양수 → 통과  ← 필터 통과 중 가장 낮음
+    // ETH: premium=-1.44%
     // ask=3,930,000  bid=2,750 → foreign_krw=3,987,500 → premium=-1.44%
     h.set_korean_price("ETH", 3920000, 3930000);
     h.set_foreign_price("ETH", 2750, 2755, 0.0002, 8);
 
-    // XRP: premium=-2.85%, 8h, 음수 펀딩 → 필터링
+    // XRP: premium=-2.85%, funding 음수여도 가격 기준으로는 가장 좋음
     h.set_korean_price("XRP", 3540, 3550);
     h.set_foreign_price("XRP", 2.52, 2.525, -0.0001, 8);
 
@@ -260,10 +259,10 @@ void test_combined_filters_select_best() {
     h.trigger_check();
 
     assert(h.captured_signal.has_value());
-    assert(h.captured_signal->symbol.get_base() == "ETH");
+    assert(h.captured_signal->symbol.get_base() == "XRP");
 
-    std::cout << "PASS (ETH 선택 premium=" << h.captured_signal->premium
-              << "%, BTC:4h, XRP:음수펀딩, DOGE:threshold, SOL:프리미엄높음)" << std::endl;
+    std::cout << "PASS (XRP 선택 premium=" << h.captured_signal->premium
+              << "%, funding 값 무시, DOGE:threshold, SOL:프리미엄높음)" << std::endl;
 }
 
 // ============================================================

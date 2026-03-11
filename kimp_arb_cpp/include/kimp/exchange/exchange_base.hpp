@@ -148,7 +148,7 @@ public:
     virtual Order place_market_buy_cost(const SymbolId& symbol, Price cost) = 0;  // For Korean exchanges
     virtual bool cancel_order(uint64_t order_id) = 0;
 
-    // Futures specific
+    // Short-selling specific
     virtual bool set_leverage(const SymbolId& symbol, int leverage) = 0;
     virtual std::vector<Position> get_positions() = 0;
     virtual bool close_position(const SymbolId& symbol) = 0;
@@ -351,8 +351,8 @@ public:
 };
 
 /**
- * Foreign futures exchange base (Bybit, Gate.io)
- * Specialized for USDT perpetual futures
+ * Foreign short-selling exchange base.
+ * Legacy name is kept to avoid a repo-wide rename.
  */
 class ForeignFuturesExchangeBase : public ExchangeBase {
 protected:
@@ -361,9 +361,9 @@ protected:
 public:
     using ExchangeBase::ExchangeBase;
 
-    MarketType get_market_type() const override { return MarketType::Perpetual; }
+    MarketType get_market_type() const override { return market_type_; }
 
-    // Futures-specific
+    // Short-selling-specific
     bool set_leverage(const SymbolId& symbol, int leverage) override = 0;
     std::vector<Position> get_positions() override = 0;
     bool close_position(const SymbolId& symbol) override = 0;
