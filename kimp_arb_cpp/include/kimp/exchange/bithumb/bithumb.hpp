@@ -5,6 +5,7 @@
 
 #include <simdjson.h>
 #include <map>
+#include <condition_variable>
 
 namespace kimp::exchange::bithumb {
 
@@ -23,6 +24,16 @@ private:
     simdjson::padded_string json_buffer_{4096};
 
     std::atomic<double> usdt_krw_price_{0.0};
+    std::shared_ptr<network::WebSocketClient> private_ws_;
+    std::atomic<bool> private_ws_authenticated_{false};
+
+    struct FillInfo {
+        double avg_price{0.0};
+        double filled_qty{0.0};
+    };
+    std::mutex fill_cache_mutex_;
+    std::condition_variable fill_cache_cv_;
+    std::unordered_map<std::string, FillInfo> fill_cache_;
 
     // Store subscribed symbols for reconnection
     std::vector<SymbolId> subscribed_tickers_;
@@ -82,6 +93,7 @@ protected:
     void on_ws_message(std::string_view message) override;
     void on_ws_connected() override;
     void on_ws_disconnected() override;
+    void on_private_ws_message(std::string_view message);
 
 private:
     std::string generate_signature(const std::string& endpoint,
@@ -100,11 +112,14 @@ private:
     bool query_order_detail_legacy(const std::string& order_id,
                                    const SymbolId& symbol,
                                    Order& order);
+    bool query_order_detail_ws(const std::string& order_id, Order& order);
 
     std::optional<Ticker> make_bbo_ticker(const std::string& symbol_key);
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
     std::vector<std::string> parse_orderbookdepth_message(std::string_view message);
     void update_bbo(const std::string& symbol_key);
+    std::string resolve_private_ws_endpoint() const;
+    void subscribe_private_myorder();
 
 public:
     void fetch_all_orderbook_snapshots(const std::vector<SymbolId>& symbols);

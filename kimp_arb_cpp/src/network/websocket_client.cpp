@@ -189,6 +189,14 @@ void WebSocketClient::on_ssl_handshake(beast::error_code ec) {
     ws_->set_option(websocket::stream_base::decorator([this](websocket::request_type& req) {
         req.set(beast::http::field::user_agent, "KIMP-Bot/1.0");
         req.set(beast::http::field::host, host_);
+        if (handshake_headers_callback_) {
+            for (const auto& [key, value] : handshake_headers_callback_()) {
+                req.set(key, value);
+            }
+        }
+        for (const auto& [key, value] : handshake_headers_) {
+            req.set(key, value);
+        }
     }));
 
     // WebSocket handshake

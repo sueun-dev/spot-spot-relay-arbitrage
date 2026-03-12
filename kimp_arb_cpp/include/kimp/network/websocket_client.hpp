@@ -19,6 +19,7 @@
 #include <mutex>
 #include <filesystem>
 #include <cstdlib>
+#include <unordered_map>
 
 namespace kimp::network {
 
@@ -48,6 +49,7 @@ using MessageCallback = std::function<void(std::string_view message, MessageType
 using ConnectCallback = std::function<void(bool success, const std::string& error)>;
 using DisconnectCallback = std::function<void(const std::string& reason)>;
 using ErrorCallback = std::function<void(const std::string& error)>;
+using HandshakeHeadersCallback = std::function<std::unordered_map<std::string, std::string>()>;
 
 /**
  * High-performance WebSocket client using Boost.Beast
@@ -77,6 +79,8 @@ private:
     std::string port_;
     std::string path_;
     std::string name_;  // For logging
+    std::unordered_map<std::string, std::string> handshake_headers_;
+    HandshakeHeadersCallback handshake_headers_callback_;
 
     // State - cache-line aligned to prevent false sharing
     alignas(64) std::atomic<ConnectionState> state_{ConnectionState::Disconnected};
@@ -133,6 +137,13 @@ public:
     void connect(const std::string& url);
     void disconnect();
     void reconnect();
+    void set_handshake_headers(std::unordered_map<std::string, std::string> headers) {
+        handshake_headers_ = std::move(headers);
+    }
+    void clear_handshake_headers() { handshake_headers_.clear(); }
+    void set_handshake_headers_callback(HandshakeHeadersCallback cb) {
+        handshake_headers_callback_ = std::move(cb);
+    }
 
     // Send message
     void send(std::string message);

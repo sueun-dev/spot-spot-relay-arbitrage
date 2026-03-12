@@ -203,10 +203,53 @@ bool BithumbExchange::connect() {
     });
 
     ws_client_->connect(credentials_.ws_endpoint);
+
+    const std::string private_ws_endpoint = resolve_private_ws_endpoint();
+    if (!private_ws_endpoint.empty() &&
+        !credentials_.api_key.empty() &&
+        !credentials_.secret_key.empty()) {
+        private_ws_ = std::make_shared<network::WebSocketClient>(io_context_, "Bithumb-Private-WS");
+        private_ws_->set_handshake_headers_callback([this]() {
+            return build_v1_auth_headers();
+        });
+
+        private_ws_->set_message_callback([this](std::string_view msg, network::MessageType) {
+            on_private_ws_message(msg);
+        });
+
+        private_ws_->set_connect_callback([this](bool success, const std::string& error) {
+            if (success) {
+                private_ws_authenticated_ = true;
+                Logger::info("[Bithumb-PrivateWS] Connected, subscribing to myOrder");
+                subscribe_private_myorder();
+            } else {
+                Logger::error("[Bithumb-PrivateWS] Connection failed: {}", error);
+            }
+        });
+
+        private_ws_->set_disconnect_callback([this](const std::string& reason) {
+            private_ws_authenticated_ = false;
+            Logger::warn("[Bithumb-PrivateWS] Disconnected: {}", reason);
+        });
+
+        private_ws_->connect(private_ws_endpoint);
+    } else {
+        Logger::info("[Bithumb-PrivateWS] Disabled (missing private endpoint or API credentials)");
+    }
+
     return true;
 }
 
 void BithumbExchange::disconnect() {
+    if (private_ws_) {
+        private_ws_->disconnect();
+        private_ws_authenticated_ = false;
+    }
+    {
+        std::lock_guard lock(fill_cache_mutex_);
+        fill_cache_.clear();
+    }
+
     // Shutdown REST connection pool
     shutdown_rest();
 
@@ -784,6 +827,99 @@ void BithumbExchange::on_ws_disconnected() {
     Logger::warn("[Bithumb] WebSocket disconnected");
 }
 
+void BithumbExchange::on_private_ws_message(std::string_view message) {
+    if (message.find("myOrder") == std::string_view::npos) {
+        return;
+    }
+
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(message);
+        auto doc = local_parser.iterate(padded);
+        simdjson::ondemand::object obj = doc.get_object();
+
+        auto parse_number = [](simdjson::ondemand::value value) -> double {
+            auto string_value = value.get_string();
+            if (!string_value.error()) {
+                return opt::fast_stod(string_value.value());
+            }
+            auto double_value = value.get_double();
+            if (!double_value.error()) {
+                return double_value.value();
+            }
+            auto int_value = value.get_int64();
+            if (!int_value.error()) {
+                return static_cast<double>(int_value.value());
+            }
+            auto uint_value = value.get_uint64();
+            if (!uint_value.error()) {
+                return static_cast<double>(uint_value.value());
+            }
+            return 0.0;
+        };
+
+        std::string type;
+        std::string order_id;
+        std::string state;
+        double executed_volume = 0.0;
+        double executed_funds = 0.0;
+
+        for (auto field : obj) {
+            std::string_view key = field.unescaped_key().value();
+            simdjson::ondemand::value value = field.value();
+
+            if (key == "ty" || key == "type") {
+                auto string_value = value.get_string();
+                if (!string_value.error()) {
+                    type = std::string(string_value.value());
+                }
+            } else if (key == "uid" || key == "uuid") {
+                auto string_value = value.get_string();
+                if (!string_value.error()) {
+                    order_id = std::string(string_value.value());
+                }
+            } else if (key == "s" || key == "state") {
+                auto string_value = value.get_string();
+                if (!string_value.error()) {
+                    state = std::string(string_value.value());
+                }
+            } else if (key == "ev" || key == "executed_volume") {
+                executed_volume = parse_number(value);
+            } else if (key == "ef" || key == "executed_funds") {
+                executed_funds = parse_number(value);
+            }
+        }
+
+        if (type != "myOrder") {
+            return;
+        }
+
+        if (order_id.empty() || state.empty()) {
+            return;
+        }
+
+        if (executed_volume <= 0.0 || executed_funds <= 0.0) {
+            return;
+        }
+
+        if (state != "trade" && state != "done" && state != "cancel") {
+            return;
+        }
+
+        FillInfo fill;
+        fill.filled_qty = executed_volume;
+        fill.avg_price = executed_funds / executed_volume;
+
+        {
+            std::lock_guard lock(fill_cache_mutex_);
+            fill_cache_[order_id] = fill;
+        }
+        fill_cache_cv_.notify_all();
+    } catch (const simdjson::simdjson_error&) {
+        // Ignore non-fill/private control messages
+    }
+}
+
 std::string BithumbExchange::generate_signature(const std::string& endpoint,
                                                   const std::string& params,
                                                   int64_t timestamp) const {
@@ -838,6 +974,23 @@ std::unordered_map<std::string, std::string> BithumbExchange::build_v1_auth_head
         {"Authorization", "Bearer " + generate_v1_jwt_token_with_query(query_string)},
         {"accept", "application/json"}
     };
+}
+
+std::string BithumbExchange::resolve_private_ws_endpoint() const {
+    if (!credentials_.ws_private_endpoint.empty()) {
+        return credentials_.ws_private_endpoint;
+    }
+    return "wss://ws-api.bithumb.com/websocket/v1/private";
+}
+
+void BithumbExchange::subscribe_private_myorder() {
+    if (!private_ws_ || !private_ws_->is_connected()) {
+        Logger::warn("[Bithumb-PrivateWS] Cannot subscribe to myOrder, not connected");
+        return;
+    }
+
+    private_ws_->send(std::string(
+        R"([{"ticket":"kimp-bithumb-private"},{"type":"myOrder","codes":[]},{"format":"SIMPLE"}])"));
 }
 
 bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
@@ -1056,6 +1209,45 @@ void BithumbExchange::update_bbo(const std::string& symbol_key) {
     }
 }
 
+bool BithumbExchange::query_order_detail_ws(const std::string& order_id, Order& order) {
+    std::unique_lock lock(fill_cache_mutex_);
+
+    auto apply_fill = [&](auto it) {
+        order.average_price = it->second.avg_price;
+        order.filled_quantity = it->second.filled_qty;
+        fill_cache_.erase(it);
+    };
+
+    auto it = fill_cache_.find(order_id);
+    if (it != fill_cache_.end()) {
+        apply_fill(it);
+        Logger::info("[Bithumb-WS] Fill: orderId={}, avgPrice={:.2f}, filledQty={:.8f}",
+                     order_id, order.average_price, order.filled_quantity);
+        return true;
+    }
+
+    if (!private_ws_authenticated_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    bool found = fill_cache_cv_.wait_for(lock, std::chrono::milliseconds(250), [&]() {
+        return fill_cache_.find(order_id) != fill_cache_.end();
+    });
+    if (!found) {
+        return false;
+    }
+
+    it = fill_cache_.find(order_id);
+    if (it == fill_cache_.end()) {
+        return false;
+    }
+
+    apply_fill(it);
+    Logger::info("[Bithumb-WS] Fill (waited): orderId={}, avgPrice={:.2f}, filledQty={:.8f}",
+                 order_id, order.average_price, order.filled_quantity);
+    return true;
+}
+
 bool BithumbExchange::query_order_detail_v1(const std::string& order_id, Order& order) {
     const std::string query = "uuid=" + utils::Crypto::url_encode(order_id);
     auto headers = build_v1_auth_headers(query);
@@ -1193,6 +1385,10 @@ bool BithumbExchange::query_order_detail_legacy(const std::string& order_id,
 }
 
 bool BithumbExchange::query_order_detail(const std::string& order_id, const SymbolId& symbol, Order& order) {
+    if (query_order_detail_ws(order_id, order)) {
+        return true;
+    }
+
     static constexpr std::array<int, 7> v1_fast_delays_ms{0, 15, 25, 40, 60, 90, 140};
 
     for (std::size_t attempt = 0; attempt < v1_fast_delays_ms.size(); ++attempt) {

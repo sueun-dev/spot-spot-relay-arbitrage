@@ -157,6 +157,10 @@ target_link_libraries(kimp_test_bybit_orderbook_ws PRIVATE kimp_lib)
 add_executable(kimp_test_bithumb_ws tests/test_bithumb_ws.cpp)
 target_link_libraries(kimp_test_bithumb_ws PRIVATE kimp_lib)
 
+# Regression: Bithumb private myOrder WS payloads must populate fill cache before REST fallback
+add_executable(kimp_test_bithumb_private_ws tests/test_bithumb_private_ws.cpp)
+target_link_libraries(kimp_test_bithumb_private_ws PRIVATE kimp_lib)
+
 # Section 1 test: Process startup & config loading
 add_executable(kimp_test_init_s1 tests/test_init_section1.cpp)
 target_link_libraries(kimp_test_init_s1 PRIVATE kimp_lib)

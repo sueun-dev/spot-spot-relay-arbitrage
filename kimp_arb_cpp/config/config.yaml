@@ -22,6 +22,7 @@ exchanges:
   bithumb:
     enabled: true
     ws_endpoint: "wss://pubwss.bithumb.com/pub/ws"
+    ws_private_endpoint: "wss://ws-api.bithumb.com/websocket/v1/private"
     rest_endpoint: "https://api.bithumb.com"
     api_key: "${BITHUMB_API_KEY}"
     secret_key: "${BITHUMB_SECRET_KEY}"
