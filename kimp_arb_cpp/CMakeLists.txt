@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(kimp_arb_cpp VERSION 1.0.0 LANGUAGES CXX)
 
+include(CheckIPOSupported)
+
 # C++20 required
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,6 +21,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
     set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
     set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -mtune=native")
+endif()
+
+check_ipo_supported(RESULT KIMP_IPO_SUPPORTED OUTPUT KIMP_IPO_ERROR)
+if(KIMP_IPO_SUPPORTED)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+else()
+    message(STATUS "IPO/LTO disabled: ${KIMP_IPO_ERROR}")
 endif()
 
 # macOS/Homebrew paths
@@ -143,6 +152,10 @@ target_link_libraries(kimp_test_fill PRIVATE kimp_lib)
 # Regression: Bybit orderbook WS payload must parse into callback-ready BBO ticker
 add_executable(kimp_test_bybit_orderbook_ws tests/test_bybit_orderbook_ws.cpp)
 target_link_libraries(kimp_test_bybit_orderbook_ws PRIVATE kimp_lib)
+
+# Regression: Bithumb ticker/orderbook WS fast paths must update callback-ready BBO ticker
+add_executable(kimp_test_bithumb_ws tests/test_bithumb_ws.cpp)
+target_link_libraries(kimp_test_bithumb_ws PRIVATE kimp_lib)
 
 # Section 1 test: Process startup & config loading
 add_executable(kimp_test_init_s1 tests/test_init_section1.cpp)

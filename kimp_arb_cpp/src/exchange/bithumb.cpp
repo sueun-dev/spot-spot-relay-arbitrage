@@ -9,6 +9,127 @@
 
 namespace {
 
+struct FastBithumbDepthUpdate {
+    std::string symbol;
+    bool is_bid;
+    double price;
+    double quantity;
+};
+
+bool extract_quoted_value(std::string_view source,
+                          std::string_view marker,
+                          size_t search_from,
+                          std::string_view& out_value,
+                          size_t& out_end) {
+    const size_t value_start = source.find(marker, search_from);
+    if (value_start == std::string_view::npos) {
+        return false;
+    }
+
+    const size_t content_start = value_start + marker.size();
+    const size_t content_end = source.find('"', content_start);
+    if (content_end == std::string_view::npos) {
+        return false;
+    }
+
+    out_value = source.substr(content_start, content_end - content_start);
+    out_end = content_end;
+    return true;
+}
+
+bool parse_ticker_fast(std::string_view message, kimp::Ticker& ticker) {
+    static constexpr std::string_view type_marker = R"("type":"ticker")";
+    static constexpr std::string_view symbol_marker = R"("symbol":")";
+    static constexpr std::string_view close_marker = R"("closePrice":")";
+
+    if (message.find(type_marker) == std::string_view::npos) {
+        return false;
+    }
+
+    std::string_view symbol_sv;
+    size_t symbol_end = 0;
+    if (!extract_quoted_value(message, symbol_marker, 0, symbol_sv, symbol_end)) {
+        return false;
+    }
+
+    std::string_view close_sv;
+    size_t close_end = 0;
+    if (!extract_quoted_value(message, close_marker, symbol_end, close_sv, close_end)) {
+        return false;
+    }
+
+    const size_t sep = symbol_sv.find('_');
+    if (sep == std::string_view::npos) {
+        return false;
+    }
+
+    ticker.exchange = kimp::Exchange::Bithumb;
+    ticker.timestamp = std::chrono::steady_clock::now();
+    ticker.symbol.set_base(symbol_sv.substr(0, sep));
+    ticker.symbol.set_quote(symbol_sv.substr(sep + 1));
+    ticker.last = kimp::opt::fast_stod(close_sv);
+    ticker.bid = 0.0;
+    ticker.ask = 0.0;
+    return ticker.last > 0.0;
+}
+
+bool parse_orderbookdepth_fast(std::string_view message,
+                               std::vector<FastBithumbDepthUpdate>& updates) {
+    static constexpr std::string_view type_marker = R"("type":"orderbookdepth")";
+    static constexpr std::string_view list_marker = R"("list":[)";
+    static constexpr std::string_view symbol_marker = R"("symbol":")";
+    static constexpr std::string_view order_type_marker = R"("orderType":")";
+    static constexpr std::string_view price_marker = R"("price":")";
+    static constexpr std::string_view quantity_marker = R"("quantity":")";
+
+    if (message.find(type_marker) == std::string_view::npos) {
+        return false;
+    }
+
+    size_t cursor = message.find(list_marker);
+    if (cursor == std::string_view::npos) {
+        return false;
+    }
+    cursor += list_marker.size();
+
+    while (true) {
+        std::string_view symbol_sv;
+        size_t symbol_end = 0;
+        if (!extract_quoted_value(message, symbol_marker, cursor, symbol_sv, symbol_end)) {
+            break;
+        }
+
+        std::string_view order_type_sv;
+        size_t order_type_end = 0;
+        if (!extract_quoted_value(message, order_type_marker, symbol_end, order_type_sv, order_type_end)) {
+            return false;
+        }
+
+        std::string_view price_sv;
+        size_t price_end = 0;
+        if (!extract_quoted_value(message, price_marker, order_type_end, price_sv, price_end)) {
+            return false;
+        }
+
+        std::string_view quantity_sv;
+        size_t quantity_end = 0;
+        if (!extract_quoted_value(message, quantity_marker, price_end, quantity_sv, quantity_end)) {
+            return false;
+        }
+
+        FastBithumbDepthUpdate update;
+        update.symbol = std::string(symbol_sv);
+        update.is_bid = (order_type_sv == "bid");
+        update.price = kimp::opt::fast_stod(price_sv);
+        update.quantity = kimp::opt::fast_stod(quantity_sv);
+        updates.push_back(std::move(update));
+
+        cursor = quantity_end;
+    }
+
+    return !updates.empty();
+}
+
 std::string base64url_encode(std::string_view raw) {
     auto encoded = kimp::utils::Crypto::base64_encode(
         reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
@@ -127,7 +248,7 @@ void BithumbExchange::subscribe_ticker(const std::vector<SymbolId>& symbols) {
         ws_client_->send(ss.str());
 
         if (end < symbols.size()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 
@@ -166,7 +287,7 @@ void BithumbExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) 
         ws_client_->send(ss.str());
 
         if (end < symbols.size()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 
@@ -720,6 +841,12 @@ std::unordered_map<std::string, std::string> BithumbExchange::build_v1_auth_head
 }
 
 bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
+    if (parse_ticker_fast(message, ticker)) {
+        std::lock_guard lock(orderbook_mutex_);
+        last_price_cache_[ticker.symbol.to_bithumb_format()] = ticker.last;
+        return true;
+    }
+
     try {
         // Use padded_string to satisfy simdjson's padding requirement
         // This fixes potential parsing issues with decimal prices
@@ -803,6 +930,49 @@ std::optional<Ticker> BithumbExchange::make_bbo_ticker(const std::string& symbol
 
 std::vector<std::string> BithumbExchange::parse_orderbookdepth_message(std::string_view message) {
     std::vector<std::string> updated_symbols;
+    std::vector<FastBithumbDepthUpdate> fast_updates;
+    if (parse_orderbookdepth_fast(message, fast_updates)) {
+        std::lock_guard lock(orderbook_mutex_);
+
+        std::string last_updated_symbol;
+        updated_symbols.reserve(fast_updates.size());
+
+        for (const auto& item : fast_updates) {
+            auto it = orderbook_state_.find(item.symbol);
+            if (it == orderbook_state_.end() || !it->second.initialized) continue;
+
+            auto& state = it->second;
+            if (item.is_bid) {
+                if (item.quantity <= 0.0) {
+                    state.bids.erase(item.price);
+                } else {
+                    state.bids[item.price] = item.quantity;
+                }
+            } else {
+                if (item.quantity <= 0.0) {
+                    state.asks.erase(item.price);
+                } else {
+                    state.asks[item.price] = item.quantity;
+                }
+            }
+
+            if (item.symbol != last_updated_symbol) {
+                if (!last_updated_symbol.empty()) {
+                    update_bbo(last_updated_symbol);
+                    updated_symbols.push_back(last_updated_symbol);
+                }
+                last_updated_symbol = item.symbol;
+            }
+        }
+
+        if (!last_updated_symbol.empty()) {
+            update_bbo(last_updated_symbol);
+            updated_symbols.push_back(last_updated_symbol);
+        }
+
+        return updated_symbols;
+    }
+
     try {
         simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(message);

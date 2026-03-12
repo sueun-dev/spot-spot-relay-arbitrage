@@ -241,7 +241,10 @@ void WebSocketClient::on_read(beast::error_code ec, std::size_t bytes_transferre
 
     // Process message
     if (on_message_) {
-        auto data = beast::buffers_to_string(read_buffer_.data());
+        const auto buffers = read_buffer_.data();
+        auto data = std::string_view(
+            net::buffer_cast<const char*>(buffers),
+            net::buffer_size(buffers));
         auto type = ws_->got_text() ? MessageType::Text : MessageType::Binary;
         on_message_(data, type);
     }

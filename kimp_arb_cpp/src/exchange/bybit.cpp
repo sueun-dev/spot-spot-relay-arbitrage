@@ -11,6 +11,94 @@
 
 namespace kimp::exchange::bybit {
 
+namespace {
+
+bool parse_quoted_double_pair(std::string_view message,
+                              std::string_view marker,
+                              double& first,
+                              double& second) {
+    const size_t start = message.find(marker);
+    if (start == std::string_view::npos) {
+        return false;
+    }
+
+    const size_t first_start = start + marker.size();
+    const size_t first_end = message.find('"', first_start);
+    if (first_end == std::string_view::npos) {
+        return false;
+    }
+
+    const size_t second_marker = message.find("\",\"", first_end);
+    if (second_marker == std::string_view::npos) {
+        return false;
+    }
+    const size_t second_start = second_marker + 3;
+    const size_t second_end = message.find('"', second_start);
+    if (second_end == std::string_view::npos) {
+        return false;
+    }
+
+    first = opt::fast_stod(message.substr(first_start, first_end - first_start));
+    second = opt::fast_stod(message.substr(second_start, second_end - second_start));
+    return true;
+}
+
+bool parse_orderbook_fast(std::string_view message, Ticker& ticker) {
+    static constexpr std::string_view topic_marker = R"("topic":"orderbook.1.)";
+    static constexpr std::string_view symbol_marker = R"("s":")";
+    static constexpr std::string_view bids_marker = R"("b":[[")";
+    static constexpr std::string_view asks_marker = R"("a":[[")";
+
+    const size_t topic_start = message.find(topic_marker);
+    if (topic_start == std::string_view::npos) {
+        return false;
+    }
+
+    const size_t symbol_start = topic_start + topic_marker.size();
+    const size_t symbol_end = message.find('"', symbol_start);
+    if (symbol_end == std::string_view::npos) {
+        return false;
+    }
+
+    std::string_view topic_symbol = message.substr(symbol_start, symbol_end - symbol_start);
+    if (topic_symbol.size() <= 4 || !topic_symbol.ends_with("USDT")) {
+        return false;
+    }
+
+    size_t data_symbol_start = message.find(symbol_marker, symbol_end);
+    if (data_symbol_start != std::string_view::npos) {
+        data_symbol_start += symbol_marker.size();
+        size_t data_symbol_end = message.find('"', data_symbol_start);
+        if (data_symbol_end == std::string_view::npos) {
+            return false;
+        }
+        const std::string_view data_symbol = message.substr(data_symbol_start, data_symbol_end - data_symbol_start);
+        if (data_symbol != topic_symbol) {
+            return false;
+        }
+    }
+
+    double bid = 0.0;
+    double bid_qty = 0.0;
+    double ask = 0.0;
+    double ask_qty = 0.0;
+    if (!parse_quoted_double_pair(message, bids_marker, bid, bid_qty) ||
+        !parse_quoted_double_pair(message, asks_marker, ask, ask_qty)) {
+        return false;
+    }
+
+    ticker.exchange = Exchange::Bybit;
+    ticker.timestamp = std::chrono::steady_clock::now();
+    ticker.symbol = SymbolId(std::string(topic_symbol.substr(0, topic_symbol.size() - 4)), "USDT");
+    ticker.bid = bid;
+    ticker.bid_qty = bid_qty;
+    ticker.ask = ask;
+    ticker.ask_qty = ask_qty;
+    return bid > 0.0 && ask > 0.0;
+}
+
+}  // namespace
+
 std::string BybitExchange::resolve_public_ws_endpoint() const {
     if (credentials_.ws_endpoint.empty()) {
         return "wss://stream.bybit.com/v5/public/spot";
@@ -140,9 +228,9 @@ void BybitExchange::subscribe_ticker(const std::vector<SymbolId>& symbols) {
         ss << "]}";
         ws_client_->send(ss.str());
 
-        // Small delay between batches to avoid rate limiting
+        // Tiny pacing keeps startup fast without overwhelming the socket.
         if (end < symbols.size()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 
@@ -178,7 +266,7 @@ void BybitExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) {
         ws_client_->send(ss.str());
 
         if (end < symbols.size()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 
@@ -746,6 +834,18 @@ bool BybitExchange::ensure_spot_margin_mode() {
 }
 
 bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
+    if (message.find(R"("topic":"orderbook.1.)") != std::string_view::npos) {
+        if (parse_orderbook_fast(message, ticker)) {
+            auto cached = get_cached_ticker(ticker.symbol);
+            if (cached && cached->last > 0.0) {
+                ticker.last = cached->last;
+            } else {
+                ticker.last = (ticker.bid + ticker.ask) * 0.5;
+            }
+            return true;
+        }
+    }
+
     try {
         simdjson::dom::parser local_parser;
         simdjson::padded_string padded(message);
