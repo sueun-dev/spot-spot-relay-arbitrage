@@ -406,6 +406,7 @@ int main(int argc, char* argv[]) {
     bool monitor_mode = true;
     bool monitor_only = false;
     bool scan_spot_relay = false;
+    std::optional<bool> dashboard_stream_override;
     int monitor_interval_sec = 2;
 
     for (int i = 1; i < argc; ++i) {
@@ -427,6 +428,10 @@ int main(int argc, char* argv[]) {
             scan_spot_relay = true;
             monitor_only = true;
             monitor_mode = false;
+        } else if (arg == "--dashboard-stream") {
+            dashboard_stream_override = true;
+        } else if (arg == "--no-dashboard-stream") {
+            dashboard_stream_override = false;
         } else if (arg == "--monitor-interval-sec") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --monitor-interval-sec requires a numeric argument\n";
@@ -445,6 +450,8 @@ int main(int argc, char* argv[]) {
                       << "  -m, --monitor        Enable full console monitor (default: ON)\n"
                       << "      --no-monitor     Disable console monitor\n"
                       << "      --monitor-only   Monitor only (no position prompts, no auto-trading)\n"
+                      << "      --dashboard-stream  Enable JSON exporter + local relay WS output\n"
+                      << "      --no-dashboard-stream  Disable JSON exporter + local relay WS output\n"
                       << "      --scan-spot-relay  Scan Bithumb↔Bybit spot-transfer candidates\n"
                       << "      --monitor-interval-sec <n>  Monitor refresh interval (default: 2)\n"
                       << "  -h, --help           Show this help\n";
@@ -463,6 +470,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     auto config = std::move(*config_opt);
+    const bool dashboard_stream_enabled =
+        dashboard_stream_override.value_or(monitor_only);
 
     std::error_code ec;
     std::filesystem::create_directories("logs", ec);
@@ -758,75 +767,83 @@ int main(int argc, char* argv[]) {
         spdlog::info("Monitor-only mode: skipping spot-margin setup and external position blacklist");
     }
 
-    // Start async JSON exporter FIRST (before any price loading or trading)
-    // 200ms interval for file-based updates (fallback)
-    engine.start_async_exporter("data/premiums.json", std::chrono::milliseconds(200));
-    spdlog::info("JSON exporter started (200ms interval)");
-
-    // =========================================================================
-    // WebSocket Broadcast Server for REAL-TIME dashboard updates (<10ms latency)
-    // =========================================================================
-    auto ws_server = std::make_shared<kimp::network::WsBroadcastServer>(io_context, 8765);
-    ws_server->start();
-
-    // =========================================================================
-    // DEDICATED BROADCAST THREAD - Exactly 50ms interval for perfect latency
-    // =========================================================================
-    std::atomic<bool> broadcast_running{true};
+    std::shared_ptr<kimp::network::WsBroadcastServer> ws_server;
+    std::atomic<bool> broadcast_running{false};
     std::atomic<int> broadcast_count{0};
-    std::thread broadcast_thread([&]() {
-        spdlog::info("[WS-Broadcast] Dedicated broadcast thread started (50ms interval)");
+    std::thread broadcast_thread;
 
-        while (broadcast_running && !g_shutdown) {
-            auto start = std::chrono::steady_clock::now();
+    if (dashboard_stream_enabled) {
+        // Start async JSON exporter FIRST (before any price loading or trading)
+        // 200ms interval for file-based updates (fallback)
+        engine.start_async_exporter("data/premiums.json", std::chrono::milliseconds(200));
+        spdlog::info("Dashboard stream enabled: JSON exporter started (200ms interval)");
 
-            auto conn_count = ws_server->connection_count();
-            // Only broadcast if clients connected
-            if (conn_count > 0) {
-                auto premiums = engine.get_all_premiums();
-                if (!premiums.empty()) {
-                    // Log every 100 broadcasts
-                    if (++broadcast_count % 100 == 1) {
-                        spdlog::info("[WS-Broadcast] Sending to {} clients, {} premiums", conn_count, premiums.size());
+        // =========================================================================
+        // WebSocket Broadcast Server for REAL-TIME dashboard updates (<10ms latency)
+        // =========================================================================
+        ws_server = std::make_shared<kimp::network::WsBroadcastServer>(io_context, 8765);
+        ws_server->start();
+
+        // =========================================================================
+        // DEDICATED BROADCAST THREAD - Exactly 50ms interval for perfect latency
+        // =========================================================================
+        broadcast_running = true;
+        broadcast_thread = std::thread([&]() {
+            spdlog::info("[WS-Broadcast] Dedicated broadcast thread started (50ms interval)");
+
+            while (broadcast_running && !g_shutdown) {
+                auto start = std::chrono::steady_clock::now();
+
+                auto conn_count = ws_server->connection_count();
+                // Only broadcast if clients connected
+                if (conn_count > 0) {
+                    auto premiums = engine.get_all_premiums();
+                    if (!premiums.empty()) {
+                        // Log every 100 broadcasts
+                        if (++broadcast_count % 100 == 1) {
+                            spdlog::info("[WS-Broadcast] Sending to {} clients, {} premiums", conn_count, premiums.size());
+                        }
+                        // Build JSON quickly using fmt
+                        std::string json;
+                        json.reserve(premiums.size() * 200 + 500);
+                        json = "{\"type\":\"premiums\",\"ts\":";
+                        json += std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count());
+                        json += ",\"data\":[";
+
+                        bool first = true;
+                        for (const auto& p : premiums) {
+                            if (!first) json += ",";
+                            first = false;
+                            json += fmt::format(
+                                "{{\"s\":\"{}/{}\",\"kb\":{:.2f},\"ka\":{:.2f},\"fb\":{:.8f},\"fa\":{:.8f},\"kp\":{:.2f},\"fp\":{:.8f},\"r\":{:.4f},\"ep\":{:.4f},\"xp\":{:.4f},\"sp\":{:.4f},\"pm\":{:.4f},\"sg\":{}}}",
+                                p.symbol.get_base(), p.symbol.get_quote(),
+                                p.korean_bid, p.korean_ask,
+                                p.foreign_bid, p.foreign_ask,
+                                p.korean_price, p.foreign_price, p.usdt_rate,
+                                p.entry_premium, p.exit_premium, p.premium_spread, p.premium,
+                                p.entry_signal ? "1" : (p.exit_signal ? "2" : "0")
+                            );
+                        }
+                        json += "]}";
+
+                        ws_server->broadcast(std::move(json));
                     }
-                    // Build JSON quickly using fmt
-                    std::string json;
-                    json.reserve(premiums.size() * 200 + 500);
-                    json = "{\"type\":\"premiums\",\"ts\":";
-                    json += std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count());
-                    json += ",\"data\":[";
+                }
 
-                    bool first = true;
-                    for (const auto& p : premiums) {
-                        if (!first) json += ",";
-                        first = false;
-                        json += fmt::format(
-                            "{{\"s\":\"{}/{}\",\"kb\":{:.2f},\"ka\":{:.2f},\"fb\":{:.8f},\"fa\":{:.8f},\"kp\":{:.2f},\"fp\":{:.8f},\"r\":{:.4f},\"ep\":{:.4f},\"xp\":{:.4f},\"sp\":{:.4f},\"pm\":{:.4f},\"sg\":{}}}",
-                            p.symbol.get_base(), p.symbol.get_quote(),
-                            p.korean_bid, p.korean_ask,
-                            p.foreign_bid, p.foreign_ask,
-                            p.korean_price, p.foreign_price, p.usdt_rate,
-                            p.entry_premium, p.exit_premium, p.premium_spread, p.premium,
-                            p.entry_signal ? "1" : (p.exit_signal ? "2" : "0")
-                        );
-                    }
-                    json += "]}";
-
-                    ws_server->broadcast(std::move(json));
+                // Sleep exactly 50ms (minus processing time for precision)
+                auto elapsed = std::chrono::steady_clock::now() - start;
+                auto sleep_time = std::chrono::milliseconds(50) - elapsed;
+                if (sleep_time > std::chrono::milliseconds(0)) {
+                    std::this_thread::sleep_for(sleep_time);
                 }
             }
 
-            // Sleep exactly 50ms (minus processing time for precision)
-            auto elapsed = std::chrono::steady_clock::now() - start;
-            auto sleep_time = std::chrono::milliseconds(50) - elapsed;
-            if (sleep_time > std::chrono::milliseconds(0)) {
-                std::this_thread::sleep_for(sleep_time);
-            }
-        }
-
-        spdlog::info("[WS-Broadcast] Broadcast thread stopped");
-    });
+            spdlog::info("[WS-Broadcast] Broadcast thread stopped");
+        });
+    } else {
+        spdlog::info("Dashboard stream disabled for this run: execution path stays isolated from JSON export/local WS broadcast");
+    }
 
     // =========================================================================
     // STEP 12: WebSocket Subscriptions (real-time streaming)
@@ -1348,7 +1365,9 @@ int main(int argc, char* argv[]) {
         broadcast_thread.join();
     }
 
-    ws_server->stop();  // Stop WebSocket server
+    if (ws_server) {
+        ws_server->stop();  // Stop WebSocket server
+    }
     order_manager.request_shutdown();  // Break adaptive loops before stopping engine
     lifecycle_executor.stop();
     engine.stop_async_exporter();
