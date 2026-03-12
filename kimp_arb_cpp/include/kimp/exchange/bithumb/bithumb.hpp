@@ -44,6 +44,8 @@ private:
     struct BBO {
         std::atomic<double> best_bid{0.0};
         std::atomic<double> best_ask{0.0};
+        std::atomic<double> best_bid_qty{0.0};
+        std::atomic<double> best_ask_qty{0.0};
     };
     std::unordered_map<std::string, BBO> orderbook_bbo_;
     std::atomic<bool> orderbook_ready_{false};
@@ -63,7 +65,6 @@ public:
     void subscribe_orderbook(const std::vector<SymbolId>& symbols) override;
 
     std::vector<SymbolId> get_available_symbols() override;
-    double get_funding_rate(const SymbolId& symbol) override { return 0.0; }
     std::vector<Ticker> fetch_all_tickers() override;
     double get_usdt_krw_price() override;
 

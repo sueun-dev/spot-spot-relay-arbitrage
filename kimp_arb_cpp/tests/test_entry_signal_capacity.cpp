@@ -13,8 +13,8 @@ kimp::Ticker make_ticker(kimp::Exchange ex,
                          double bid,
                          double ask,
                          double last,
-                         double funding_rate = 0.0001,
-                         int funding_interval_hours = 8) {
+                         double bid_qty = 100.0,
+                         double ask_qty = 100.0) {
     kimp::Ticker t;
     t.exchange = ex;
     t.symbol = symbol;
@@ -22,8 +22,8 @@ kimp::Ticker make_ticker(kimp::Exchange ex,
     t.bid = bid;
     t.ask = ask;
     t.last = last;
-    t.funding_rate = funding_rate;
-    t.funding_interval_hours = funding_interval_hours;
+    t.bid_qty = bid_qty;
+    t.ask_qty = ask_qty;
     return t;
 }
 
@@ -48,19 +48,19 @@ int main() {
 
     // Seed USDT/KRW.
     engine.on_ticker_update(make_ticker(
-        Exchange::Bithumb, SymbolId("USDT", "KRW"), 1000.0, 1000.2, 1000.1));
+        Exchange::Bithumb, SymbolId("USDT", "KRW"), 1000.0, 1000.2, 1000.1, 1000000.0, 1000000.0));
 
-    // Make all symbols qualify for entry (about -2% premium).
+    // Make all symbols qualify for relay entry with enough top-of-book quantity.
     for (const auto& base : bases) {
         engine.on_ticker_update(make_ticker(
-            Exchange::Bybit, SymbolId(base, "USDT"), 100.0, 100.1, 100.05, 0.0001, 8));
+            Exchange::Bybit, SymbolId(base, "USDT"), 100.0, 100.1, 100.05, 10.0, 10.0));
         engine.on_ticker_update(make_ticker(
-            Exchange::Bithumb, SymbolId(base, "KRW"), 97900.0, 98000.0, 97950.0));
+            Exchange::Bithumb, SymbolId(base, "KRW"), 99550.0, 99600.0, 99575.0, 10.0, 10.0));
     }
 
     // Trigger one more full pass after all quotes are populated.
     engine.on_ticker_update(make_ticker(
-        Exchange::Bithumb, SymbolId("USDT", "KRW"), 1000.0, 1000.2, 1000.1));
+        Exchange::Bithumb, SymbolId("USDT", "KRW"), 1000.0, 1000.2, 1000.1, 1000000.0, 1000000.0));
 
     int total_signals = 0;
     std::set<std::string> unique_symbols;
@@ -70,6 +70,7 @@ int main() {
     }
 
     const bool within_capacity =
+        !unique_symbols.empty() &&
         static_cast<int>(unique_symbols.size()) <= TradingConfig::MAX_POSITIONS;
 
     std::cout << "  MAX_POSITIONS=" << TradingConfig::MAX_POSITIONS << "\n";
@@ -86,4 +87,3 @@ int main() {
     std::cout << "*** FAIL: emitted signals exceed available position slots ***\n";
     return 1;
 }
-

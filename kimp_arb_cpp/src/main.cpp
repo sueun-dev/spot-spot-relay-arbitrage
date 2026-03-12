@@ -125,57 +125,6 @@ std::string format_time(const kimp::SystemTimestamp& ts) {
     return oss.str();
 }
 
-uint64_t next_funding_time_from_interval_utc(int interval_hours) {
-    if (interval_hours <= 0) {
-        return 0;
-    }
-    std::time_t now = std::time(nullptr);
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &now);
-#else
-    gmtime_r(&now, &tm);
-#endif
-    int seconds_since_midnight = tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
-    int interval_sec = interval_hours * 3600;
-    int next_sec = ((seconds_since_midnight / interval_sec) + 1) * interval_sec;
-    std::time_t base = now - seconds_since_midnight;
-    if (next_sec >= 24 * 3600) {
-        base += 24 * 3600;
-        next_sec -= 24 * 3600;
-    }
-    std::time_t next_time = base + next_sec;
-    return static_cast<uint64_t>(next_time) * 1000;
-}
-
-std::string format_remaining_ms(int interval_hours, uint64_t next_funding_time_ms) {
-    uint64_t target_ms = next_funding_time_ms;
-    if (interval_hours > 0) {
-        target_ms = next_funding_time_from_interval_utc(interval_hours);
-    }
-    if (target_ms == 0) {
-        return "--";
-    }
-    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    if (target_ms <= static_cast<uint64_t>(now_ms)) {
-        return "0m";
-    }
-    uint64_t diff_sec = (target_ms - static_cast<uint64_t>(now_ms)) / 1000;
-    uint64_t hours = diff_sec / 3600;
-    uint64_t mins = (diff_sec % 3600) / 60;
-    char buf[16];
-    if (hours > 0) {
-        std::snprintf(buf, sizeof(buf), "%lluh%02llum",
-                      static_cast<unsigned long long>(hours),
-                      static_cast<unsigned long long>(mins));
-    } else {
-        std::snprintf(buf, sizeof(buf), "%llum",
-                      static_cast<unsigned long long>(mins));
-    }
-    return std::string(buf);
-}
-
 void append_trade_log(const kimp::Position& pos,
                       double pnl_usd,
                       double usdt_rate,
@@ -598,7 +547,7 @@ int main(int argc, char* argv[]) {
             spdlog::debug("[LIFECYCLE] {} picked up by worker {} in {}us",
                           task.signal.symbol.to_string(), worker_index, pickup_us);
 
-            auto result = order_manager.execute_entry_futures_first(
+            auto result = order_manager.execute_spot_relay_entry(
                 task.signal, task.initial_position);
 
             spdlog::debug("[LIFECYCLE] {} worker {} finished",
@@ -697,7 +646,7 @@ int main(int argc, char* argv[]) {
             int core_id = -1;
             if (i == 0) core_id = thread_config.io_bithumb_core;
             else if (i == 1) core_id = thread_config.io_bybit_core;
-            else core_id = thread_config.io_gateio_core;  // Additional threads
+            else core_id = thread_config.io_bybit_core;
 
             if (core_id >= 0) {
                 if (kimp::opt::pin_to_core(core_id)) {
@@ -787,7 +736,7 @@ int main(int argc, char* argv[]) {
 
     if (!monitor_only) {
         // Prepare Bybit spot margin account once at startup (avoid first-trade setup latency)
-        if (!order_manager.prepare_foreign_shorting(common_symbols)) {
+        if (!order_manager.prepare_bybit_shorting(common_symbols)) {
             spdlog::error("Bybit spot margin setup failed");
             bithumb->disconnect();
             bybit->disconnect();
@@ -855,13 +804,12 @@ int main(int argc, char* argv[]) {
                         if (!first) json += ",";
                         first = false;
                         json += fmt::format(
-                            "{{\"s\":\"{}/{}\",\"kb\":{:.2f},\"ka\":{:.2f},\"fb\":{:.8f},\"fa\":{:.8f},\"kp\":{:.2f},\"fp\":{:.8f},\"r\":{:.4f},\"ep\":{:.4f},\"xp\":{:.4f},\"sp\":{:.4f},\"pm\":{:.4f},\"fr\":{:.8f},\"fi\":{},\"sg\":{}}}",
+                            "{{\"s\":\"{}/{}\",\"kb\":{:.2f},\"ka\":{:.2f},\"fb\":{:.8f},\"fa\":{:.8f},\"kp\":{:.2f},\"fp\":{:.8f},\"r\":{:.4f},\"ep\":{:.4f},\"xp\":{:.4f},\"sp\":{:.4f},\"pm\":{:.4f},\"sg\":{}}}",
                             p.symbol.get_base(), p.symbol.get_quote(),
                             p.korean_bid, p.korean_ask,
                             p.foreign_bid, p.foreign_ask,
                             p.korean_price, p.foreign_price, p.usdt_rate,
                             p.entry_premium, p.exit_premium, p.premium_spread, p.premium,
-                            p.funding_rate, p.funding_interval_hours,
                             p.entry_signal ? "1" : (p.exit_signal ? "2" : "0")
                         );
                     }
@@ -940,7 +888,19 @@ int main(int argc, char* argv[]) {
 
     // Fetch orderbook snapshots and subscribe to orderbookdepth for real bid/ask
     bithumb->fetch_all_orderbook_snapshots(bithumb_subs);
+    auto bithumb_bbo_seed = bithumb->fetch_all_tickers();
+    int bithumb_bbo_loaded = 0;
+    for (const auto& ticker : bithumb_bbo_seed) {
+        if (common_bases.count(std::string(ticker.symbol.get_base()))) {
+            engine.on_ticker_update(ticker);
+            ++bithumb_bbo_loaded;
+        }
+        if (ticker.symbol.get_base() == "USDT") {
+            engine.on_ticker_update(ticker);
+        }
+    }
     bithumb->subscribe_orderbook(bithumb_subs);
+    spdlog::info("Bithumb BBO seed loaded after snapshots: {}", bithumb_bbo_loaded);
 
     bybit->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
         engine.on_ticker_update(ticker);
@@ -994,14 +954,14 @@ int main(int argc, char* argv[]) {
                 }
                 if (common_bases.count(std::string(ticker.symbol.get_base()))) {
                     cache.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last,
-                                 snapshot_ms);
+                                 snapshot_ms, ticker.bid_qty, ticker.ask_qty);
                 }
             }
 
             for (const auto& ticker : bybit_tickers_refresh) {
                 if (common_bases.count(std::string(ticker.symbol.get_base()))) {
                     cache.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last,
-                                 snapshot_ms);
+                                 snapshot_ms, ticker.bid_qty, ticker.ask_qty);
                 }
             }
 
@@ -1054,7 +1014,7 @@ int main(int argc, char* argv[]) {
                 std::unordered_map<std::string, kimp::Position> bybit_short_by_coin;
 
                 // Query Bybit short positions once, then scan all candidates from that set.
-                auto bybit_positions = bybit->get_positions();
+                auto bybit_positions = bybit->get_short_positions();
                 for (const auto& p : bybit_positions) {
                     std::string coin = std::string(p.symbol.get_base());
                     if (coin.empty()) continue;
@@ -1297,14 +1257,18 @@ int main(int argc, char* argv[]) {
             spdlog::info("Press Ctrl+C to stop");
         } else {
             spdlog::info("=== Bot Running (Auto-Trading ENABLED) ===");
-            spdlog::info("Mode: SPLIT ORDERS (~33s) | Max positions: {}",
+            spdlog::info("Mode: relay gate (70 USDT, 1-tick only) | Max positions: {}",
                          kimp::TradingConfig::MAX_POSITIONS);
             spdlog::info("Capital: ${:.2f} | Position size: ${:.2f}/side (복리 성장)",
                          engine.get_current_capital(), engine.get_position_size_usd());
-            spdlog::info("Entry: premium <= {:.2f}% (>=4h funding, rate > 0)",
-                         kimp::TradingConfig::ENTRY_PREMIUM_THRESHOLD);
+            spdlog::info("Entry: positive net edge + both venues can fill {:.2f} USDT at top-of-book",
+                         kimp::TradingConfig::TARGET_ENTRY_USDT);
+            spdlog::info("Entry fee model: Bithumb {}x + Bybit {}x = {:.2f}%",
+                         kimp::TradingConfig::BITHUMB_FEE_EVENTS,
+                         kimp::TradingConfig::BYBIT_FEE_EVENTS,
+                         kimp::TradingConfig::ENTRY_TOTAL_FEE_PCT);
             spdlog::info("Exit: dynamic max(entry_pm + {:.2f}% fees + {:.2f}% profit, +{:.2f}% floor)",
-                         kimp::TradingConfig::ROUND_TRIP_FEE_PCT,
+                         kimp::TradingConfig::ENTRY_TOTAL_FEE_PCT,
                          kimp::TradingConfig::MIN_NET_PROFIT_PCT,
                          kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD);
             spdlog::info("Press Ctrl+C to stop");
@@ -1352,64 +1316,86 @@ int main(int argc, char* argv[]) {
                 auto premiums = engine.get_all_premiums();
                 if (!premiums.empty()) {
                     std::sort(premiums.begin(), premiums.end(),
-                        [](const auto& a, const auto& b) { return a.entry_premium < b.entry_premium; });
+                        [](const auto& a, const auto& b) { return a.net_edge_pct > b.net_edge_pct; });
 
                     if (live_monitor_guard.active()) {
                         live_monitor_guard.clear_frame();
                     } else {
                         std::cout << "\033[2J\033[H";
                     }
-                    std::cout << fmt::format("=== KIMP Full Monitor | {} symbols | USDT: {:.2f} KRW | every {}s ===\n",
-                        premiums.size(), premiums[0].usdt_rate, monitor_interval_sec);
-                    std::cout << "Columns: KR/Bybit bid-ask, entry/exit premium, spread\n";
-                    std::cout << fmt::format("{:<10} {:>11} {:>11} {:>12} {:>12} {:>9} {:>9} {:>8} {:>8} {:>4} {:>7} {:>4}\n",
-                        "Symbol", "KR_bid", "KR_ask", "BY_bid", "BY_ask", "Entry%", "Exit%", "Sprd%", "Fund%", "Int", "TTE", "Sig");
-                    std::cout << std::string(132, '-') << "\n";
+                    std::cout << fmt::format("=== Spot Relay Monitor | {} symbols | 환율: {:.2f} KRW/USDT | target: {:.2f} USDT | every {}s ===\n",
+                        premiums.size(), premiums[0].usdt_rate, kimp::TradingConfig::TARGET_ENTRY_USDT, monitor_interval_sec);
+                    std::cout << "Columns: 빗썸 ask/qty/총액, 바이비트 bid/qty, 매칭수량, gross/net, 수수료, 순손익, age/1틱\n";
+                    std::cout << fmt::format(
+                        "{:<10} {:>11} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>6}\n",
+                        "Symbol", "B_ask", "B_qty", "B_KRW", "By_bid", "By_qty", "MatchQty",
+                        "Gross%", "Net%", "BFeeKRW", "ByFeeU", "NetKRW", "Age/1Tick", "Sig");
+                    std::cout << std::string(180, '-') << "\n";
 
                     for (const auto& p : premiums) {
-                        std::string tte = format_remaining_ms(p.funding_interval_hours, p.next_funding_time);
+                        const char* one_tick = p.both_can_fill_target ? "YES" : "NO";
                         const char* sig = p.entry_signal ? "ENT" : (p.exit_signal ? "EXT" : "-");
-                        std::cout << fmt::format("{:<10} {:>11.2f} {:>11.2f} {:>12.6f} {:>12.6f} {:>8.4f}% {:>8.4f}% {:>7.4f}% {:>7.4f}% {:>3}h {:>7} {:>4}\n",
-                            p.symbol.get_base(), p.korean_bid, p.korean_ask,
-                            p.foreign_bid, p.foreign_ask,
-                            p.entry_premium, p.exit_premium, p.premium_spread,
-                            p.funding_rate * 100, p.funding_interval_hours, tte, sig);
+                        std::cout << fmt::format(
+                            "{:<10} {:>11.2f} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>11.2f} {:>12} {:>6}\n",
+                            p.symbol.get_base(),
+                            p.korean_ask, p.korean_ask_qty,
+                            p.bithumb_top_krw,
+                            p.foreign_bid, p.foreign_bid_qty,
+                            p.match_qty,
+                            p.gross_edge_pct, p.net_edge_pct,
+                            p.bithumb_total_fee_krw,
+                            p.bybit_total_fee_usdt,
+                            p.net_profit_krw,
+                            fmt::format("{}ms/{}", p.age_ms, one_tick),
+                            sig);
                     }
 
-                    std::cout << std::string(132, '-') << "\n";
+                    std::cout << std::string(180, '-') << "\n";
+
+                    auto positive_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
+                        return p.entry_signal;
+                    });
+                    const auto bithumb_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
+                        return p.korean_ask_qty > 0.0;
+                    });
+                    const auto bybit_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
+                        return p.foreign_bid_qty > 0.0;
+                    });
+                    const auto both_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
+                        return p.korean_ask_qty > 0.0 && p.foreign_bid_qty > 0.0;
+                    });
+                    std::cout << fmt::format(
+                        "ready: bithumb {}/{} | bybit {}/{} | both {}/{} | positive+1tick {} | fee model: 빗썸 {}회 + 바이비트 {}회\n",
+                        bithumb_ready, premiums.size(),
+                        bybit_ready, premiums.size(),
+                        both_ready, premiums.size(),
+                        positive_count,
+                        kimp::TradingConfig::BITHUMB_FEE_EVENTS,
+                        kimp::TradingConfig::BYBIT_FEE_EVENTS);
 
                     // ===== SELECTED (active positions) section =====
                     auto& pos_tracker = engine.get_position_tracker();
                     if (pos_tracker.get_position_count() > 0) {
-                        std::cout << "\n\033[1m=== Selected Positions ===\033[0m\n";
-                        std::cout << fmt::format("{:<10} {:>11} {:>11} {:>12} {:>12} {:>9} {:>9} {:>8} {:>8} {:>4} {:>7} {:>4}\n",
-                            "Symbol", "KR_bid", "KR_ask", "BY_bid", "BY_ask", "Entry%", "Exit%", "Sprd%", "Fund%", "Int", "TTE", "Sig");
-                        std::cout << std::string(132, '-') << "\n";
+                        std::cout << "\n\033[1m=== Active Positions ===\033[0m\n";
+                        std::cout << fmt::format("{:<10} {:>11} {:>12} {:>12} {:>12} {:>11} {:>11}\n",
+                            "Symbol", "EntryPM", "ExitPM", "Net%", "NetKRW", "HeldUSD", "Coins");
+                        std::cout << std::string(94, '-') << "\n";
 
-                        // Find position coins in premium data and display them
                         for (const auto& p : premiums) {
                             auto pos = pos_tracker.get_position(p.symbol);
                             if (!pos) continue;
 
-                            std::string tte2 = format_remaining_ms(p.funding_interval_hours, p.next_funding_time);
-                            const char* sig2 = p.entry_signal ? "ENT" : (p.exit_signal ? "EXT" : "-");
-                            std::cout << fmt::format("{:<10} {:>11.2f} {:>11.2f} {:>12.6f} {:>12.6f} {:>8.4f}% {:>8.4f}% {:>7.4f}% {:>7.4f}% {:>3}h {:>7} {:>4}\n",
-                                p.symbol.get_base(), p.korean_bid, p.korean_ask,
-                                p.foreign_bid, p.foreign_ask,
-                                p.entry_premium, p.exit_premium, p.premium_spread,
-                                p.funding_rate * 100, p.funding_interval_hours, tte2, sig2);
-
-                            // Position details line
                             double pos_usd = pos->foreign_amount * pos->foreign_entry_price;
-                            double dynamic_exit = std::max(
-                                pos->entry_premium + kimp::TradingConfig::DYNAMIC_EXIT_SPREAD,
-                                kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD);
-                            double gap_to_exit = dynamic_exit - p.exit_premium;
-                            std::cout << fmt::format("  \033[36m-> Entry: {:.4f}% | Target exit: {:.4f}% | Gap: {:.4f}% | Size: ${:.2f}/${:.2f} | Coins: {:.8f}\033[0m\n",
-                                pos->entry_premium, dynamic_exit, gap_to_exit,
-                                pos_usd, pos->position_size_usd, pos->korean_amount);
+                            std::cout << fmt::format("{:<10} {:>10.4f}% {:>11.4f}% {:>10.4f}% {:>11.2f} {:>11.2f} {:>11.8f}\n",
+                                p.symbol.get_base(),
+                                pos->entry_premium,
+                                p.exit_premium,
+                                p.net_edge_pct,
+                                p.net_profit_krw,
+                                pos_usd,
+                                pos->korean_amount);
                         }
-                        std::cout << std::string(132, '-') << "\n";
+                        std::cout << std::string(94, '-') << "\n";
                     }
 
                     const auto& tracker = engine.get_capital_tracker();
@@ -1417,8 +1403,8 @@ int main(int argc, char* argv[]) {
                         engine.get_position_count(), kimp::TradingConfig::MAX_POSITIONS,
                         tracker.get_current_capital(), tracker.get_return_percent(),
                         engine.get_position_size_usd());
-                    std::cout << fmt::format("Entry <= {:.2f}% | Exit >= max(entry + {:.2f}%, +{:.2f}%) | Trades: {} ({:.1f}% win)\n",
-                        kimp::TradingConfig::ENTRY_PREMIUM_THRESHOLD,
+                    std::cout << fmt::format("Entry: net>0 + both fill {:.2f} USDT | Exit >= max(entry + {:.2f}%, +{:.2f}%) | Trades: {} ({:.1f}% win)\n",
+                        kimp::TradingConfig::TARGET_ENTRY_USDT,
                         kimp::TradingConfig::DYNAMIC_EXIT_SPREAD,
                         kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD,
                         tracker.get_total_trades(), tracker.get_win_rate());

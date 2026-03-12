@@ -2,13 +2,13 @@
 # Kimchi Premium Arbitrage Trading Bot - C++ HFT Version
 
 trading:
-  max_positions: 3
-  position_size_usd: 50.0
-  split_orders: 2
-  order_size_usd: 25.0
-  order_interval_ms: 1000
-  entry_premium_threshold: -0.75   # Entry when premium <= -0.75%
-  exit_premium_threshold: 1.0      # Exit when premium >= +1%
+  max_positions: 1
+  position_size_usd: 70.0
+  split_orders: 1
+  order_size_usd: 70.0
+  order_interval_ms: 100
+  entry_premium_threshold: 0.0
+  exit_premium_threshold: 0.25
   max_price_diff_percent: 50.0
   usdt_update_interval_ms: 180000  # 3 minutes
 
@@ -35,13 +35,6 @@ exchanges:
     rest_endpoint: "https://api.bybit.com"
     api_key: "${BYBIT_API_KEY}"
     secret_key: "${BYBIT_SECRET_KEY}"
-
-  gateio:
-    enabled: true
-    ws_endpoint: "wss://fx-ws.gateio.ws/v4/ws/usdt"
-    rest_endpoint: "https://api.gateio.ws"
-    api_key: "${GATE_API_KEY}"
-    secret_key: "${GATE_SECRET_KEY}"
 
 threading:
   io_threads: 4

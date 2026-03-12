@@ -4,6 +4,8 @@
 
 #include <array>
 #include <cstddef>
+#include <algorithm>
+#include <vector>
 
 namespace kimp::strategy {
 
@@ -52,42 +54,14 @@ EntrySelectionResult<MaxSymbols> select_entry_candidates(
         result.free_slots = 0;
     }
 
-    if (max_positions <= 1) {
-        if (result.free_slots == 0) {
-            for (std::size_t idx = 0; idx < symbol_count; ++idx) {
-                if (position_state[idx] == 2 && qualified_at(idx)) {
-                    result.push(idx);
-                    break;
-                }
-            }
-            return result;
-        }
-
-        double best_premium = 100.0;
-        std::size_t best_idx = MaxSymbols;
-        candidate_bits.for_each_set(symbol_count, [&](std::size_t idx) {
-            if (position_state[idx] == 1) {
-                return;
-            }
-            const double premium = premium_at(idx);
-            if (premium < best_premium) {
-                best_premium = premium;
-                best_idx = idx;
-            }
-        });
-
-        if (best_idx != MaxSymbols) {
-            result.push(best_idx);
-        }
-        return result;
-    }
-
     for (std::size_t idx = 0; idx < symbol_count; ++idx) {
         if (position_state[idx] == 2 && qualified_at(idx)) {
             result.push(idx);
         }
     }
 
+    std::vector<std::size_t> fresh_candidates;
+    fresh_candidates.reserve(symbol_count);
     candidate_bits.for_each_set(symbol_count, [&](std::size_t idx) {
         const bool has_position = position_state[idx] != 0;
         const bool partial = position_state[idx] == 2;
@@ -102,11 +76,21 @@ EntrySelectionResult<MaxSymbols> select_entry_candidates(
             return;
         }
 
-        result.push(idx);
-        if (result.free_slots > 0) {
-            --result.free_slots;
-        }
+        fresh_candidates.push_back(idx);
     });
+
+    std::sort(fresh_candidates.begin(), fresh_candidates.end(),
+              [&](std::size_t lhs, std::size_t rhs) {
+                  return premium_at(lhs) < premium_at(rhs);
+              });
+
+    for (std::size_t idx : fresh_candidates) {
+        if (result.free_slots <= 0) {
+            break;
+        }
+        result.push(idx);
+        --result.free_slots;
+    }
 
     return result;
 }

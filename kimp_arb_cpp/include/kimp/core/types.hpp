@@ -23,8 +23,7 @@ enum class Exchange : uint8_t {
     Upbit = 0,
     Bithumb = 1,
     Bybit = 2,
-    GateIO = 3,
-    Count = 4
+    Count = 3
 };
 
 inline constexpr const char* exchange_name(Exchange ex) noexcept {
@@ -32,7 +31,6 @@ inline constexpr const char* exchange_name(Exchange ex) noexcept {
         case Exchange::Upbit: return "Upbit";
         case Exchange::Bithumb: return "Bithumb";
         case Exchange::Bybit: return "Bybit";
-        case Exchange::GateIO: return "GateIO";
         default: return "Unknown";
     }
 }
@@ -42,14 +40,13 @@ inline constexpr bool is_korean_exchange(Exchange ex) noexcept {
 }
 
 inline constexpr bool is_foreign_exchange(Exchange ex) noexcept {
-    return ex == Exchange::Bybit || ex == Exchange::GateIO;
+    return ex == Exchange::Bybit;
 }
 
 // Market type
 enum class MarketType : uint8_t {
     Spot = 0,
-    Futures = 1,
-    Perpetual = 2
+    MarginSpot = 1
 };
 
 // Order side
@@ -121,13 +118,9 @@ struct SymbolId {
         return std::string(get_base()) + "_" + std::string(get_quote());
     }
 
-    // Foreign format: "BTCUSDT" for Bybit, "BTC_USDT" for Gate.io futures
+    // Foreign format: "BTCUSDT" for Bybit spot margin
     std::string to_bybit_format() const {
         return std::string(get_base()) + std::string(get_quote());
-    }
-
-    std::string to_gateio_futures_format() const {
-        return std::string(get_base()) + "_" + std::string(get_quote());
     }
 
     bool operator==(const SymbolId& other) const noexcept {
@@ -177,14 +170,11 @@ struct alignas(64) Ticker {
     Price last{0.0};
     Price bid{0.0};
     Price ask{0.0};
+    Quantity bid_qty{0.0};
+    Quantity ask_qty{0.0};
     Price high_24h{0.0};
     Price low_24h{0.0};
     Quantity volume_24h{0.0};
-
-    // Funding rate info (futures only)
-    double funding_rate{0.0};       // Current funding rate (e.g., 0.0001 = 0.01%)
-    int funding_interval_hours{8};   // Funding interval in hours (default 8h for most exchanges)
-    uint64_t next_funding_time{0};   // Unix timestamp ms of next funding
 
     Price mid_price() const noexcept { return (bid + ask) / 2.0; }
     Price spread() const noexcept { return ask - bid; }
@@ -282,8 +272,16 @@ struct ArbitrageSignal {
 
     double premium{0.0};
     Price korean_ask{0.0};    // Buy price on Korean
+    Quantity korean_ask_qty{0.0};
     Price foreign_bid{0.0};   // Short price on foreign
-    double funding_rate{0.0};
+    Quantity foreign_bid_qty{0.0};
+    Quantity match_qty{0.0};
+    Quantity target_coin_qty{0.0};
+    double max_tradable_usdt_at_best{0.0};
+    double gross_edge_pct{0.0};
+    double net_edge_pct{0.0};
+    double net_profit_krw{0.0};
+    bool both_can_fill_target{false};
     Price usdt_krw_rate{0.0};
 
     Timestamp timestamp{};
@@ -309,30 +307,31 @@ struct TradingConfig {
     // 병렬 포지션 관리: 조건 만족하는 모든 코인에 동시 진입, 개별 청산
     // ==========================================================================
     static inline int MAX_POSITIONS = 1;                       // 최대 동시 포지션 수 (런타임 설정, 1~4)
-    static constexpr double POSITION_SIZE_USD = 250.0;        // $250 per side (총 $500 per position)
-    static constexpr double ORDER_SIZE_USD = 25.0;            // $25 per split
-    static constexpr int SPLIT_ORDERS = 10;                   // 250 / 25 = 10 splits
-    static constexpr int ORDER_INTERVAL_MS = 1000;            // Keep 1s split cadence for adaptive better-fill opportunities
+    static constexpr double TARGET_ENTRY_USDT = 70.0;         // Relay gate: exact 70 USDT notional per entry
+    static constexpr double POSITION_SIZE_USD = TARGET_ENTRY_USDT;
+    static constexpr double ORDER_SIZE_USD = TARGET_ENTRY_USDT;
+    static constexpr int SPLIT_ORDERS = 1;                    // Relay mode: single-shot fill only
+    static constexpr int ORDER_INTERVAL_MS = 100;             // Retry quickly on missed 1-tick capacity
 
     // Entry threshold
-    static constexpr double ENTRY_PREMIUM_THRESHOLD = -0.99;  // Entry when premium <= -0.99%
+    static constexpr double ENTRY_PREMIUM_THRESHOLD = 0.0;    // Legacy/monitor alias only
+    static constexpr double MIN_NET_EDGE_PCT = 0.0;           // Enter only when net edge is positive
 
-    // Fee structure (bid/ask spread already in premium calc, slippage ~0 at $25 splits)
-    static constexpr double BITHUMB_FEE_PCT = 0.04;           // Per trade (buy or sell)
-    static constexpr double BYBIT_FEE_PCT = 0.10;             // Spot taker per trade (sell short or buy cover)
-    static constexpr double ROUND_TRIP_FEE_PCT = (BITHUMB_FEE_PCT + BYBIT_FEE_PCT) * 2;  // 0.28%
-    static constexpr double MIN_NET_PROFIT_PCT = 0.00;         // floor(0.10%)에서 청산 — 수수료만 커버하면 즉시 탈출
-    static constexpr double DYNAMIC_EXIT_SPREAD = ROUND_TRIP_FEE_PCT + MIN_NET_PROFIT_PCT; // 0.19%
-    // Dynamic exit: exit_pm >= max(entry_pm + 0.19%, EXIT_PREMIUM_THRESHOLD)
-    // e.g., entry -0.99% -> dynamic -0.80%, floor applies -> exit >= +0.25%
-    // e.g., entry -0.53% -> dynamic -0.34%, floor applies -> exit >= +0.25%
+    // Fee structure for the relay model
+    static constexpr int BITHUMB_FEE_EVENTS = 1;
+    static constexpr int BYBIT_FEE_EVENTS = 3;
+    static constexpr double BITHUMB_FEE_RATE = 0.0004;        // 0.0400%
+    static constexpr double BYBIT_FEE_RATE = 0.0010;          // 0.1000% fallback
+    static constexpr double BITHUMB_FEE_PCT = BITHUMB_FEE_RATE * 100.0;
+    static constexpr double BYBIT_FEE_PCT = BYBIT_FEE_RATE * 100.0;
+    static constexpr double ENTRY_TOTAL_FEE_PCT =
+        (BITHUMB_FEE_PCT * BITHUMB_FEE_EVENTS) + (BYBIT_FEE_PCT * BYBIT_FEE_EVENTS);  // 0.34%
+    static constexpr double ROUND_TRIP_FEE_PCT = ENTRY_TOTAL_FEE_PCT;  // Legacy alias for older diagnostics/tests
+    static constexpr double MIN_NET_PROFIT_PCT = 0.00;
+    static constexpr double DYNAMIC_EXIT_SPREAD = ENTRY_TOTAL_FEE_PCT + MIN_NET_PROFIT_PCT;
 
     // Fallback fixed exit threshold (used when no position entry_premium available)
     static constexpr double EXIT_PREMIUM_THRESHOLD = 0.25;    // Exit floor: premium >= +0.25%
-
-    // Spot/spot execution uses no funding filters.
-    static constexpr int MIN_FUNDING_INTERVAL_HOURS = 0;
-    static constexpr bool REQUIRE_POSITIVE_FUNDING = false;
 
     static constexpr double MAX_PRICE_DIFF_PERCENT = 50.0;
     static constexpr int USDT_UPDATE_INTERVAL_MS = 180000;    // 3 minutes

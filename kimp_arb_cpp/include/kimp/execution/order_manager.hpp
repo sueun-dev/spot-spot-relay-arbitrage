@@ -5,7 +5,6 @@
 #include "kimp/exchange/upbit/upbit.hpp"
 #include "kimp/exchange/bithumb/bithumb.hpp"
 #include "kimp/exchange/bybit/bybit.hpp"
-#include "kimp/exchange/gateio/gateio.hpp"
 #include "kimp/strategy/arbitrage_engine.hpp"
 
 #include <memory>
@@ -41,7 +40,7 @@ class OrderManager {
 public:
     using ExchangePtr = std::shared_ptr<exchange::IExchange>;
     using KoreanExchangePtr = std::shared_ptr<exchange::KoreanExchangeBase>;
-    using ShortExchangePtr = std::shared_ptr<exchange::ForeignFuturesExchangeBase>;
+    using BybitExchangePtr = std::shared_ptr<exchange::bybit::BybitExchange>;
 
 private:
     // Exchange references
@@ -72,17 +71,17 @@ public:
     // 1. SHORT on Bybit spot margin
     // 2. BUY on Bithumb (same amount)
     // Optional initial_position for top-up: resumes from existing partial position state
-    ExecutionResult execute_entry_futures_first(
+    ExecutionResult execute_spot_relay_entry(
         const ArbitrageSignal& signal,
         const std::optional<Position>& initial_position = std::nullopt);
 
     // Execute exit with foreign short leg FIRST
     // 1. COVER on Bybit spot margin
     // 2. SELL on Bithumb (same amount)
-    ExecutionResult execute_exit_futures_first(const ExitSignal& signal, const Position& position);
+    ExecutionResult execute_spot_relay_exit(const ExitSignal& signal, const Position& position);
 
     // Prepare Bybit spot margin account before live trading
-    bool prepare_foreign_shorting(const std::vector<SymbolId>& symbols);
+    bool prepare_bybit_shorting(const std::vector<SymbolId>& symbols);
 
     // Request graceful shutdown of any running adaptive loops
     void request_shutdown() { running_.store(false, std::memory_order_release); }
@@ -117,7 +116,7 @@ private:
     std::mutex blacklist_mutex_;
     // Get typed exchange
     KoreanExchangePtr get_korean_exchange(Exchange ex);
-    ShortExchangePtr get_futures_exchange(Exchange ex);
+    BybitExchangePtr get_bybit_exchange();
 
     // Split order execution
     ExecutionResult execute_split_entry(const ArbitrageSignal& signal);

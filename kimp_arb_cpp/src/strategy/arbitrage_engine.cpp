@@ -119,8 +119,12 @@ void write_premiums_json_file(
             "      \"symbol\": \"{}/{}\",\n"
             "      \"koreanBid\": {:.2f},\n"
             "      \"koreanAsk\": {:.2f},\n"
+            "      \"koreanBidQty\": {:.8f},\n"
+            "      \"koreanAskQty\": {:.8f},\n"
             "      \"foreignBid\": {:.6f},\n"
             "      \"foreignAsk\": {:.6f},\n"
+            "      \"foreignBidQty\": {:.8f},\n"
+            "      \"foreignAskQty\": {:.8f},\n"
             "      \"koreanPrice\": {:.2f},\n"
             "      \"foreignPrice\": {:.4f},\n"
             "      \"usdtRate\": {:.2f},\n"
@@ -128,19 +132,39 @@ void write_premiums_json_file(
             "      \"exitPremium\": {:.4f},\n"
             "      \"premiumSpread\": {:.4f},\n"
             "      \"premium\": {:.4f},\n"
-            "      \"fundingRate\": {:.6f},\n"
-            "      \"fundingIntervalHours\": {},\n"
-            "      \"nextFundingTime\": {},\n"
+            "      \"matchQty\": {:.8f},\n"
+            "      \"targetCoinQty\": {:.8f},\n"
+            "      \"maxTradableUsdtAtBest\": {:.8f},\n"
+            "      \"bithumbTopKrw\": {:.2f},\n"
+            "      \"bithumbTopUsdt\": {:.8f},\n"
+            "      \"bybitTopUsdt\": {:.8f},\n"
+            "      \"bybitTopKrw\": {:.2f},\n"
+            "      \"grossEdgePct\": {:.6f},\n"
+            "      \"netEdgePct\": {:.6f},\n"
+            "      \"bithumbTotalFeeKrw\": {:.2f},\n"
+            "      \"bybitTotalFeeUsdt\": {:.8f},\n"
+            "      \"bybitTotalFeeKrw\": {:.2f},\n"
+            "      \"totalFeeKrw\": {:.2f},\n"
+            "      \"netProfitKrw\": {:.2f},\n"
+            "      \"bothCanFillTarget\": {},\n"
             "      \"signal\": {},\n"
+            "      \"ageMs\": {},\n"
             "      \"timestamp\": {}\n"
             "    }}",
             p.symbol.get_base(), p.symbol.get_quote(),
             p.korean_bid, p.korean_ask,
+            p.korean_bid_qty, p.korean_ask_qty,
             p.foreign_bid, p.foreign_ask,
+            p.foreign_bid_qty, p.foreign_ask_qty,
             p.korean_price, p.foreign_price, p.usdt_rate,
             p.entry_premium, p.exit_premium, p.premium_spread, p.premium,
-            p.funding_rate, p.funding_interval_hours, p.next_funding_time,
-            signal_str, now_ms);
+            p.match_qty, p.target_coin_qty, p.max_tradable_usdt_at_best,
+            p.bithumb_top_krw, p.bithumb_top_usdt, p.bybit_top_usdt, p.bybit_top_krw,
+            p.gross_edge_pct, p.net_edge_pct,
+            p.bithumb_total_fee_krw, p.bybit_total_fee_usdt, p.bybit_total_fee_krw, p.total_fee_krw,
+            p.net_profit_krw,
+            p.both_can_fill_target ? "true" : "false",
+            signal_str, p.age_ms, now_ms);
 
         if (i < premiums.size() - 1) {
             buffer += ",\n";
@@ -242,15 +266,7 @@ void ArbitrageEngine::on_ticker_update(const Ticker& ticker) {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             ticker.timestamp.time_since_epoch()).count());
     price_cache_.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last,
-                        ticker_ts_ms);
-
-    // Update funding rate for futures exchanges (cache even if 0)
-    if (kimp::is_foreign_exchange(ticker.exchange)) {
-        if (std::isfinite(ticker.funding_rate) || ticker.next_funding_time != 0) {
-            price_cache_.update_funding(ticker.exchange, ticker.symbol,
-                ticker.funding_rate, ticker.funding_interval_hours, ticker.next_funding_time);
-        }
-    }
+                        ticker_ts_ms, ticker.bid_qty, ticker.ask_qty);
 
     // Update USDT price if this is USDT/KRW (fast char-based check)
     if (ticker.symbol.is_usdt_krw()) {
@@ -508,16 +524,31 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
 
     double premium = PremiumCalculator::calculate_entry_premium(
         korean_price.ask, foreign_price.bid, usdt_rate);
+    auto relay_metrics = PremiumCalculator::calculate_relay_metrics(
+        korean_price.ask,
+        korean_price.ask_qty,
+        foreign_price.bid,
+        foreign_price.bid_qty,
+        usdt_rate);
 
-    bool qualifies = (premium <= TradingConfig::ENTRY_PREMIUM_THRESHOLD);
+    bool qualifies = relay_metrics.both_can_fill_target &&
+                     relay_metrics.match_qty > 0.0 &&
+                     relay_metrics.net_edge_pct > TradingConfig::MIN_NET_EDGE_PCT;
 
     // Update cached values
     cache.entry_premium.store(premium, std::memory_order_relaxed);
     cache.korean_ask.store(korean_price.ask, std::memory_order_relaxed);
+    cache.korean_ask_qty.store(korean_price.ask_qty, std::memory_order_relaxed);
     cache.foreign_bid.store(foreign_price.bid, std::memory_order_relaxed);
-    cache.funding_rate.store(foreign_price.funding_rate, std::memory_order_relaxed);
+    cache.foreign_bid_qty.store(foreign_price.bid_qty, std::memory_order_relaxed);
+    cache.match_qty.store(relay_metrics.match_qty, std::memory_order_relaxed);
+    cache.target_coin_qty.store(relay_metrics.target_coin_qty, std::memory_order_relaxed);
+    cache.max_tradable_usdt_at_best.store(relay_metrics.max_tradable_usdt_at_best, std::memory_order_relaxed);
+    cache.gross_edge_pct.store(relay_metrics.gross_edge_pct, std::memory_order_relaxed);
+    cache.net_edge_pct.store(relay_metrics.net_edge_pct, std::memory_order_relaxed);
+    cache.net_profit_krw.store(relay_metrics.net_profit_krw, std::memory_order_relaxed);
+    cache.both_can_fill_target.store(relay_metrics.both_can_fill_target, std::memory_order_relaxed);
     cache.usdt_rate.store(usdt_rate, std::memory_order_relaxed);
-    cache.funding_interval.store(foreign_price.funding_interval_hours, std::memory_order_relaxed);
 
     bool was_qualified = cache.qualified.load(std::memory_order_relaxed);
     cache.qualified.store(qualifies, std::memory_order_release);
@@ -574,8 +605,16 @@ void ArbitrageEngine::fire_entry_from_cache() {
         signal.foreign_exchange = foreign_ex;
         signal.premium = c.entry_premium.load(std::memory_order_relaxed);
         signal.korean_ask = c.korean_ask.load(std::memory_order_relaxed);
+        signal.korean_ask_qty = c.korean_ask_qty.load(std::memory_order_relaxed);
         signal.foreign_bid = c.foreign_bid.load(std::memory_order_relaxed);
-        signal.funding_rate = c.funding_rate.load(std::memory_order_relaxed);
+        signal.foreign_bid_qty = c.foreign_bid_qty.load(std::memory_order_relaxed);
+        signal.match_qty = c.match_qty.load(std::memory_order_relaxed);
+        signal.target_coin_qty = c.target_coin_qty.load(std::memory_order_relaxed);
+        signal.max_tradable_usdt_at_best = c.max_tradable_usdt_at_best.load(std::memory_order_relaxed);
+        signal.gross_edge_pct = c.gross_edge_pct.load(std::memory_order_relaxed);
+        signal.net_edge_pct = c.net_edge_pct.load(std::memory_order_relaxed);
+        signal.net_profit_krw = c.net_profit_krw.load(std::memory_order_relaxed);
+        signal.both_can_fill_target = c.both_can_fill_target.load(std::memory_order_relaxed);
         signal.usdt_krw_rate = c.usdt_rate.load(std::memory_order_relaxed);
         signal.timestamp = std::chrono::steady_clock::now();
         if (on_entry_signal_) on_entry_signal_(signal);
@@ -588,7 +627,7 @@ void ArbitrageEngine::fire_entry_from_cache() {
         entry_signal_fired_bits_,
         position_state,
         [&](size_t idx) {
-            return entry_cache_[idx].entry_premium.load(std::memory_order_relaxed);
+            return -entry_cache_[idx].net_edge_pct.load(std::memory_order_relaxed);
         },
         [&](size_t idx) {
             return entry_cache_[idx].qualified.load(std::memory_order_acquire);
@@ -720,26 +759,36 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
     // SoA arrays for SIMD - collect directly (no intermediate struct copy)
     // Entry arrays (korean_ask / foreign_bid)
     std::vector<double> korean_asks;
+    std::vector<double> korean_ask_qtys;
     std::vector<double> foreign_bids;
+    std::vector<double> foreign_bid_qtys;
     // Exit arrays (korean_bid / foreign_ask)
     std::vector<double> korean_bids;
+    std::vector<double> korean_bid_qtys;
     std::vector<double> foreign_asks;
+    std::vector<double> foreign_ask_qtys;
 
     std::vector<double> usdt_rates;
-    std::vector<double> funding_rates;
-    std::vector<int> funding_intervals;
-    std::vector<uint64_t> next_funding_times;
+    std::vector<uint64_t> korean_timestamps;
+    std::vector<uint64_t> foreign_timestamps;
     std::vector<size_t> symbol_indices;
 
     korean_asks.reserve(n);
+    korean_ask_qtys.reserve(n);
     foreign_bids.reserve(n);
+    foreign_bid_qtys.reserve(n);
     korean_bids.reserve(n);
+    korean_bid_qtys.reserve(n);
     foreign_asks.reserve(n);
+    foreign_ask_qtys.reserve(n);
     usdt_rates.reserve(n);
-    funding_rates.reserve(n);
-    funding_intervals.reserve(n);
-    next_funding_times.reserve(n);
+    korean_timestamps.reserve(n);
+    foreign_timestamps.reserve(n);
     symbol_indices.reserve(n);
+
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 
     // Phase 1: Collect valid prices directly into SoA arrays (single pass)
     for (size_t i = 0; i < n; ++i) {
@@ -758,13 +807,16 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
             if (usdt_rate <= 0) continue;  // No real USDT/KRW rate
 
             korean_asks.push_back(korean_price.ask);
+            korean_ask_qtys.push_back(korean_price.ask_qty);
             foreign_bids.push_back(foreign_price.bid);
+            foreign_bid_qtys.push_back(foreign_price.bid_qty);
             korean_bids.push_back(korean_price.bid);
+            korean_bid_qtys.push_back(korean_price.bid_qty);
             foreign_asks.push_back(foreign_price.ask);
+            foreign_ask_qtys.push_back(foreign_price.ask_qty);
             usdt_rates.push_back(usdt_rate);
-            funding_rates.push_back(foreign_price.funding_rate);
-            funding_intervals.push_back(foreign_price.funding_interval_hours);
-            next_funding_times.push_back(foreign_price.next_funding_time);
+            korean_timestamps.push_back(korean_price.timestamp);
+            foreign_timestamps.push_back(foreign_price.timestamp);
             symbol_indices.push_back(i);
             break; // Only first exchange pair per symbol
         }
@@ -801,8 +853,12 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
         info.symbol = monitored_symbols_[symbol_indices[i]];
         info.korean_bid = korean_bids[i];
         info.korean_ask = korean_asks[i];
+        info.korean_bid_qty = korean_bid_qtys[i];
+        info.korean_ask_qty = korean_ask_qtys[i];
         info.foreign_bid = foreign_bids[i];
         info.foreign_ask = foreign_asks[i];
+        info.foreign_bid_qty = foreign_bid_qtys[i];
+        info.foreign_ask_qty = foreign_ask_qtys[i];
         info.korean_price = korean_asks[i];
         info.foreign_price = foreign_bids[i];
         info.usdt_rate = usdt_rates[i];
@@ -810,10 +866,32 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
         info.exit_premium = exit_premiums[i];
         info.premium_spread = entry_premiums[i] - exit_premiums[i];
         info.premium = entry_premiums[i];  // Backward-compatible alias
-        info.funding_rate = funding_rates[i];
-        info.funding_interval_hours = funding_intervals[i];
-        info.next_funding_time = next_funding_times[i];
-        info.entry_signal = entry_premiums[i] <= TradingConfig::ENTRY_PREMIUM_THRESHOLD;
+        auto relay_metrics = PremiumCalculator::calculate_relay_metrics(
+            korean_asks[i],
+            korean_ask_qtys[i],
+            foreign_bids[i],
+            foreign_bid_qtys[i],
+            usdt_rates[i]);
+        info.match_qty = relay_metrics.match_qty;
+        info.target_coin_qty = relay_metrics.target_coin_qty;
+        info.max_tradable_usdt_at_best = relay_metrics.max_tradable_usdt_at_best;
+        info.bithumb_top_krw = relay_metrics.bithumb_top_krw;
+        info.bithumb_top_usdt = relay_metrics.bithumb_top_usdt;
+        info.bybit_top_usdt = relay_metrics.bybit_top_usdt;
+        info.bybit_top_krw = relay_metrics.bybit_top_krw;
+        info.gross_edge_pct = relay_metrics.gross_edge_pct;
+        info.net_edge_pct = relay_metrics.net_edge_pct;
+        info.bithumb_total_fee_krw = relay_metrics.bithumb_total_fee_krw;
+        info.bybit_total_fee_usdt = relay_metrics.bybit_total_fee_usdt;
+        info.bybit_total_fee_krw = relay_metrics.bybit_total_fee_krw;
+        info.total_fee_krw = relay_metrics.total_fee_krw;
+        info.net_profit_krw = relay_metrics.net_profit_krw;
+        info.both_can_fill_target = relay_metrics.both_can_fill_target;
+        const uint64_t newest_ts = std::max(korean_timestamps[i], foreign_timestamps[i]);
+        info.age_ms = newest_ts > 0 && now_ms > newest_ts ? (now_ms - newest_ts) : 0;
+        info.entry_signal = relay_metrics.both_can_fill_target &&
+                            relay_metrics.match_qty > 0.0 &&
+                            relay_metrics.net_edge_pct > TradingConfig::MIN_NET_EDGE_PCT;
         info.exit_signal = exit_premiums[i] >= TradingConfig::EXIT_PREMIUM_THRESHOLD;
         result.push_back(info);
     }

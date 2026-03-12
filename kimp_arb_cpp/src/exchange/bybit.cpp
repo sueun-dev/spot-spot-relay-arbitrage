@@ -15,14 +15,7 @@ std::string BybitExchange::resolve_public_ws_endpoint() const {
     if (credentials_.ws_endpoint.empty()) {
         return "wss://stream.bybit.com/v5/public/spot";
     }
-
-    std::string endpoint = credentials_.ws_endpoint;
-    const std::string needle = "/public/linear";
-    const auto pos = endpoint.find(needle);
-    if (pos != std::string::npos) {
-        endpoint.replace(pos, needle.size(), "/public/spot");
-    }
-    return endpoint;
+    return credentials_.ws_endpoint;
 }
 
 bool BybitExchange::connect() {
@@ -293,13 +286,18 @@ std::vector<Ticker> BybitExchange::fetch_all_tickers() {
 
             std::string_view bid_str = item["bid1Price"].get_string().value();
             ticker.bid = opt::fast_stod(bid_str);
+            auto bid_qty = item["bid1Size"];
+            if (!bid_qty.error()) {
+                ticker.bid_qty = opt::fast_stod(bid_qty.get_string().value());
+            }
 
             std::string_view ask_str = item["ask1Price"].get_string().value();
             ticker.ask = opt::fast_stod(ask_str);
+            auto ask_qty = item["ask1Size"];
+            if (!ask_qty.error()) {
+                ticker.ask_qty = opt::fast_stod(ask_qty.get_string().value());
+            }
 
-            ticker.funding_rate = 0.0;
-            ticker.funding_interval_hours = 0;
-            ticker.next_funding_time = 0;
             ticker.timestamp = std::chrono::steady_clock::now();
 
             if (ticker.last > 0) {
@@ -312,10 +310,6 @@ std::vector<Ticker> BybitExchange::fetch_all_tickers() {
 
     Logger::info("[Bybit] Fetched {} tickers via REST", tickers.size());
     return tickers;
-}
-
-double BybitExchange::get_funding_rate(const SymbolId& symbol) {
-    return 0.0;
 }
 
 Order BybitExchange::place_market_order(const SymbolId& symbol, Side side, Quantity quantity) {
@@ -533,31 +527,12 @@ bool BybitExchange::cancel_order(uint64_t order_id) {
     return false;
 }
 
-bool BybitExchange::set_leverage(const SymbolId& symbol, int leverage) {
-    if (!ensure_spot_margin_mode()) {
-        return false;
-    }
-    if (leverage <= 1) {
-        return true;
-    }
-
-    std::ostringstream body;
-    body << R"({"leverage":")" << leverage << R"("})";
-
-    std::string body_str = body.str();
-    auto headers = build_auth_headers(body_str);
-    headers["Content-Type"] = "application/json";
-
-    auto response = rest_client_->post("/v5/spot-margin-trade/set-leverage", body_str, headers);
-    if (!response.success) {
-        Logger::error("[Bybit] Set spot-margin leverage failed: {}", response.body);
-        return false;
-    }
-
-    return true;
+bool BybitExchange::prepare_shorting(const SymbolId& symbol) {
+    (void)symbol;
+    return ensure_spot_margin_mode();
 }
 
-std::vector<Position> BybitExchange::get_positions() {
+std::vector<Position> BybitExchange::get_short_positions() {
     std::vector<Position> positions;
 
     std::string query = "accountType=UNIFIED";
@@ -606,8 +581,8 @@ std::vector<Position> BybitExchange::get_positions() {
     return positions;
 }
 
-bool BybitExchange::close_position(const SymbolId& symbol) {
-    auto positions = get_positions();
+bool BybitExchange::close_short_position(const SymbolId& symbol) {
+    auto positions = get_short_positions();
 
     for (const auto& pos : positions) {
         if (pos.symbol == symbol && pos.foreign_amount > 0) {
@@ -783,10 +758,6 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
 
         ticker.exchange = Exchange::Bybit;
         ticker.timestamp = std::chrono::steady_clock::now();
-        ticker.funding_rate = 0.0;
-        ticker.funding_interval_hours = 0;
-        ticker.next_funding_time = 0;
-
         if (topic_str.substr(0, 8) == "tickers.") {
             std::string_view symbol_str = data["symbol"].get_string().value();
             if (symbol_str.size() > 4) {
@@ -799,9 +770,17 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
 
             std::string_view bid_str = data["bid1Price"].get_string().value();
             ticker.bid = opt::fast_stod(bid_str);
+            auto bid_qty = data["bid1Size"];
+            if (!bid_qty.error()) {
+                ticker.bid_qty = opt::fast_stod(bid_qty.get_string().value());
+            }
 
             std::string_view ask_str = data["ask1Price"].get_string().value();
             ticker.ask = opt::fast_stod(ask_str);
+            auto ask_qty = data["ask1Size"];
+            if (!ask_qty.error()) {
+                ticker.ask_qty = opt::fast_stod(ask_qty.get_string().value());
+            }
             return ticker.last > 0.0 && ticker.bid > 0.0 && ticker.ask > 0.0;
         }
 
@@ -825,7 +804,15 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
         auto ask_val_it = ask_vals.begin();
         if (bid_val_it == bid_vals.end() || ask_val_it == ask_vals.end()) return false;
         ticker.bid = opt::fast_stod((*bid_val_it).get_string().value());
+        ++bid_val_it;
+        if (bid_val_it != bid_vals.end()) {
+            ticker.bid_qty = opt::fast_stod((*bid_val_it).get_string().value());
+        }
         ticker.ask = opt::fast_stod((*ask_val_it).get_string().value());
+        ++ask_val_it;
+        if (ask_val_it != ask_vals.end()) {
+            ticker.ask_qty = opt::fast_stod((*ask_val_it).get_string().value());
+        }
 
         auto cached = get_cached_ticker(ticker.symbol);
         if (cached && cached->last > 0.0) {

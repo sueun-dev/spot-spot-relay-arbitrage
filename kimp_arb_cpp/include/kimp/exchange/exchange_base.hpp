@@ -140,18 +140,12 @@ public:
 
     // Market data queries
     virtual std::vector<SymbolId> get_available_symbols() = 0;
-    virtual double get_funding_rate(const SymbolId& symbol) = 0;
     virtual std::vector<Ticker> fetch_all_tickers() = 0;  // REST API bulk fetch
 
     // Order execution
     virtual Order place_market_order(const SymbolId& symbol, Side side, Quantity quantity) = 0;
     virtual Order place_market_buy_cost(const SymbolId& symbol, Price cost) = 0;  // For Korean exchanges
     virtual bool cancel_order(uint64_t order_id) = 0;
-
-    // Short-selling specific
-    virtual bool set_leverage(const SymbolId& symbol, int leverage) = 0;
-    virtual std::vector<Position> get_positions() = 0;
-    virtual bool close_position(const SymbolId& symbol) = 0;
 
     // Balance
     virtual double get_balance(const std::string& currency) = 0;
@@ -239,19 +233,6 @@ public:
 
     void set_order_callback(OrderCallback cb) override {
         order_callback_ = std::move(cb);
-    }
-
-    // Default implementations (futures-specific, override in spot exchanges)
-    bool set_leverage(const SymbolId& symbol, int leverage) override {
-        return false;  // Not applicable for spot
-    }
-
-    std::vector<Position> get_positions() override {
-        return {};  // Not applicable for spot
-    }
-
-    bool close_position(const SymbolId& symbol) override {
-        return false;  // Not applicable for spot
     }
 
     // Cost-based market buy (override in Korean exchanges)
@@ -351,23 +332,18 @@ public:
 };
 
 /**
- * Foreign short-selling exchange base.
- * Legacy name is kept to avoid a repo-wide rename.
+ * Foreign spot-margin short-selling exchange base.
  */
-class ForeignFuturesExchangeBase : public ExchangeBase {
-protected:
-    static constexpr int DEFAULT_LEVERAGE = 1;
-
+class ForeignShortExchangeBase : public ExchangeBase {
 public:
     using ExchangeBase::ExchangeBase;
 
     MarketType get_market_type() const override { return market_type_; }
 
     // Short-selling-specific
-    bool set_leverage(const SymbolId& symbol, int leverage) override = 0;
-    std::vector<Position> get_positions() override = 0;
-    bool close_position(const SymbolId& symbol) override = 0;
-    double get_funding_rate(const SymbolId& symbol) override = 0;
+    virtual bool prepare_shorting(const SymbolId& symbol) = 0;
+    virtual std::vector<Position> get_short_positions() = 0;
+    virtual bool close_short_position(const SymbolId& symbol) = 0;
 
     // Open short position
     virtual Order open_short(const SymbolId& symbol, Quantity quantity) = 0;

@@ -66,8 +66,6 @@ RuntimeConfig ConfigLoader::load(const std::string& path) {
         load_exchange("upbit", Exchange::Upbit);
         load_exchange("bithumb", Exchange::Bithumb);
         load_exchange("bybit", Exchange::Bybit);
-        load_exchange("gateio", Exchange::GateIO);
-
         // Threading config
         if (yaml["threading"]) {
             auto th = yaml["threading"];
@@ -137,16 +135,6 @@ RuntimeConfig ConfigLoader::load_from_env() {
         true
     };
 
-    config.exchanges[Exchange::GateIO] = {
-        get_env("GATE_API_KEY"),
-        get_env("GATE_SECRET_KEY"),
-        endpoints::GATEIO_WS,
-        "",
-        "",
-        endpoints::GATEIO_REST,
-        true
-    };
-
     return config;
 }
 
@@ -163,10 +151,6 @@ RuntimeConfig ConfigLoader::get_default() {
     config.exchanges[Exchange::Bybit] = {
         "", "", endpoints::BYBIT_WS_PUBLIC, endpoints::BYBIT_WS_PRIVATE, endpoints::BYBIT_WS_TRADE, endpoints::BYBIT_REST, false
     };
-    config.exchanges[Exchange::GateIO] = {
-        "", "", endpoints::GATEIO_WS, "", "", endpoints::GATEIO_REST, false
-    };
-
     return config;
 }
 

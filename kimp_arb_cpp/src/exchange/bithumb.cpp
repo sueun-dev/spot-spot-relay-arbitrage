@@ -67,21 +67,31 @@ void BithumbExchange::subscribe_ticker(const std::vector<SymbolId>& symbols) {
         return;
     }
 
-    // Format: {"type":"ticker","symbols":["BTC_KRW","ETH_KRW"],"tickTypes":["MID"]}
-    std::ostringstream ss;
-    ss << R"({"type":"ticker","symbols":[)";
+    constexpr size_t BATCH_SIZE = 30;
 
-    bool first = true;
-    for (const auto& sym : symbols) {
-        if (!first) ss << ",";
-        ss << "\"" << sym.to_bithumb_format() << "\"";
-        first = false;
+    for (size_t start = 0; start < symbols.size(); start += BATCH_SIZE) {
+        size_t end = std::min(start + BATCH_SIZE, symbols.size());
+
+        std::ostringstream ss;
+        ss << R"({"type":"ticker","symbols":[)";
+
+        bool first = true;
+        for (size_t i = start; i < end; ++i) {
+            if (!first) ss << ",";
+            ss << "\"" << symbols[i].to_bithumb_format() << "\"";
+            first = false;
+        }
+
+        ss << R"(],"tickTypes":["MID"]})";
+        ws_client_->send(ss.str());
+
+        if (end < symbols.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
 
-    ss << R"(],"tickTypes":["MID"]})";
-
-    Logger::debug("[Bithumb] Subscribing to {} symbols", symbols.size());
-    ws_client_->send(ss.str());
+    Logger::info("[Bithumb] Subscribed to {} tickers in {} batches",
+                 symbols.size(), (symbols.size() + BATCH_SIZE - 1) / BATCH_SIZE);
 }
 
 void BithumbExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) {
@@ -96,20 +106,31 @@ void BithumbExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) 
         return;
     }
 
-    std::ostringstream ss;
-    ss << R"({"type":"orderbookdepth","symbols":[)";
+    constexpr size_t BATCH_SIZE = 30;
 
-    bool first = true;
-    for (const auto& sym : symbols) {
-        if (!first) ss << ",";
-        ss << "\"" << sym.to_bithumb_format() << "\"";
-        first = false;
+    for (size_t start = 0; start < symbols.size(); start += BATCH_SIZE) {
+        size_t end = std::min(start + BATCH_SIZE, symbols.size());
+
+        std::ostringstream ss;
+        ss << R"({"type":"orderbookdepth","symbols":[)";
+
+        bool first = true;
+        for (size_t i = start; i < end; ++i) {
+            if (!first) ss << ",";
+            ss << "\"" << symbols[i].to_bithumb_format() << "\"";
+            first = false;
+        }
+
+        ss << R"(]})";
+        ws_client_->send(ss.str());
+
+        if (end < symbols.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
 
-    ss << R"(]})";
-
-    Logger::info("[Bithumb] Subscribing to {} orderbook depth streams", symbols.size());
-    ws_client_->send(ss.str());
+    Logger::info("[Bithumb] Subscribed to {} orderbook depth streams in {} batches",
+                 symbols.size(), (symbols.size() + BATCH_SIZE - 1) / BATCH_SIZE);
 }
 
 std::vector<SymbolId> BithumbExchange::get_available_symbols() {
@@ -183,8 +204,12 @@ std::vector<Ticker> BithumbExchange::fetch_all_tickers() {
                         if (bbo_it != orderbook_bbo_.end()) {
                             double real_bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
                             double real_ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
+                            double real_bid_qty = bbo_it->second.best_bid_qty.load(std::memory_order_acquire);
+                            double real_ask_qty = bbo_it->second.best_ask_qty.load(std::memory_order_acquire);
                             if (real_bid > 0.0) ticker.bid = real_bid;
                             if (real_ask > 0.0) ticker.ask = real_ask;
+                            if (real_bid_qty > 0.0) ticker.bid_qty = real_bid_qty;
+                            if (real_ask_qty > 0.0) ticker.ask_qty = real_ask_qty;
                         }
                     }
                 }
@@ -482,6 +507,8 @@ void BithumbExchange::on_ws_message(std::string_view message) {
             for (const auto& symbol_key : updated_symbols) {
                 double bid = 0.0;
                 double ask = 0.0;
+                double bid_qty = 0.0;
+                double ask_qty = 0.0;
                 double last = 0.0;
                 {
                     std::lock_guard lock(orderbook_mutex_);
@@ -490,6 +517,8 @@ void BithumbExchange::on_ws_message(std::string_view message) {
 
                     bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
                     ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
+                    bid_qty = bbo_it->second.best_bid_qty.load(std::memory_order_acquire);
+                    ask_qty = bbo_it->second.best_ask_qty.load(std::memory_order_acquire);
                     if (bid <= 0.0 || ask <= 0.0) continue;
 
                     auto last_it = last_price_cache_.find(symbol_key);
@@ -508,6 +537,8 @@ void BithumbExchange::on_ws_message(std::string_view message) {
                 ticker.last = last;
                 ticker.bid = bid;
                 ticker.ask = ask;
+                ticker.bid_qty = bid_qty;
+                ticker.ask_qty = ask_qty;
                 dispatch_ticker(ticker);
             }
         }
@@ -528,8 +559,12 @@ void BithumbExchange::on_ws_message(std::string_view message) {
             if (bbo_it != orderbook_bbo_.end()) {
                 double real_bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
                 double real_ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
+                double real_bid_qty = bbo_it->second.best_bid_qty.load(std::memory_order_acquire);
+                double real_ask_qty = bbo_it->second.best_ask_qty.load(std::memory_order_acquire);
                 if (real_bid > 0.0) ticker.bid = real_bid;
                 if (real_ask > 0.0) ticker.ask = real_ask;
+                if (real_bid_qty > 0.0) ticker.bid_qty = real_bid_qty;
+                if (real_ask_qty > 0.0) ticker.ask_qty = real_ask_qty;
             }
         }
 
@@ -729,9 +764,11 @@ void BithumbExchange::update_bbo(const std::string& symbol_key) {
 
     if (!state.bids.empty()) {
         bbo.best_bid.store(state.bids.begin()->first, std::memory_order_release);
+        bbo.best_bid_qty.store(state.bids.begin()->second, std::memory_order_release);
     }
     if (!state.asks.empty()) {
         bbo.best_ask.store(state.asks.begin()->first, std::memory_order_release);
+        bbo.best_ask_qty.store(state.asks.begin()->second, std::memory_order_release);
     }
 }
 

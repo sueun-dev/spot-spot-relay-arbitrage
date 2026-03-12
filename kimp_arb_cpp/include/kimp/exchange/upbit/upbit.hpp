@@ -39,7 +39,6 @@ public:
 
     // Market data
     std::vector<SymbolId> get_available_symbols() override;
-    double get_funding_rate(const SymbolId& symbol) override { return 0.0; }  // N/A for spot
     double get_usdt_krw_price() override;
 
     // Orders

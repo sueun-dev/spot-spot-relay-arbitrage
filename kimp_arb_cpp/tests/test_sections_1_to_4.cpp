@@ -417,7 +417,7 @@ void test_section3_exchange_creation() {
         ASSERT_EQ(bithumb->get_exchange_id(), kimp::Exchange::Bithumb, "bithumb id");
         ASSERT_EQ(bybit->get_exchange_id(), kimp::Exchange::Bybit, "bybit id");
         ASSERT_EQ(bithumb->get_market_type(), kimp::MarketType::Spot, "bithumb spot");
-        ASSERT_EQ(bybit->get_market_type(), kimp::MarketType::Spot, "bybit spot");
+        ASSERT_EQ(bybit->get_market_type(), kimp::MarketType::MarginSpot, "bybit margin spot");
         PASS();
     } catch (const std::exception& e) { FAIL(e.what()); }
 }

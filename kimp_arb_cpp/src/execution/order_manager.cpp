@@ -331,23 +331,17 @@ OrderManager::KoreanExchangePtr OrderManager::get_korean_exchange(Exchange ex) {
     return nullptr;
 }
 
-OrderManager::ShortExchangePtr OrderManager::get_futures_exchange(Exchange ex) {
-    auto ptr = exchanges_[static_cast<size_t>(ex)];
+OrderManager::BybitExchangePtr OrderManager::get_bybit_exchange() {
+    auto ptr = exchanges_[static_cast<size_t>(Exchange::Bybit)];
     if (!ptr) return nullptr;
-
-    if (ex == Exchange::Bybit) {
-        return std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(ptr);
-    } else if (ex == Exchange::GateIO) {
-        return std::dynamic_pointer_cast<exchange::gateio::GateIOExchange>(ptr);
-    }
-    return nullptr;
+    return std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(ptr);
 }
 
 ExecutionResult OrderManager::execute_entry(const ArbitrageSignal& signal) {
     return execute_split_entry(signal);
 }
 
-ExecutionResult OrderManager::execute_entry_futures_first(
+ExecutionResult OrderManager::execute_spot_relay_entry(
         const ArbitrageSignal& signal,
         const std::optional<Position>& initial_position) {
     ExecutionResult result;
@@ -364,7 +358,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(
     result.position.position_size_usd = position_size_usd;
 
     auto korean_ex = get_korean_exchange(signal.korean_exchange);
-    auto foreign_ex = get_futures_exchange(signal.foreign_exchange);
+    auto foreign_ex = get_bybit_exchange();
 
     if (!korean_ex || !foreign_ex) {
         result.error_message = "Exchange not available";
@@ -461,8 +455,10 @@ ExecutionResult OrderManager::execute_entry_futures_first(
         // Get fresh prices from cache
         double current_foreign_bid = signal.foreign_bid;
         double current_foreign_ask = 0.0;
+        double current_foreign_bid_qty = signal.foreign_bid_qty;
         double current_korean_ask = signal.korean_ask;
         double current_korean_bid = 0.0;
+        double current_korean_ask_qty = signal.korean_ask_qty;
         double usdt_rate = signal.usdt_krw_rate;  // From signal (guaranteed real)
         bool quote_pair_ok = !engine_;
         if (engine_) {
@@ -479,8 +475,10 @@ ExecutionResult OrderManager::execute_entry_futures_first(
                 if (has_prices) {
                     current_foreign_bid = foreign_price.bid;
                     current_foreign_ask = foreign_price.ask;
+                    current_foreign_bid_qty = foreign_price.bid_qty;
                     current_korean_ask = korean_price.ask;
                     current_korean_bid = korean_price.bid;
+                    current_korean_ask_qty = korean_price.ask_qty;
                     quote_pair_ok = true;
                 }
             } else {
@@ -488,8 +486,10 @@ ExecutionResult OrderManager::execute_entry_futures_first(
                 if (has_prices && quote_pair_is_usable(korean_price, foreign_price)) {
                     current_foreign_bid = foreign_price.bid;
                     current_foreign_ask = foreign_price.ask;
+                    current_foreign_bid_qty = foreign_price.bid_qty;
                     current_korean_ask = korean_price.ask;
                     current_korean_bid = korean_price.bid;
+                    current_korean_ask_qty = korean_price.ask_qty;
                     quote_pair_ok = true;
                 }
             }
@@ -523,6 +523,20 @@ ExecutionResult OrderManager::execute_entry_futures_first(
         }
 
         double held_value_usd = held_amount * current_foreign_bid;
+        double remaining_position_usd = std::max(0.0, position_size_usd - held_value_usd);
+        double required_coin_amount = current_foreign_bid > 0.0
+            ? (remaining_position_usd / current_foreign_bid)
+            : 0.0;
+        bool korean_can_fill_required = required_coin_amount > 0.0 &&
+                                        current_korean_ask_qty >= required_coin_amount;
+        bool foreign_can_fill_required = required_coin_amount > 0.0 &&
+                                         current_foreign_bid_qty >= required_coin_amount;
+        auto relay_metrics = strategy::PremiumCalculator::calculate_relay_metrics(
+            current_korean_ask,
+            current_korean_ask_qty,
+            current_foreign_bid,
+            current_foreign_bid_qty,
+            usdt_rate);
 
         // Dynamic exit threshold with a hard floor (+0.10% by default)
         double dynamic_exit_threshold = TradingConfig::EXIT_PREMIUM_THRESHOLD;
@@ -533,21 +547,23 @@ ExecutionResult OrderManager::execute_entry_futures_first(
                 TradingConfig::EXIT_PREMIUM_THRESHOLD);
         }
 
-        double remaining_position_usd = std::max(0.0, position_size_usd - held_value_usd);
         double min_split_usd = min_executable_usd(current_foreign_bid, current_korean_ask);
 
         auto split_start = std::chrono::steady_clock::now();
 
-        if (entry_premium <= TradingConfig::ENTRY_PREMIUM_THRESHOLD && remaining_position_usd >= min_split_usd) {
-            // ==================== ENTRY SPLIT ====================
+        if (relay_metrics.net_edge_pct > TradingConfig::MIN_NET_EDGE_PCT &&
+            korean_can_fill_required &&
+            foreign_can_fill_required &&
+            remaining_position_usd >= min_split_usd) {
+            // ==================== ENTRY ====================
             double order_size_usd = std::min(TradingConfig::ORDER_SIZE_USD, remaining_position_usd);
-            double coin_amount = order_size_usd / current_foreign_bid;
+            double coin_amount = std::min(order_size_usd / current_foreign_bid, required_coin_amount);
 
             // Open Bybit spot-margin short first (no fill query — deferred to parallel)
             Order foreign_order = execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
-                Logger::error("[ADAPTIVE-ENTRY] Futures SHORT failed, retrying next cycle");
+                Logger::error("[RELAY-ENTRY] Bybit spot-margin short failed, retrying next cycle");
                 std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
                 continue;
             }
@@ -557,7 +573,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(
             double krw_amount = actual_filled * current_korean_ask;
 
             if (krw_amount < TradingConfig::MIN_ORDER_KRW) {
-                Logger::warn("[ADAPTIVE-ENTRY] Order too small ({:.0f} KRW), rolling back Bybit spot-margin short", krw_amount);
+                Logger::warn("[RELAY-ENTRY] Order too small ({:.0f} KRW), rolling back Bybit spot-margin short", krw_amount);
                 Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
                 if (rollback.status != OrderStatus::Filled) {
                     Position mismatch;
@@ -577,7 +593,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(
                     mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
 
                     trigger_critical_stop(
-                        "[ADAPTIVE-ENTRY] Futures rollback failed after min-order guard (manual intervention required)",
+                        "[RELAY-ENTRY] Bybit rollback failed after min-order guard (manual intervention required)",
                         mismatch
                     );
                     return result;
@@ -632,12 +648,12 @@ ExecutionResult OrderManager::execute_entry_futures_first(
 
                 auto split_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - split_start).count();
-                Logger::info("[ADAPTIVE-ENTRY] {} +{:.8f} coins (${:.2f}), held: ${:.2f}/${:.2f}, "
-                             "entry_pm_now: {:.4f}%, eff_entry_pm: {:.4f}%, target_exit_pm: {:.4f}%, "
-                             "buy_price: {:.2f}, exec_ms: {}",
+                Logger::info("[RELAY-ENTRY] {} +{:.8f} coins (${:.2f}), held: ${:.2f}/${:.2f}, "
+                             "net_edge_now: {:.4f}%, entry_pm_now: {:.4f}%, eff_entry_pm: {:.4f}%, "
+                             "target_exit_pm: {:.4f}%, buy_price: {:.2f}, exec_ms: {}",
                              signal.symbol.to_string(), actual_filled, order_size_usd,
-                             new_held_value, position_size_usd, entry_premium, effective_entry_pm,
-                             target_exit_pm, buy_price, split_elapsed);
+                             new_held_value, position_size_usd, relay_metrics.net_edge_pct,
+                             entry_premium, effective_entry_pm, target_exit_pm, buy_price, split_elapsed);
 
                 // Log entry split to CSV (actual fill price)
                 append_entry_split_log(signal.symbol, actual_filled, buy_price,
@@ -666,7 +682,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(
                 }
             } else {
                 bithumb_fill_future.get();  // Don't leak the future
-                Logger::error("[ADAPTIVE-ENTRY] Korean BUY failed, rolling back Bybit spot-margin short");
+                Logger::error("[RELAY-ENTRY] Korean BUY failed, rolling back Bybit spot-margin short");
                 Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
                 if (rollback.status != OrderStatus::Filled) {
                     Position mismatch;
@@ -686,7 +702,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(
                     mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
 
                     trigger_critical_stop(
-                        "[ADAPTIVE-ENTRY] Futures rollback failed after Korean BUY rejection (manual intervention required)",
+                        "[RELAY-ENTRY] Bybit rollback failed after Korean BUY rejection (manual intervention required)",
                         mismatch
                     );
                     return result;
@@ -712,7 +728,7 @@ ExecutionResult OrderManager::execute_entry_futures_first(
             Order foreign_order = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, exit_coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
-                Logger::error("[ADAPTIVE-EXIT] Futures COVER failed during entry, retrying");
+                Logger::error("[ADAPTIVE-EXIT] Bybit spot-margin cover failed during entry, retrying");
                 std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
                 continue;
             }
@@ -929,12 +945,12 @@ ExecutionResult OrderManager::execute_entry_futures_first(
     return result;
 }
 
-ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signal, const Position& position) {
+ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, const Position& position) {
     ExecutionResult result;
     result.position = position;
 
     auto korean_ex = get_korean_exchange(signal.korean_exchange);
-    auto foreign_ex = get_futures_exchange(signal.foreign_exchange);
+    auto foreign_ex = get_bybit_exchange();
 
     if (!korean_ex || !foreign_ex) {
         result.error_message = "Exchange not available";
@@ -1084,7 +1100,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
             Order foreign_order = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, exit_coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
-                Logger::error("[ADAPTIVE-EXIT] Futures COVER failed, retrying");
+                Logger::error("[ADAPTIVE-EXIT] Bybit spot-margin cover failed, retrying");
                 std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
                 continue;
             }
@@ -1232,7 +1248,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
             Order foreign_order = execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
 
             if (foreign_order.status != OrderStatus::Filled) {
-                Logger::error("[ADAPTIVE-REENTRY] Futures SHORT failed, retrying");
+                Logger::error("[ADAPTIVE-REENTRY] Bybit spot-margin short failed, retrying");
                 std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
                 continue;
             }
@@ -1256,7 +1272,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                     mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
 
                     trigger_critical_stop(
-                        "[ADAPTIVE-REENTRY] Futures rollback failed after min-order guard (manual intervention required)",
+                        "[ADAPTIVE-REENTRY] Bybit rollback failed after min-order guard (manual intervention required)",
                         mismatch
                     );
                     return result;
@@ -1336,7 +1352,7 @@ ExecutionResult OrderManager::execute_exit_futures_first(const ExitSignal& signa
                     mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
 
                     trigger_critical_stop(
-                        "[ADAPTIVE-REENTRY] Futures rollback failed after Korean BUY rejection (manual intervention required)",
+                        "[ADAPTIVE-REENTRY] Bybit rollback failed after Korean BUY rejection (manual intervention required)",
                         mismatch
                     );
                     return result;
@@ -1411,7 +1427,7 @@ ExecutionResult OrderManager::execute_split_entry(const ArbitrageSignal& signal)
     result.position.position_size_usd = position_size_usd;
 
     auto korean_ex = get_korean_exchange(signal.korean_exchange);
-    auto foreign_ex = get_futures_exchange(signal.foreign_exchange);
+    auto foreign_ex = get_bybit_exchange();
 
     if (!korean_ex || !foreign_ex) {
         result.error_message = "Exchange not available";
@@ -1535,8 +1551,8 @@ ExecutionResult OrderManager::execute_split_entry(const ArbitrageSignal& signal)
     return result;
 }
 
-bool OrderManager::prepare_foreign_shorting(const std::vector<SymbolId>& symbols) {
-    auto bybit = get_futures_exchange(Exchange::Bybit);
+bool OrderManager::prepare_bybit_shorting(const std::vector<SymbolId>& symbols) {
+    auto bybit = get_bybit_exchange();
     if (!bybit) {
         Logger::warn("Bybit preparation skipped: exchange not available");
         return false;
@@ -1550,7 +1566,7 @@ bool OrderManager::prepare_foreign_shorting(const std::vector<SymbolId>& symbols
         sample_symbol = SymbolId("BTC", "USDT");
     }
 
-    const bool ready = bybit->set_leverage(*sample_symbol, 2);
+    const bool ready = bybit->prepare_shorting(*sample_symbol);
     if (ready) {
         Logger::info("Prepared Bybit spot-margin shorting for {} symbols", symbols.size());
     } else {
@@ -1564,7 +1580,7 @@ ExecutionResult OrderManager::execute_exit(const ExitSignal& signal, const Posit
     result.position = position;
 
     auto korean_ex = get_korean_exchange(signal.korean_exchange);
-    auto foreign_ex = get_futures_exchange(signal.foreign_exchange);
+    auto foreign_ex = get_bybit_exchange();
 
     if (!korean_ex || !foreign_ex) {
         result.error_message = "Exchange not available";
@@ -1636,7 +1652,7 @@ Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, doub
 }
 
 Order OrderManager::execute_foreign_short(Exchange ex, const SymbolId& symbol, double quantity) {
-    auto short_ex = get_futures_exchange(ex);
+    auto short_ex = get_bybit_exchange();
     if (!short_ex) {
         Order order;
         order.status = OrderStatus::Rejected;
@@ -1658,7 +1674,7 @@ Order OrderManager::execute_korean_sell(Exchange ex, const SymbolId& symbol, dou
 }
 
 Order OrderManager::execute_foreign_cover(Exchange ex, const SymbolId& symbol, double quantity) {
-    auto short_ex = get_futures_exchange(ex);
+    auto short_ex = get_bybit_exchange();
     if (!short_ex) {
         Order order;
         order.status = OrderStatus::Rejected;
@@ -1675,7 +1691,7 @@ bool OrderManager::rollback_korean_buy(Exchange ex, const SymbolId& symbol, doub
 
 void OrderManager::query_foreign_fill(Exchange ex, Order& order) {
     if (order.order_id_str.empty() || order.status != OrderStatus::Filled) return;
-    auto short_ex = get_futures_exchange(ex);
+    auto short_ex = get_bybit_exchange();
     if (!short_ex) return;
     if (ex == Exchange::Bybit) {
         auto bybit = std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(short_ex);
@@ -1732,9 +1748,9 @@ void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbo
     }
 
     // Check Bybit spot-margin short liabilities
-    auto bybit = get_futures_exchange(Exchange::Bybit);
+    auto bybit = get_bybit_exchange();
     if (bybit) {
-        auto positions = bybit->get_positions();
+        auto positions = bybit->get_short_positions();
         for (const auto& pos : positions) {
             if (pos.foreign_amount > 0.0001) {  // Ignore dust
                 SymbolId krw_symbol(pos.symbol.get_base(), "KRW");

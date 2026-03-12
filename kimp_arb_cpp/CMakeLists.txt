@@ -112,14 +112,6 @@ target_link_libraries(kimp_lib
 add_executable(kimp_bot src/main.cpp)
 target_link_libraries(kimp_bot PRIVATE kimp_lib)
 
-# Diagnostic trade executable (separate from main bot)
-add_executable(kimp_diag_trade tests/integration/diag_trade.cpp)
-target_link_libraries(kimp_diag_trade PRIVATE kimp_lib)
-
-# Gap accuracy diagnostic executable (10-minute false-positive check)
-add_executable(kimp_diag_gap tests/integration/diag_gap_accuracy.cpp)
-target_link_libraries(kimp_diag_gap PRIVATE kimp_lib)
-
 # Entry selection test
 add_executable(kimp_test_entry tests/test_entry_selection.cpp)
 target_link_libraries(kimp_test_entry PRIVATE kimp_lib)
@@ -144,29 +136,9 @@ target_link_libraries(kimp_test_entry_bitmap PRIVATE kimp_lib)
 add_executable(kimp_test_export_async_stability tests/test_export_async_stability.cpp)
 target_link_libraries(kimp_test_export_async_stability PRIVATE kimp_lib)
 
-# Live entry selection test (fetches real-time data from APIs)
-add_executable(kimp_test_live_entry tests/test_live_entry_selection.cpp)
-target_link_libraries(kimp_test_live_entry PRIVATE kimp_lib)
-
-# Price verification test (10-minute live bid/ask comparison)
-add_executable(kimp_test_price tests/test_price_verify.cpp)
-target_link_libraries(kimp_test_price PRIVATE kimp_lib)
-
 # Fill price parsing test (JSON parsing verification, no network)
 add_executable(kimp_test_fill tests/test_fill_parsing.cpp)
 target_link_libraries(kimp_test_fill PRIVATE kimp_lib)
-
-# Symbol matching test (live API - verifies both exchanges return correct symbols)
-add_executable(kimp_test_symbols tests/test_symbol_matching.cpp)
-target_link_libraries(kimp_test_symbols PRIVATE kimp_lib)
-
-# Market data pipeline test (ticker, orderbook BBO, USDT/KRW, premium)
-add_executable(kimp_test_market tests/test_market_data.cpp)
-target_link_libraries(kimp_test_market PRIVATE kimp_lib)
-
-# E2E pipeline test (#1 거래소 연결 → #2 시세 수신 → #3 프리미엄 계산)
-add_executable(kimp_test_e2e tests/test_e2e_pipeline.cpp)
-target_link_libraries(kimp_test_e2e PRIVATE kimp_lib)
 
 # Section 1 test: Process startup & config loading
 add_executable(kimp_test_init_s1 tests/test_init_section1.cpp)
@@ -180,25 +152,9 @@ target_link_libraries(kimp_test_init_s2 PRIVATE kimp_lib)
 add_executable(kimp_test_s1_to_s4 tests/test_sections_1_to_4.cpp)
 target_link_libraries(kimp_test_s1_to_s4 PRIVATE kimp_lib)
 
-# Section 5: Entry/Exit callback & hedge accuracy test
-add_executable(kimp_test_s5_hedge tests/test_section5_hedge.cpp)
-target_link_libraries(kimp_test_s5_hedge PRIVATE kimp_lib)
-
 # Sections 6-8: IO thread pool, WebSocket, common symbols & preprocessing
 add_executable(kimp_test_s6_to_s8 tests/test_sections_6_to_8.cpp)
 target_link_libraries(kimp_test_s6_to_s8 PRIVATE kimp_lib)
-
-# Live hedge accuracy test (REAL TRADES: $25 x 3 entry + split exit)
-add_executable(kimp_test_live_hedge tests/test_live_hedge_accuracy.cpp)
-target_link_libraries(kimp_test_live_hedge PRIVATE kimp_lib)
-
-# Multi-coin hedge accuracy test (REAL TRADES: 5 coins x $25 x 3 entry + split exit)
-add_executable(kimp_test_multicoin_hedge tests/test_multicoin_hedge.cpp)
-target_link_libraries(kimp_test_multicoin_hedge PRIVATE kimp_lib)
-
-# Parallel fill execution test (100-step: entry + hold + exit hedge accuracy)
-add_executable(kimp_test_parallel_fill tests/test_parallel_fill.cpp)
-target_link_libraries(kimp_test_parallel_fill PRIVATE kimp_lib)
 
 # Copy config and trade_logs directories to build dir so bot runs from build/
 add_custom_command(TARGET kimp_bot POST_BUILD

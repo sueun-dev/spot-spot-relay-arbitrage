@@ -61,8 +61,8 @@ void test_section6_thread_config_optimal() {
     if (cores >= 8) {
         TEST("8+ cores: dedicated io_bithumb_core=1", cfg.io_bithumb_core == 1);
         TEST("8+ cores: dedicated io_bybit_core=2", cfg.io_bybit_core == 2);
-        TEST("8+ cores: strategy_core=4", cfg.strategy_core == 4);
-        TEST("8+ cores: execution_core=5", cfg.execution_core == 5);
+        TEST("8+ cores: strategy_core=3", cfg.strategy_core == 3);
+        TEST("8+ cores: execution_core=4", cfg.execution_core == 4);
     } else if (cores >= 4) {
         TEST("4+ cores: shared io cores", cfg.io_bithumb_core == 0 && cfg.io_bybit_core == 1);
         TEST("4+ cores: strategy_core=2", cfg.strategy_core == 2);
@@ -165,7 +165,7 @@ void test_section7_connect_pattern() {
     TEST("Bithumb ID correct", bithumb->get_exchange_id() == kimp::Exchange::Bithumb);
     TEST("Bybit ID correct", bybit->get_exchange_id() == kimp::Exchange::Bybit);
     TEST("Bithumb is Spot", bithumb->get_market_type() == kimp::MarketType::Spot);
-    TEST("Bybit is Spot", bybit->get_market_type() == kimp::MarketType::Spot);
+    TEST("Bybit is MarginSpot", bybit->get_market_type() == kimp::MarketType::MarginSpot);
 }
 
 void test_section7_polling_logic() {
@@ -389,10 +389,10 @@ void test_section8_premium_calculator() {
     // foreign_krw = 187.50 * 1380 = 258750
     // premium = (256800 - 258750) / 258750 * 100 = -0.7536%
     TEST_NEAR("Entry premium SOL ~= -0.75%", entry_pm, -0.7536, 0.01);
-    TEST("should_enter at -0.75% is false (threshold -0.99%)",
-         !kimp::strategy::PremiumCalculator::should_enter(entry_pm));
-    TEST("should_enter at -1.10% is true",
-         kimp::strategy::PremiumCalculator::should_enter(-1.10));
+    TEST("legacy should_enter at -0.75% is true (threshold 0.0%)",
+         kimp::strategy::PremiumCalculator::should_enter(entry_pm));
+    TEST("legacy should_enter at +0.10% is false",
+         !kimp::strategy::PremiumCalculator::should_enter(0.10));
 
     // Exit premium: korean_bid vs foreign_ask
     double exit_pm = kimp::strategy::PremiumCalculator::calculate_exit_premium(
@@ -421,8 +421,7 @@ void test_section8_capital_tracker() {
     TEST_NEAR("Current capital = $2000 (no P&L)", tracker.get_current_capital(), 2000.0, 1e-10);
     TEST_NEAR("Realized P&L = $0", tracker.get_realized_pnl(), 0.0, 1e-10);
 
-    // Position size: min(2000/1/2, 250) = min(1000, 250) = 250
-    TEST_NEAR("Position size = $250 (capped)", tracker.get_position_size_usd(), 250.0, 1e-10);
+    TEST_NEAR("Position size = $70 relay target", tracker.get_position_size_usd(), 70.0, 1e-10);
 
     // Add profit
     tracker.add_realized_pnl(1.50);  // $1.50 profit
@@ -495,33 +494,25 @@ void test_section8_price_cache_thread_safety() {
     TEST_NEAR("USDT/KRW Bithumb = 1385", cache.get_usdt_krw(kimp::Exchange::Bithumb), 1385.0, 1e-10);
 }
 
-void test_section8_funding_cache_and_leverage() {
-    std::cout << "\n--- Section 8.8: Funding cache & pre_set_leverage pattern ---\n";
+void test_section8_spot_short_symbol_prep() {
+    std::cout << "\n--- Section 8.8: Spot short symbol prep ---\n";
 
-    // Verify cached metadata path for Bybit spot prices
     kimp::strategy::PriceCache cache;
     kimp::SymbolId sol_usdt("SOL", "USDT");
 
-    // Simulate what bybit.cpp does for spot metadata
     cache.update(kimp::Exchange::Bybit, sol_usdt, 187.0, 188.0, 187.5);
-    cache.update_funding(kimp::Exchange::Bybit, sol_usdt, 0.0, 0, 0);
 
     auto data = cache.get_price(kimp::Exchange::Bybit, sol_usdt);
-    TEST("Spot metadata cached", data.valid && std::abs(data.funding_rate - 0.0) < 1e-10);
-    TEST("Funding interval = 0h", data.funding_interval_hours == 0);
-    TEST("Next funding time stored", data.next_funding_time == 0);
+    TEST("Spot metadata cached", data.valid && std::abs(data.bid - 187.0) < 1e-10);
+    TEST("Spot best ask cached", std::abs(data.ask - 188.0) < 1e-10);
 
-    // prepare_foreign_shorting pattern: just verify the symbol conversion concept
-    // (actual API call tested in integration tests)
     std::vector<kimp::SymbolId> symbols;
     symbols.emplace_back("SOL", "KRW");
     symbols.emplace_back("BTC", "KRW");
 
-    // Convert KRW→USDT (same pattern as prepare_foreign_shorting)
     for (const auto& sym : symbols) {
         kimp::SymbolId foreign(sym.get_base(), "USDT");
-        // Would call bybit->set_leverage(foreign, 2)
-        TEST(("Leverage symbol: " + foreign.to_string() + " correct").c_str(),
+        TEST(("Short symbol: " + foreign.to_string() + " correct").c_str(),
              std::string(foreign.get_quote()) == "USDT");
     }
 }
@@ -530,8 +521,8 @@ void test_section8_dynamic_exit_threshold() {
     std::cout << "\n--- Section 8.9: Dynamic exit threshold ---\n";
 
     // Verify TradingConfig constants
-    TEST_NEAR("ROUND_TRIP_FEE = 0.28%",
-              kimp::TradingConfig::ROUND_TRIP_FEE_PCT, 0.28, 0.001);
+    TEST_NEAR("ENTRY_TOTAL_FEE = 0.34%",
+              kimp::TradingConfig::ROUND_TRIP_FEE_PCT, 0.34, 0.001);
     TEST_NEAR("DYNAMIC_EXIT_SPREAD = fee + min_profit",
               kimp::TradingConfig::DYNAMIC_EXIT_SPREAD,
               kimp::TradingConfig::ROUND_TRIP_FEE_PCT + kimp::TradingConfig::MIN_NET_PROFIT_PCT,
@@ -562,12 +553,7 @@ void test_section8_dynamic_exit_threshold() {
     TEST_NEAR("Entry -1.50% uses floor threshold", required_exit3,
               kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD, 1e-10);
 
-    // Verify entry filter constants
-    TEST("MIN_FUNDING_INTERVAL = 0h",
-         kimp::TradingConfig::MIN_FUNDING_INTERVAL_HOURS == 0);
-    TEST("REQUIRE_POSITIVE_FUNDING = false",
-         kimp::TradingConfig::REQUIRE_POSITIVE_FUNDING == false);
-    TEST("SPLIT_ORDERS = 10", kimp::TradingConfig::SPLIT_ORDERS == 10);
+    TEST("SPLIT_ORDERS = 1", kimp::TradingConfig::SPLIT_ORDERS == 1);
     TEST_NEAR("ORDER_SIZE * SPLITS = POSITION_SIZE",
               kimp::TradingConfig::ORDER_SIZE_USD * kimp::TradingConfig::SPLIT_ORDERS,
               kimp::TradingConfig::POSITION_SIZE_USD, 1e-10);
@@ -599,7 +585,7 @@ int main() {
     test_section8_premium_calculator();
     test_section8_capital_tracker();
     test_section8_price_cache_thread_safety();
-    test_section8_funding_cache_and_leverage();
+    test_section8_spot_short_symbol_prep();
     test_section8_dynamic_exit_threshold();
 
     std::cout << "\n=== Results ===\n";

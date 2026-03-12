@@ -29,11 +29,10 @@ public:
     struct PriceData {
         double bid{0.0};
         double ask{0.0};
+        double bid_qty{0.0};
+        double ask_qty{0.0};
         double last{0.0};
-        double funding_rate{0.0};
-        uint64_t next_funding_time{0};
         uint64_t timestamp{0};
-        int funding_interval_hours{8};
         bool valid{false};
     };
 
@@ -41,10 +40,9 @@ private:
     struct PriceEntry {
         std::atomic<double> bid{0.0};
         std::atomic<double> ask{0.0};
+        std::atomic<double> bid_qty{0.0};
+        std::atomic<double> ask_qty{0.0};
         std::atomic<double> last{0.0};
-        std::atomic<double> funding_rate{0.0};
-        std::atomic<int> funding_interval_hours{8};
-        std::atomic<uint64_t> next_funding_time{0};
         std::atomic<uint64_t> timestamp{0};
     };
 
@@ -97,7 +95,7 @@ private:
 
 public:
     void update(Exchange ex, const SymbolId& symbol, double bid, double ask, double last,
-                uint64_t timestamp_ms = 0) {
+                uint64_t timestamp_ms = 0, double bid_qty = 0.0, double ask_qty = 0.0) {
         PriceKey key = make_key(ex, symbol);
         auto& shard = shard_for(key);
         const uint64_t ts = (timestamp_ms != 0)
@@ -112,6 +110,12 @@ public:
                 // Fast path: entry exists, just update atomics
                 it->second.bid.store(bid, std::memory_order_relaxed);
                 it->second.ask.store(ask, std::memory_order_relaxed);
+                if (bid_qty > 0.0) {
+                    it->second.bid_qty.store(bid_qty, std::memory_order_relaxed);
+                }
+                if (ask_qty > 0.0) {
+                    it->second.ask_qty.store(ask_qty, std::memory_order_relaxed);
+                }
                 it->second.last.store(last, std::memory_order_relaxed);
                 it->second.timestamp.store(ts, std::memory_order_release);
                 return;
@@ -123,31 +127,10 @@ public:
         auto& entry = shard.prices[key];
         entry.bid.store(bid, std::memory_order_relaxed);
         entry.ask.store(ask, std::memory_order_relaxed);
+        entry.bid_qty.store(bid_qty, std::memory_order_relaxed);
+        entry.ask_qty.store(ask_qty, std::memory_order_relaxed);
         entry.last.store(last, std::memory_order_relaxed);
         entry.timestamp.store(ts, std::memory_order_release);
-    }
-
-    void update_funding(Exchange ex, const SymbolId& symbol, double funding_rate,
-                        int interval_hours, uint64_t next_funding_time) {
-        PriceKey key = make_key(ex, symbol);
-        auto& shard = shard_for(key);
-
-        {
-            std::shared_lock read_lock(shard.mutex);
-            auto it = shard.prices.find(key);
-            if (it != shard.prices.end()) {
-                it->second.funding_rate.store(funding_rate, std::memory_order_relaxed);
-                it->second.funding_interval_hours.store(interval_hours, std::memory_order_relaxed);
-                it->second.next_funding_time.store(next_funding_time, std::memory_order_relaxed);
-                return;
-            }
-        }
-
-        std::unique_lock write_lock(shard.mutex);
-        auto& entry = shard.prices[key];
-        entry.funding_rate.store(funding_rate, std::memory_order_relaxed);
-        entry.funding_interval_hours.store(interval_hours, std::memory_order_relaxed);
-        entry.next_funding_time.store(next_funding_time, std::memory_order_relaxed);
     }
 
     void update_usdt_krw(Exchange ex, double price) {
@@ -172,11 +155,10 @@ public:
         return {
             entry.bid.load(std::memory_order_acquire),
             entry.ask.load(std::memory_order_acquire),
+            entry.bid_qty.load(std::memory_order_acquire),
+            entry.ask_qty.load(std::memory_order_acquire),
             entry.last.load(std::memory_order_acquire),
-            entry.funding_rate.load(std::memory_order_acquire),
-            entry.next_funding_time.load(std::memory_order_acquire),
             entry.timestamp.load(std::memory_order_acquire),
-            entry.funding_interval_hours.load(std::memory_order_acquire),
             true  // valid
         };
     }
@@ -448,6 +430,31 @@ public:
  */
 class PremiumCalculator {
 public:
+    struct RelayMetrics {
+        double match_qty{0.0};
+        double bithumb_top_krw{0.0};
+        double bithumb_top_usdt{0.0};
+        double bybit_top_usdt{0.0};
+        double bybit_top_krw{0.0};
+        double match_buy_krw{0.0};
+        double match_sell_usdt{0.0};
+        double match_sell_krw{0.0};
+        double max_tradable_usdt_at_best{0.0};
+        double target_coin_qty{0.0};
+        bool bithumb_can_fill_target{false};
+        bool bybit_can_fill_target{false};
+        bool both_can_fill_target{false};
+        double bithumb_total_fee_krw{0.0};
+        double bybit_total_fee_usdt{0.0};
+        double bybit_total_fee_krw{0.0};
+        double total_fee_krw{0.0};
+        double gross_spread_krw{0.0};
+        double gross_edge_pct{0.0};
+        double net_profit_krw{0.0};
+        double net_basis_krw{0.0};
+        double net_edge_pct{0.0};
+    };
+
     static double calculate_entry_premium(double korean_ask,
                                            double foreign_bid,
                                            double usdt_krw_rate) {
@@ -471,6 +478,53 @@ public:
     static bool should_exit(double premium) {
         return premium >= TradingConfig::EXIT_PREMIUM_THRESHOLD;
     }
+
+    static RelayMetrics calculate_relay_metrics(double korean_ask,
+                                                double korean_ask_qty,
+                                                double foreign_bid,
+                                                double foreign_bid_qty,
+                                                double usdt_krw_rate) {
+        RelayMetrics metrics;
+        if (korean_ask <= 0.0 || korean_ask_qty <= 0.0 ||
+            foreign_bid <= 0.0 || foreign_bid_qty <= 0.0 ||
+            usdt_krw_rate <= 0.0) {
+            return metrics;
+        }
+
+        metrics.match_qty = std::min(korean_ask_qty, foreign_bid_qty);
+        metrics.bithumb_top_krw = korean_ask * korean_ask_qty;
+        metrics.bithumb_top_usdt = metrics.bithumb_top_krw / usdt_krw_rate;
+        metrics.bybit_top_usdt = foreign_bid * foreign_bid_qty;
+        metrics.bybit_top_krw = metrics.bybit_top_usdt * usdt_krw_rate;
+        metrics.match_buy_krw = korean_ask * metrics.match_qty;
+        metrics.match_sell_usdt = foreign_bid * metrics.match_qty;
+        metrics.match_sell_krw = metrics.match_sell_usdt * usdt_krw_rate;
+        metrics.max_tradable_usdt_at_best = metrics.match_sell_usdt;
+        metrics.target_coin_qty = TradingConfig::TARGET_ENTRY_USDT / foreign_bid;
+        metrics.bithumb_can_fill_target = korean_ask_qty >= metrics.target_coin_qty;
+        metrics.bybit_can_fill_target = foreign_bid_qty >= metrics.target_coin_qty;
+        metrics.both_can_fill_target = metrics.bithumb_can_fill_target && metrics.bybit_can_fill_target;
+
+        const double bithumb_fee_per_trade_krw = metrics.match_buy_krw * TradingConfig::BITHUMB_FEE_RATE;
+        const double bybit_fee_per_trade_usdt = metrics.match_sell_usdt * TradingConfig::BYBIT_FEE_RATE;
+        const double bybit_fee_per_trade_krw = metrics.match_sell_krw * TradingConfig::BYBIT_FEE_RATE;
+        metrics.bithumb_total_fee_krw = bithumb_fee_per_trade_krw * TradingConfig::BITHUMB_FEE_EVENTS;
+        metrics.bybit_total_fee_usdt = bybit_fee_per_trade_usdt * TradingConfig::BYBIT_FEE_EVENTS;
+        metrics.bybit_total_fee_krw = bybit_fee_per_trade_krw * TradingConfig::BYBIT_FEE_EVENTS;
+        metrics.total_fee_krw = metrics.bithumb_total_fee_krw + metrics.bybit_total_fee_krw;
+
+        metrics.gross_spread_krw = metrics.match_sell_krw - metrics.match_buy_krw;
+        if (metrics.match_buy_krw > 0.0) {
+            metrics.gross_edge_pct = (metrics.gross_spread_krw / metrics.match_buy_krw) * 100.0;
+        }
+        metrics.net_profit_krw = metrics.gross_spread_krw - metrics.total_fee_krw;
+        metrics.net_basis_krw = metrics.match_buy_krw + metrics.total_fee_krw;
+        if (metrics.net_basis_krw > 0.0) {
+            metrics.net_edge_pct = (metrics.net_profit_krw / metrics.net_basis_krw) * 100.0;
+        }
+
+        return metrics;
+    }
 };
 
 /**
@@ -484,8 +538,12 @@ public:
         SymbolId symbol;
         double korean_bid{0.0};
         double korean_ask{0.0};
+        double korean_bid_qty{0.0};
+        double korean_ask_qty{0.0};
         double foreign_bid{0.0};
         double foreign_ask{0.0};
+        double foreign_bid_qty{0.0};
+        double foreign_ask_qty{0.0};
         double korean_price{0.0};
         double foreign_price{0.0};
         double usdt_rate{0.0};
@@ -493,9 +551,22 @@ public:
         double exit_premium{0.0};
         double premium_spread{0.0};   // entry - exit
         double premium{0.0};
-        double funding_rate{0.0};
-        int funding_interval_hours{8};
-        uint64_t next_funding_time{0};
+        double match_qty{0.0};
+        double target_coin_qty{0.0};
+        double max_tradable_usdt_at_best{0.0};
+        double bithumb_top_krw{0.0};
+        double bithumb_top_usdt{0.0};
+        double bybit_top_usdt{0.0};
+        double bybit_top_krw{0.0};
+        double gross_edge_pct{0.0};
+        double net_edge_pct{0.0};
+        double bithumb_total_fee_krw{0.0};
+        double bybit_total_fee_usdt{0.0};
+        double bybit_total_fee_krw{0.0};
+        double total_fee_krw{0.0};
+        double net_profit_krw{0.0};
+        bool both_can_fill_target{false};
+        uint64_t age_ms{0};
         bool entry_signal{false};
         bool exit_signal{false};
     };
@@ -599,10 +670,17 @@ private:
     struct alignas(64) CachedEntryPremium {
         std::atomic<double> entry_premium{100.0};  // High default = no signal
         std::atomic<double> korean_ask{0.0};
+        std::atomic<double> korean_ask_qty{0.0};
         std::atomic<double> foreign_bid{0.0};
-        std::atomic<double> funding_rate{0.0};
+        std::atomic<double> foreign_bid_qty{0.0};
+        std::atomic<double> match_qty{0.0};
+        std::atomic<double> target_coin_qty{0.0};
+        std::atomic<double> max_tradable_usdt_at_best{0.0};
+        std::atomic<double> gross_edge_pct{0.0};
+        std::atomic<double> net_edge_pct{0.0};
+        std::atomic<double> net_profit_krw{0.0};
         std::atomic<double> usdt_rate{0.0};
-        std::atomic<int> funding_interval{0};
+        std::atomic<bool> both_can_fill_target{false};
         std::atomic<bool> qualified{false};         // All entry filters passed
         std::atomic<bool> signal_fired{false};      // Dedup: reset when disqualified
     };

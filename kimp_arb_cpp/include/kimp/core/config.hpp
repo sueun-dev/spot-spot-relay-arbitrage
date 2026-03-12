@@ -88,10 +88,6 @@ constexpr const char* BYBIT_WS_PRIVATE = "wss://stream.bybit.com/v5/private";
 constexpr const char* BYBIT_WS_TRADE = "wss://stream.bybit.com/v5/trade";
 constexpr const char* BYBIT_REST = "https://api.bybit.com";
 
-// Gate.io
-constexpr const char* GATEIO_WS = "wss://fx-ws.gateio.ws/v4/ws/usdt";
-constexpr const char* GATEIO_REST = "https://api.gateio.ws";
-
 } // namespace endpoints
 
 } // namespace kimp

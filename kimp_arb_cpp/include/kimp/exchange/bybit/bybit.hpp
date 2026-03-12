@@ -21,7 +21,7 @@ namespace kimp::exchange::bybit {
  * - WebSocket for real-time data
  * - Borrow liability tracking via wallet balance
  */
-class BybitExchange : public ForeignFuturesExchangeBase {
+class BybitExchange : public ForeignShortExchangeBase {
 private:
     simdjson::ondemand::parser json_parser_;
     simdjson::padded_string json_buffer_{8192};
@@ -58,7 +58,7 @@ private:
 
 public:
     BybitExchange(net::io_context& ioc, ExchangeCredentials creds)
-        : ForeignFuturesExchangeBase(Exchange::Bybit, MarketType::Spot, "Bybit", ioc, std::move(creds)) {
+        : ForeignShortExchangeBase(Exchange::Bybit, MarketType::MarginSpot, "Bybit", ioc, std::move(creds)) {
     }
 
     bool connect() override;
@@ -68,16 +68,14 @@ public:
     void subscribe_orderbook(const std::vector<SymbolId>& symbols) override;
 
     std::vector<SymbolId> get_available_symbols() override;
-    double get_funding_rate(const SymbolId& symbol) override;
     std::vector<Ticker> fetch_all_tickers() override;
 
     Order place_market_order(const SymbolId& symbol, Side side, Quantity quantity) override;
     bool cancel_order(uint64_t order_id) override;
 
-    // Futures specific
-    bool set_leverage(const SymbolId& symbol, int leverage) override;
-    std::vector<Position> get_positions() override;
-    bool close_position(const SymbolId& symbol) override;
+    bool prepare_shorting(const SymbolId& symbol) override;
+    std::vector<Position> get_short_positions() override;
+    bool close_short_position(const SymbolId& symbol) override;
     Order open_short(const SymbolId& symbol, Quantity quantity) override;
     Order close_short(const SymbolId& symbol, Quantity quantity) override;
 
