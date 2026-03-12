@@ -829,50 +829,6 @@ int main(int argc, char* argv[]) {
     });
 
     // =========================================================================
-    // INITIAL PRICE LOADING via REST API (parallel fetch for ALL symbols)
-    // This ensures all 257+ symbols have prices BEFORE WebSocket streaming starts
-    // =========================================================================
-    spdlog::info("Loading initial prices via REST API (parallel)...");
-
-    // Launch parallel REST API calls (fast!)
-    auto bithumb_fetch = std::async(std::launch::async, [&bithumb]() {
-        return bithumb->fetch_all_tickers();
-    });
-
-    auto bybit_fetch = std::async(std::launch::async, [&bybit]() {
-        return bybit->fetch_all_tickers();
-    });
-
-    // Wait for both and process results
-    auto bithumb_tickers = bithumb_fetch.get();
-    auto bybit_tickers = bybit_fetch.get();
-
-    // Load Bithumb tickers into engine
-    int bithumb_loaded = 0;
-    for (const auto& ticker : bithumb_tickers) {
-        if (common_bases.count(std::string(ticker.symbol.get_base()))) {
-            engine.on_ticker_update(ticker);
-            ++bithumb_loaded;
-        }
-        // Also load USDT/KRW for exchange rate
-        if (ticker.symbol.get_base() == "USDT") {
-            engine.on_ticker_update(ticker);
-        }
-    }
-
-    // Load Bybit tickers into engine
-    int bybit_loaded = 0;
-    for (const auto& ticker : bybit_tickers) {
-        if (common_bases.count(std::string(ticker.symbol.get_base()))) {
-            engine.on_ticker_update(ticker);
-            ++bybit_loaded;
-        }
-    }
-
-    spdlog::info("Initial prices loaded: Bithumb={}, Bybit={}", bithumb_loaded, bybit_loaded);
-    // =========================================================================
-
-    // =========================================================================
     // STEP 12: WebSocket Subscriptions (real-time streaming)
     // =========================================================================
     bithumb->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
@@ -886,19 +842,8 @@ int main(int argc, char* argv[]) {
 
     // Fetch orderbook snapshots and subscribe to orderbookdepth for real bid/ask
     bithumb->fetch_all_orderbook_snapshots(bithumb_subs);
-    auto bithumb_bbo_seed = bithumb->fetch_all_tickers();
-    int bithumb_bbo_loaded = 0;
-    for (const auto& ticker : bithumb_bbo_seed) {
-        if (common_bases.count(std::string(ticker.symbol.get_base()))) {
-            engine.on_ticker_update(ticker);
-            ++bithumb_bbo_loaded;
-        }
-        if (ticker.symbol.get_base() == "USDT") {
-            engine.on_ticker_update(ticker);
-        }
-    }
     bithumb->subscribe_orderbook(bithumb_subs);
-    spdlog::info("Bithumb BBO seed loaded after snapshots: {}", bithumb_bbo_loaded);
+    spdlog::info("Bithumb orderbook snapshots primed; live cache will be driven by WebSocket only");
 
     bybit->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
         engine.on_ticker_update(ticker);
@@ -913,56 +858,10 @@ int main(int argc, char* argv[]) {
     spdlog::info("Subscribed to {} Bybit spot symbols (ticker + orderbook)", bybit_subs.size());
 
     // =========================================================================
-    // STEP 13: Background Refresh Threads (REST fallback for data maintenance)
+    // STEP 13: Warm-up
+    // Market data updates are WebSocket-only after subscriptions.
     // =========================================================================
-
-    // 13: Price refresh (every 4 minutes) - REST backup for non-USDT books only.
-    // USDT/KRW is owned by the live WebSocket stream and should not be periodically overwritten here.
-    std::atomic<bool> price_refresh_running{true};
-    std::mutex price_refresh_mutex;
-    std::condition_variable price_refresh_cv;
-    std::thread price_refresh_thread([&]() {
-        constexpr auto interval = std::chrono::minutes(4);
-        std::unique_lock<std::mutex> lock(price_refresh_mutex);
-        while (price_refresh_running && !g_shutdown) {
-            lock.unlock();
-
-            // Fetch both snapshots in parallel to minimize cross-exchange skew.
-            auto bithumb_fetch = std::async(std::launch::async, [&bithumb]() {
-                return bithumb->fetch_all_tickers();
-            });
-            auto bybit_fetch = std::async(std::launch::async, [&bybit]() {
-                return bybit->fetch_all_tickers();
-            });
-
-            auto bithumb_tickers_refresh = bithumb_fetch.get();
-            auto bybit_tickers_refresh = bybit_fetch.get();
-
-            const uint64_t snapshot_ms = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-
-            auto& cache = engine.get_price_cache();
-            for (const auto& ticker : bithumb_tickers_refresh) {
-                if (common_bases.count(std::string(ticker.symbol.get_base()))) {
-                    cache.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last,
-                                 snapshot_ms, ticker.bid_qty, ticker.ask_qty);
-                }
-            }
-
-            for (const auto& ticker : bybit_tickers_refresh) {
-                if (common_bases.count(std::string(ticker.symbol.get_base()))) {
-                    cache.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last,
-                                 snapshot_ms, ticker.bid_qty, ticker.ask_qty);
-                }
-            }
-
-            lock.lock();
-            price_refresh_cv.wait_for(lock, interval, [&] {
-                return !price_refresh_running || g_shutdown.load();
-            });
-        }
-    });
+    spdlog::info("Market data path: WebSocket-only after startup subscriptions");
 
     // =========================================================================
     // STARTUP RECOVERY: Check for existing positions (trade mode only)
@@ -1447,13 +1346,6 @@ int main(int argc, char* argv[]) {
     broadcast_running = false;
     if (broadcast_thread.joinable()) {
         broadcast_thread.join();
-    }
-
-    // Stop price refresh thread
-    price_refresh_running = false;
-    price_refresh_cv.notify_all();
-    if (price_refresh_thread.joinable()) {
-        price_refresh_thread.join();
     }
 
     ws_server->stop();  // Stop WebSocket server
