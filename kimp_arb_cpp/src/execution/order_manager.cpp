@@ -1,5 +1,6 @@
 #include "kimp/execution/order_manager.hpp"
 #include "kimp/core/logger.hpp"
+#include "kimp/core/optimization.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -284,14 +285,7 @@ namespace kimp::execution {
 OrderManager::OrderManager()
     : fill_query_executor_([this](FillQueryTask&& task, std::size_t worker_index) {
           handle_fill_query(std::move(task), worker_index);
-      }) {
-    LifecycleExecutorOptions options;
-    options.worker_count = 2;
-    options.push_spin_count = 128;
-    options.empty_spin_count = 1024;
-    options.idle_wait = std::chrono::microseconds(100);
-    fill_query_executor_.start(options);
-}
+      }) {}
 
 OrderManager::~OrderManager() {
     running_ = false;
@@ -299,25 +293,27 @@ OrderManager::~OrderManager() {
 }
 
 void OrderManager::set_exchange(Exchange ex, ExchangePtr exchange) {
-    exchanges_[static_cast<size_t>(ex)] = std::move(exchange);
+    exchanges_[static_cast<size_t>(ex)] = exchange;
+    if (ex == Exchange::Upbit) {
+        upbit_exchange_ = std::dynamic_pointer_cast<exchange::upbit::UpbitExchange>(exchange);
+    } else if (ex == Exchange::Bithumb) {
+        bithumb_exchange_ = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(exchange);
+    } else if (ex == Exchange::Bybit) {
+        bybit_exchange_ = std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(exchange);
+    }
 }
 
 OrderManager::KoreanExchangePtr OrderManager::get_korean_exchange(Exchange ex) {
-    auto ptr = exchanges_[static_cast<size_t>(ex)];
-    if (!ptr) return nullptr;
-
     if (ex == Exchange::Upbit) {
-        return std::dynamic_pointer_cast<exchange::upbit::UpbitExchange>(ptr);
+        return upbit_exchange_;
     } else if (ex == Exchange::Bithumb) {
-        return std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(ptr);
+        return bithumb_exchange_;
     }
     return nullptr;
 }
 
 OrderManager::BybitExchangePtr OrderManager::get_bybit_exchange() {
-    auto ptr = exchanges_[static_cast<size_t>(Exchange::Bybit)];
-    if (!ptr) return nullptr;
-    return std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(ptr);
+    return bybit_exchange_;
 }
 
 ExecutionResult OrderManager::execute_spot_relay_entry(
@@ -1423,9 +1419,8 @@ Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, doub
     }
 
     if (ex == Exchange::Bithumb) {
-        auto bithumb = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(korean_ex);
-        if (bithumb) {
-            return bithumb->place_market_buy_quantity(symbol, quantity);
+        if (bithumb_exchange_) {
+            return bithumb_exchange_->place_market_buy_quantity(symbol, quantity);
         }
     }
 
@@ -1467,22 +1462,44 @@ Order OrderManager::execute_foreign_cover(Exchange /*ex*/, const SymbolId& symbo
 
 void OrderManager::query_foreign_fill(Exchange ex, Order& order) {
     if (order.order_id_str.empty() || order.status != OrderStatus::Filled) return;
-    auto short_ex = get_bybit_exchange();
-    if (!short_ex) return;
-    if (ex == Exchange::Bybit) {
-        auto bybit = std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(short_ex);
-        if (bybit) bybit->query_order_fill(order.order_id_str, order);
+    if (ex == Exchange::Bybit && bybit_exchange_) {
+        bybit_exchange_->query_order_fill(order.order_id_str, order);
     }
 }
 
 void OrderManager::query_korean_fill(Exchange ex, const SymbolId& symbol, Order& order) {
     if (order.order_id_str.empty() || order.status != OrderStatus::Filled) return;
-    auto korean_ex = get_korean_exchange(ex);
-    if (!korean_ex) return;
     if (ex == Exchange::Bithumb) {
-        auto bithumb = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(korean_ex);
-        if (bithumb) bithumb->query_order_detail(order.order_id_str, symbol, order);
+        if (bithumb_exchange_) {
+            bithumb_exchange_->query_order_detail(order.order_id_str, symbol, order);
+        }
     }
+}
+
+void OrderManager::ensure_fill_query_executor_started() {
+    std::call_once(fill_query_executor_start_once_, [this]() {
+        auto thread_config = opt::ThreadConfig::optimal();
+        LifecycleExecutorOptions options;
+        options.worker_count = 2;
+        options.push_spin_count = 128;
+        options.empty_spin_count = 1024;
+        options.idle_wait = std::chrono::microseconds(100);
+        fill_query_executor_.start(options, [thread_config](std::size_t worker_index) {
+            const int total_cores = static_cast<int>(std::thread::hardware_concurrency());
+            int core_id = thread_config.execution_core;
+            if (core_id >= 0 && total_cores > 0) {
+                core_id = std::min(core_id + static_cast<int>(TradingConfig::MAX_POSITIONS) +
+                                       static_cast<int>(worker_index),
+                                   total_cores - 1);
+                if (opt::pin_to_core(core_id)) {
+                    Logger::info("Fill query worker {} pinned to core {}", worker_index, core_id);
+                }
+            }
+            if (opt::set_realtime_priority()) {
+                Logger::info("Fill query worker {} set to realtime priority", worker_index);
+            }
+        });
+    });
 }
 
 void OrderManager::handle_fill_query(FillQueryTask&& task, std::size_t /*worker_index*/) {
@@ -1506,6 +1523,7 @@ void OrderManager::handle_fill_query(FillQueryTask&& task, std::size_t /*worker_
 }
 
 void OrderManager::dispatch_fill_query(FillQueryTask task) {
+    ensure_fill_query_executor_started();
     if (!fill_query_executor_.enqueue(task)) {
         handle_fill_query(std::move(task), 0);
     }

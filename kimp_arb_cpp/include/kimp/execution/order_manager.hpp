@@ -61,12 +61,16 @@ private:
 
     // Exchange references
     std::array<ExchangePtr, static_cast<size_t>(Exchange::Count)> exchanges_{};
+    std::shared_ptr<exchange::upbit::UpbitExchange> upbit_exchange_;
+    std::shared_ptr<exchange::bithumb::BithumbExchange> bithumb_exchange_;
+    std::shared_ptr<exchange::bybit::BybitExchange> bybit_exchange_;
 
     // Strategy engine for position tracking
     strategy::ArbitrageEngine* engine_{nullptr};
 
     std::atomic<bool> running_{true};
     LifecycleExecutor<FillQueryTask, 64> fill_query_executor_;
+    std::once_flag fill_query_executor_start_once_;
 
 public:
     ~OrderManager();
@@ -135,6 +139,7 @@ private:
     // Async fill price queries (parallel with hedge orders)
     void query_foreign_fill(Exchange ex, Order& order);
     void query_korean_fill(Exchange ex, const SymbolId& symbol, Order& order);
+    void ensure_fill_query_executor_started();
     void handle_fill_query(FillQueryTask&& task, std::size_t worker_index);
     void dispatch_fill_query(FillQueryTask task);
     void wait_for_next_market_update(uint64_t update_seq_before_trade);

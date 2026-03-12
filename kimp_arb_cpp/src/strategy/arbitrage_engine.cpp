@@ -377,6 +377,20 @@ std::optional<ExitSignal> ArbitrageEngine::get_exit_signal() {
 }
 
 void ArbitrageEngine::wait_for_update(uint64_t last_seq, std::chrono::milliseconds timeout) const {
+    if (update_seq_.load(std::memory_order_acquire) != last_seq) {
+        return;
+    }
+
+    // Fast path: most wakes happen immediately after an order, so spin briefly
+    // before falling back to kernel-assisted sleep.
+    constexpr uint32_t spin_iterations = 2048;
+    for (uint32_t i = 0; i < spin_iterations; ++i) {
+        if (update_seq_.load(std::memory_order_acquire) != last_seq) {
+            return;
+        }
+        opt::cpu_pause();
+    }
+
     std::unique_lock lock(update_mutex_);
     update_cv_.wait_for(lock, timeout, [this, last_seq] {
         return update_seq_.load(std::memory_order_acquire) != last_seq;
