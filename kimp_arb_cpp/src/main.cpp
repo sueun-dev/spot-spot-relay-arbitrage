@@ -627,12 +627,10 @@ int main(int argc, char* argv[]) {
         spdlog::info("Monitor-only mode enabled: auto-trading callbacks are disabled");
     }
 
-    // ==========================================================================
-    // 병렬 포지션 관리: 조건 만족하는 모든 코인 동시 진입, 각각 0.8% 수익시 개별 청산
-    // - Entry: 8시간 펀딩 + 펀딩비 양수 + 프리미엄 <= -0.99%
-    // - Exit: 프리미엄 >= max(entry + 0.79%, +0.10%)
-    // - 최대 동시 포지션: 16개
-    // ==========================================================================
+    // Relay runtime:
+    // - entry is event-driven from the spot relay gate
+    // - each claimed symbol runs inside a dedicated lifecycle worker
+    // - exits are handled inside the lifecycle loop, not by a separate dispatcher
 
     // Get optimal thread configuration based on hardware
     auto thread_config = kimp::opt::ThreadConfig::optimal();

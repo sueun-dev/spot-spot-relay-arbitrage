@@ -8,8 +8,6 @@
 #include "kimp/strategy/arbitrage_engine.hpp"
 
 #include <memory>
-#include <future>
-#include <thread>
 #include <unordered_set>
 #include <mutex>
 
@@ -28,13 +26,13 @@ struct ExecutionResult {
 };
 
 /**
- * Order Manager handles trade execution with split orders and rollback
+ * Order Manager handles the spot relay lifecycle.
  *
  * Features:
- * - Split order execution (2 orders with interval)
- * - Parallel Korean/Foreign execution
- * - Automatic rollback on partial failure
- * - Position lifecycle management
+ * - Bithumb spot buy/sell execution
+ * - Bybit spot-margin short open/cover execution
+ * - Rollback and critical-stop safety handling
+ * - Position lifecycle persistence and recovery
  */
 class OrderManager {
 public:
@@ -49,8 +47,6 @@ private:
     // Strategy engine for position tracking
     strategy::ArbitrageEngine* engine_{nullptr};
 
-    // Execution thread
-    std::thread exec_thread_;
     std::atomic<bool> running_{true};
 
 public:
@@ -60,12 +56,6 @@ public:
     // Configuration
     void set_exchange(Exchange ex, ExchangePtr exchange);
     void set_engine(strategy::ArbitrageEngine* engine) { engine_ = engine; }
-
-    // Execute entry (open position) - parallel execution
-    ExecutionResult execute_entry(const ArbitrageSignal& signal);
-
-    // Execute exit (close position) - parallel execution
-    ExecutionResult execute_exit(const ExitSignal& signal, const Position& position);
 
     // Execute entry with foreign short FIRST for hedge sizing
     // 1. SHORT on Bybit spot margin
@@ -118,25 +108,15 @@ private:
     KoreanExchangePtr get_korean_exchange(Exchange ex);
     BybitExchangePtr get_bybit_exchange();
 
-    // Split order execution
-    ExecutionResult execute_split_entry(const ArbitrageSignal& signal);
-
     // Single order execution helpers
     Order execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount);
     Order execute_foreign_short(Exchange ex, const SymbolId& symbol, double quantity);
     Order execute_korean_sell(Exchange ex, const SymbolId& symbol, double quantity);
     Order execute_foreign_cover(Exchange ex, const SymbolId& symbol, double quantity);
 
-    // Rollback
-    bool rollback_korean_buy(Exchange ex, const SymbolId& symbol, double quantity);
-
     // Async fill price queries (parallel with hedge orders)
     void query_foreign_fill(Exchange ex, Order& order);
     void query_korean_fill(Exchange ex, const SymbolId& symbol, Order& order);
-
-    // P&L calculation
-    double calculate_pnl(const Position& pos, double exit_korean_price,
-                         double exit_foreign_price, double usdt_rate);
 };
 
 } // namespace kimp::execution

@@ -54,7 +54,7 @@ if [[ ${HELP_MODE} -eq 0 ]]; then
       echo "Fix network/VPN/DNS first, then retry." >&2
       exit 1
     fi
-    if ! curl -sS --max-time 8 "https://api.bybit.com/v5/market/tickers?category=linear" -o /dev/null; then
+    if ! curl -sS --max-time 8 "https://api.bybit.com/v5/market/tickers?category=spot" -o /dev/null; then
       echo "ERROR: Cannot reach Bybit REST endpoint (https://api.bybit.com)." >&2
       echo "Fix network/VPN/DNS first, then retry." >&2
       exit 1

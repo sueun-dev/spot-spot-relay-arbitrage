@@ -7,6 +7,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <mutex>
@@ -239,23 +240,6 @@ void append_exit_split_log(const kimp::Position& pos,
     });
 }
 
-std::string format_time(std::chrono::system_clock::time_point tp) {
-    auto t = std::chrono::system_clock::to_time_t(tp);
-    std::tm tm{};
-#if defined(_WIN32)
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()) % 1000;
-    char out[40];
-    std::snprintf(out, sizeof(out), "%s.%03lld", buf,
-                  static_cast<long long>(ms.count()));
-    return std::string(out);
-}
-
 uint64_t steady_now_ms() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -270,16 +254,6 @@ double spread_pct(double bid, double ask) {
         return std::numeric_limits<double>::infinity();
     }
     return ((ask - bid) / mid) * 100.0;
-}
-
-bool quote_is_fresh(const kimp::strategy::PriceCache::PriceData& price, uint64_t now_ms) {
-    if (!price.valid || price.timestamp == 0) {
-        return false;
-    }
-    if (now_ms < price.timestamp) {
-        return false;
-    }
-    return (now_ms - price.timestamp) <= kimp::TradingConfig::MAX_QUOTE_AGE_MS;
 }
 
 bool quote_pair_is_usable(const kimp::strategy::PriceCache::PriceData& korean_price,
@@ -310,9 +284,6 @@ namespace kimp::execution {
 
 OrderManager::~OrderManager() {
     running_ = false;
-    if (exec_thread_.joinable()) {
-        exec_thread_.join();
-    }
 }
 
 void OrderManager::set_exchange(Exchange ex, ExchangePtr exchange) {
@@ -335,10 +306,6 @@ OrderManager::BybitExchangePtr OrderManager::get_bybit_exchange() {
     auto ptr = exchanges_[static_cast<size_t>(Exchange::Bybit)];
     if (!ptr) return nullptr;
     return std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(ptr);
-}
-
-ExecutionResult OrderManager::execute_entry(const ArbitrageSignal& signal) {
-    return execute_split_entry(signal);
 }
 
 ExecutionResult OrderManager::execute_spot_relay_entry(
@@ -376,11 +343,10 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
     SymbolId foreign_symbol(signal.symbol.get_base(), "USDT");
 
     // =========================================================================
-    // ADAPTIVE SPLIT EXECUTION: 진입/청산 유기적 전환
-    // - premium <= -0.99%: entry split ($25 short + buy)
-    // - premium >= max(entry + 0.79%, +0.10%): exit split ($25 cover + sell, <$50 close all)
-    // - between: wait for market update
-    // Loop ends when: fully entered ($250) or fully exited (0 coins)
+    // SPOT RELAY LIFECYCLE
+    // - entry: net edge positive and both venues can fill the target size
+    // - exit: cover/sell when exit premium clears the dynamic threshold
+    // - between: wait for the next fresh market update
     // =========================================================================
     double held_amount = initial_position ? initial_position->korean_amount : 0.0;
     double total_korean_cost = initial_position
@@ -1412,145 +1378,6 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
     return result;
 }
 
-ExecutionResult OrderManager::execute_split_entry(const ArbitrageSignal& signal) {
-    ExecutionResult result;
-    result.position.symbol = signal.symbol;
-    result.position.korean_exchange = signal.korean_exchange;
-    result.position.foreign_exchange = signal.foreign_exchange;
-    result.position.entry_time = std::chrono::system_clock::now();
-    result.position.entry_premium = signal.premium;
-    result.position.korean_entry_price = signal.korean_ask;
-    result.position.foreign_entry_price = signal.foreign_bid;
-
-    // Dynamic position size based on current capital (복리 성장)
-    double position_size_usd = engine_ ? engine_->get_position_size_usd() : TradingConfig::POSITION_SIZE_USD;
-    result.position.position_size_usd = position_size_usd;
-
-    auto korean_ex = get_korean_exchange(signal.korean_exchange);
-    auto foreign_ex = get_bybit_exchange();
-
-    if (!korean_ex || !foreign_ex) {
-        result.error_message = "Exchange not available";
-        Logger::error("Entry failed: {}", result.error_message);
-        return result;
-    }
-
-    SymbolId foreign_symbol(signal.symbol.get_base(), "USDT");
-    // Leverage is pre-set to 1x at startup to avoid per-trade REST latency
-
-    double total_korean_amount = 0.0;
-    double total_foreign_amount = 0.0;
-
-    // Split order execution
-    for (int i = 0; i < TradingConfig::SPLIT_ORDERS; ++i) {
-        double order_size_usd = TradingConfig::ORDER_SIZE_USD;
-
-        // Re-check premium condition before each split
-        if (engine_) {
-            double current_premium = engine_->calculate_premium(
-                signal.symbol, signal.korean_exchange, signal.foreign_exchange);
-            if (current_premium > TradingConfig::ENTRY_PREMIUM_THRESHOLD) {
-                uint64_t seq = engine_->get_update_seq();
-                while (current_premium > TradingConfig::ENTRY_PREMIUM_THRESHOLD) {
-                    engine_->wait_for_update(seq, std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
-                    seq = engine_->get_update_seq();
-                    current_premium = engine_->calculate_premium(
-                        signal.symbol, signal.korean_exchange, signal.foreign_exchange);
-                }
-            }
-        }
-
-        // Calculate amounts
-        double coin_amount = order_size_usd / signal.foreign_bid;
-        double krw_amount = coin_amount * signal.korean_ask;
-
-        // Ensure minimum order amount
-        if (krw_amount < TradingConfig::MIN_ORDER_KRW) {
-            krw_amount = TradingConfig::MIN_ORDER_KRW;
-            coin_amount = krw_amount / signal.korean_ask;
-        }
-
-        // Execute Korean buy and Foreign short in parallel
-        std::future<Order> korean_future = std::async(std::launch::async, [&]() {
-            return execute_korean_buy(signal.korean_exchange, signal.symbol, coin_amount, krw_amount);
-        });
-
-        std::future<Order> foreign_future = std::async(std::launch::async, [&]() {
-            return execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
-        });
-
-        // Wait for both
-        Order korean_order = korean_future.get();
-        Order foreign_order = foreign_future.get();
-
-        // Check results
-        bool korean_success = korean_order.status == OrderStatus::Filled;
-        bool foreign_success = foreign_order.status == OrderStatus::Filled;
-
-        if (korean_success && foreign_success) {
-            // Both succeeded
-            total_korean_amount += coin_amount;  // Approximate, ideally get from order response
-            total_foreign_amount += coin_amount;
-        } else if (korean_success && !foreign_success) {
-            // Korean succeeded but foreign failed - ROLLBACK
-            Logger::error("Foreign order failed, rolling back Korean buy");
-
-            if (rollback_korean_buy(signal.korean_exchange, signal.symbol, coin_amount)) {
-            } else {
-                Logger::error("Rollback failed! Manual intervention required");
-                result.error_message = "Rollback failed after partial fill";
-                running_.store(false, std::memory_order_release);
-                if (engine_) {
-                    engine_->set_entry_suppressed(true);
-                }
-                break;
-            }
-        } else if (!korean_success && foreign_success) {
-            // Korean failed but foreign succeeded - close foreign position
-            Logger::error("Korean order failed, closing foreign short");
-            Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, coin_amount);
-            if (rollback.status != OrderStatus::Filled) {
-                Logger::error("Critical rollback failed after foreign short fill (manual intervention required)");
-                result.error_message = "Critical rollback failure after foreign short fill";
-                running_.store(false, std::memory_order_release);
-                if (engine_) {
-                    engine_->set_entry_suppressed(true);
-                }
-                break;
-            }
-        } else {
-            // Both failed
-            Logger::error("Both orders failed for split {}", i + 1);
-        }
-
-        // Wait between split orders (except for last)
-        if (i < TradingConfig::SPLIT_ORDERS - 1) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
-        }
-    }
-
-    if (!result.error_message.empty()) {
-        return result;
-    }
-
-    // Check if we got any fill
-    if (total_korean_amount > 0 && total_foreign_amount > 0) {
-        result.success = true;
-        result.position.korean_amount = total_korean_amount;
-        result.position.foreign_amount = total_foreign_amount;
-        result.position.is_active = true;
-        result.korean_filled_amount = total_korean_amount;
-        result.foreign_filled_amount = total_foreign_amount;
-
-    } else {
-        result.error_message = "No fills received";
-        Logger::error("Entry failed: {}", result.error_message);
-    }
-
-    return result;
-}
-
 bool OrderManager::prepare_bybit_shorting(const std::vector<SymbolId>& symbols) {
     auto bybit = get_bybit_exchange();
     if (!bybit) {
@@ -1575,64 +1402,6 @@ bool OrderManager::prepare_bybit_shorting(const std::vector<SymbolId>& symbols) 
     return ready;
 }
 
-ExecutionResult OrderManager::execute_exit(const ExitSignal& signal, const Position& position) {
-    ExecutionResult result;
-    result.position = position;
-
-    auto korean_ex = get_korean_exchange(signal.korean_exchange);
-    auto foreign_ex = get_bybit_exchange();
-
-    if (!korean_ex || !foreign_ex) {
-        result.error_message = "Exchange not available";
-        Logger::error("Exit failed: {}", result.error_message);
-        return result;
-    }
-
-    // Get actual balance from Korean exchange
-    double actual_korean_amount = korean_ex->get_balance(std::string(position.symbol.get_base()));
-    if (actual_korean_amount <= 0) {
-        actual_korean_amount = position.korean_amount;
-    }
-
-    SymbolId foreign_symbol(position.symbol.get_base(), "USDT");
-
-    // Execute in parallel
-    std::future<Order> korean_future = std::async(std::launch::async, [&]() {
-        return execute_korean_sell(signal.korean_exchange, position.symbol, actual_korean_amount);
-    });
-
-    std::future<Order> foreign_future = std::async(std::launch::async, [&]() {
-        return execute_foreign_cover(signal.foreign_exchange, foreign_symbol, position.foreign_amount);
-    });
-
-    Order korean_order = korean_future.get();
-    Order foreign_order = foreign_future.get();
-
-    bool korean_success = korean_order.status == OrderStatus::Filled;
-    bool foreign_success = foreign_order.status == OrderStatus::Filled;
-
-    if (korean_success && foreign_success) {
-        result.success = true;
-        result.position.exit_time = std::chrono::system_clock::now();
-        result.position.exit_premium = signal.premium;
-        result.position.korean_exit_price = signal.korean_bid;
-        result.position.foreign_exit_price = signal.foreign_ask;
-        result.position.is_active = false;
-
-        // Calculate P&L
-        result.position.realized_pnl_krw = calculate_pnl(
-            position, signal.korean_bid, signal.foreign_ask, signal.usdt_krw_rate);
-
-    } else {
-        result.error_message = "Exit orders failed";
-        Logger::error("Exit failed: korean={} foreign={}",
-                      korean_success ? "OK" : "FAILED",
-                      foreign_success ? "OK" : "FAILED");
-    }
-
-    return result;
-}
-
 Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount) {
     auto korean_ex = get_korean_exchange(ex);
     if (!korean_ex) {
@@ -1651,7 +1420,7 @@ Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, doub
     return korean_ex->place_market_buy_cost(symbol, krw_amount);
 }
 
-Order OrderManager::execute_foreign_short(Exchange ex, const SymbolId& symbol, double quantity) {
+Order OrderManager::execute_foreign_short(Exchange /*ex*/, const SymbolId& symbol, double quantity) {
     auto short_ex = get_bybit_exchange();
     if (!short_ex) {
         Order order;
@@ -1673,7 +1442,7 @@ Order OrderManager::execute_korean_sell(Exchange ex, const SymbolId& symbol, dou
     return korean_ex->place_market_order(symbol, Side::Sell, quantity);
 }
 
-Order OrderManager::execute_foreign_cover(Exchange ex, const SymbolId& symbol, double quantity) {
+Order OrderManager::execute_foreign_cover(Exchange /*ex*/, const SymbolId& symbol, double quantity) {
     auto short_ex = get_bybit_exchange();
     if (!short_ex) {
         Order order;
@@ -1682,11 +1451,6 @@ Order OrderManager::execute_foreign_cover(Exchange ex, const SymbolId& symbol, d
     }
 
     return short_ex->close_short(symbol, quantity);
-}
-
-bool OrderManager::rollback_korean_buy(Exchange ex, const SymbolId& symbol, double quantity) {
-    auto order = execute_korean_sell(ex, symbol, quantity);
-    return order.status == OrderStatus::Filled;
 }
 
 void OrderManager::query_foreign_fill(Exchange ex, Order& order) {
@@ -1707,23 +1471,6 @@ void OrderManager::query_korean_fill(Exchange ex, const SymbolId& symbol, Order&
         auto bithumb = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(korean_ex);
         if (bithumb) bithumb->query_order_detail(order.order_id_str, symbol, order);
     }
-}
-
-double OrderManager::calculate_pnl(const Position& pos, double exit_korean_price,
-                                    double exit_foreign_price, double usdt_rate) {
-    // Korean spot P&L (long position)
-    double korean_pnl_krw = (exit_korean_price - pos.korean_entry_price) * pos.korean_amount;
-
-    // Foreign spot-margin short P&L (sell borrowed coin at entry, buy back at exit)
-    double foreign_pnl_usd = (pos.foreign_entry_price - exit_foreign_price) * pos.foreign_amount;
-    double foreign_pnl_krw = foreign_pnl_usd * usdt_rate;
-
-    double total_pnl = korean_pnl_krw + foreign_pnl_krw;
-
-    Logger::debug("P&L calculation: korean={:.0f} KRW, foreign={:.2f} USD ({:.0f} KRW), total={:.0f} KRW",
-                  korean_pnl_krw, foreign_pnl_usd, foreign_pnl_krw, total_pnl);
-
-    return total_pnl;
 }
 
 void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbols,
@@ -1772,7 +1519,7 @@ void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbo
                  external_position_blacklist_.size());
 }
 
-bool OrderManager::is_safe_to_trade(const SymbolId& symbol, Exchange korean_ex, Exchange foreign_ex) {
+bool OrderManager::is_safe_to_trade(const SymbolId& symbol, Exchange /*korean_ex*/, Exchange /*foreign_ex*/) {
     // O(1) blacklist lookup - no API calls!
     std::lock_guard lock(blacklist_mutex_);
 
