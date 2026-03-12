@@ -2,8 +2,48 @@
 #include "kimp/core/logger.hpp"
 #include "kimp/core/optimization.hpp"
 
+#include <array>
 #include <sstream>
 #include <iomanip>
+
+namespace {
+
+std::string base64url_encode(std::string_view raw) {
+    auto encoded = kimp::utils::Crypto::base64_encode(
+        reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+    for (char& ch : encoded) {
+        if (ch == '+') ch = '-';
+        else if (ch == '/') ch = '_';
+    }
+    while (!encoded.empty() && encoded.back() == '=') {
+        encoded.pop_back();
+    }
+    return encoded;
+}
+
+std::string base64url_encode(const std::vector<uint8_t>& raw) {
+    auto encoded = kimp::utils::Crypto::base64_encode(raw);
+    for (char& ch : encoded) {
+        if (ch == '+') ch = '-';
+        else if (ch == '/') ch = '_';
+    }
+    while (!encoded.empty() && encoded.back() == '=') {
+        encoded.pop_back();
+    }
+    return encoded;
+}
+
+std::string sign_bithumb_v1_jwt(std::string_view secret_key,
+                                std::string_view payload_json) {
+    static constexpr std::string_view header_json = R"({"alg":"HS256","typ":"JWT"})";
+    std::string header_b64 = base64url_encode(header_json);
+    std::string payload_b64 = base64url_encode(payload_json);
+    std::string signing_input = header_b64 + "." + payload_b64;
+    auto signature = kimp::utils::Crypto::hmac_sha256_raw(secret_key, signing_input);
+    return signing_input + "." + base64url_encode(signature);
+}
+
+} // namespace
 
 namespace kimp::exchange::bithumb {
 
@@ -646,6 +686,40 @@ std::unordered_map<std::string, std::string> BithumbExchange::build_auth_headers
     };
 }
 
+std::string BithumbExchange::generate_v1_jwt_token() const {
+    std::ostringstream payload;
+    payload << R"({"access_key":")" << credentials_.api_key
+            << R"(","nonce":")" << utils::Crypto::generate_uuid()
+            << R"(","timestamp":)" << utils::Crypto::timestamp_ms()
+            << "}";
+    return sign_bithumb_v1_jwt(credentials_.secret_key, payload.str());
+}
+
+std::string BithumbExchange::generate_v1_jwt_token_with_query(const std::string& query_string) const {
+    std::ostringstream payload;
+    payload << R"({"access_key":")" << credentials_.api_key
+            << R"(","nonce":")" << utils::Crypto::generate_uuid()
+            << R"(","timestamp":)" << utils::Crypto::timestamp_ms()
+            << R"(,"query_hash":")" << utils::Crypto::sha512(query_string)
+            << R"(","query_hash_alg":"SHA512"})";
+    return sign_bithumb_v1_jwt(credentials_.secret_key, payload.str());
+}
+
+std::unordered_map<std::string, std::string> BithumbExchange::build_v1_auth_headers() const {
+    return {
+        {"Authorization", "Bearer " + generate_v1_jwt_token()},
+        {"accept", "application/json"}
+    };
+}
+
+std::unordered_map<std::string, std::string> BithumbExchange::build_v1_auth_headers(
+    const std::string& query_string) const {
+    return {
+        {"Authorization", "Bearer " + generate_v1_jwt_token_with_query(query_string)},
+        {"accept", "application/json"}
+    };
+}
+
 bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
     try {
         // Use padded_string to satisfy simdjson's padding requirement
@@ -772,9 +846,77 @@ void BithumbExchange::update_bbo(const std::string& symbol_key) {
     }
 }
 
-bool BithumbExchange::query_order_detail(const std::string& order_id, const SymbolId& symbol, Order& order) {
-    constexpr int MAX_RETRIES = 5;
-    constexpr int BASE_DELAY_MS = 300;  // 300, 600, 1200, 2400ms backoff
+bool BithumbExchange::query_order_detail_v1(const std::string& order_id, Order& order) {
+    const std::string query = "uuid=" + utils::Crypto::url_encode(order_id);
+    auto headers = build_v1_auth_headers(query);
+    auto response = rest_client_->get("/v1/order?" + query, headers);
+    if (!response.success) {
+        Logger::debug("[Bithumb] v1 order query failed for {}: {}", order_id, response.error);
+        return false;
+    }
+
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
+
+        double executed_volume = 0.0;
+        auto executed = doc["executed_volume"];
+        if (!executed.error()) {
+            executed_volume = opt::fast_stod(executed.get_string().value());
+        }
+        if (executed_volume <= 0.0) {
+            return false;
+        }
+
+        double total_funds = 0.0;
+        double total_units = 0.0;
+        auto trades = doc["trades"];
+        if (!trades.error()) {
+            for (auto trade : trades.get_array()) {
+                double volume = 0.0;
+                double funds = 0.0;
+
+                auto volume_field = trade["volume"];
+                if (!volume_field.error()) {
+                    volume = opt::fast_stod(volume_field.get_string().value());
+                }
+
+                auto funds_field = trade["funds"];
+                if (!funds_field.error()) {
+                    funds = opt::fast_stod(funds_field.get_string().value());
+                } else {
+                    auto price_field = trade["price"];
+                    if (!price_field.error()) {
+                        funds = opt::fast_stod(price_field.get_string().value()) * volume;
+                    }
+                }
+
+                if (volume > 0.0 && funds > 0.0) {
+                    total_units += volume;
+                    total_funds += funds;
+                }
+            }
+        }
+
+        order.filled_quantity = total_units > 0.0 ? total_units : executed_volume;
+        if (total_units > 0.0 && total_funds > 0.0) {
+            order.average_price = total_funds / total_units;
+        }
+
+        Logger::info("[Bithumb] Fill(v1): orderId={}, avgPrice={:.2f}, filledQty={:.8f}",
+                     order_id, order.average_price, order.filled_quantity);
+        return true;
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::debug("[Bithumb] Failed to parse v1 order detail for {}: {}", order_id, e.what());
+        return false;
+    }
+}
+
+bool BithumbExchange::query_order_detail_legacy(const std::string& order_id,
+                                                const SymbolId& symbol,
+                                                Order& order) {
+    static constexpr std::array<int, 5> retry_delays_ms{0, 80, 160, 320, 640};
 
     std::string endpoint = "/info/order_detail";
     std::ostringstream params;
@@ -783,12 +925,9 @@ bool BithumbExchange::query_order_detail(const std::string& order_id, const Symb
     params << "&payment_currency=" << symbol.get_quote();
     const std::string params_str = params.str();
 
-    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
-        if (attempt > 0) {
-            int delay = BASE_DELAY_MS * (1 << (attempt - 1));  // exponential backoff
-            Logger::warn("[Bithumb] Fill query retry {}/{} for order {} (wait {}ms)",
-                         attempt + 1, MAX_RETRIES, order_id, delay);
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    for (std::size_t attempt = 0; attempt < retry_delays_ms.size(); ++attempt) {
+        if (retry_delays_ms[attempt] > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(retry_delays_ms[attempt]));
         }
 
         auto headers = build_auth_headers(endpoint, params_str);
@@ -796,11 +935,9 @@ bool BithumbExchange::query_order_detail(const std::string& order_id, const Symb
 
         auto response = rest_client_->post(endpoint, params_str, headers);
         if (!response.success) {
-            Logger::warn("[Bithumb] Failed to query order detail: {}", response.error);
+            Logger::debug("[Bithumb] Legacy order detail query failed for {}: {}", order_id, response.error);
             continue;
         }
-
-        Logger::debug("[Bithumb] Order detail raw: {}", response.body);
 
         try {
             simdjson::ondemand::parser local_parser;
@@ -809,7 +946,6 @@ bool BithumbExchange::query_order_detail(const std::string& order_id, const Symb
 
             std::string_view status = doc["status"].get_string().value();
             if (status != "0000") {
-                Logger::warn("[Bithumb] Order detail query status: {}", std::string(status));
                 continue;
             }
 
@@ -824,33 +960,46 @@ bool BithumbExchange::query_order_detail(const std::string& order_id, const Symb
                     auto units_field = c["units"];
                     if (price_field.error() || units_field.error()) continue;
 
-                    std::string_view price_str = price_field.get_string().value();
-                    std::string_view units_str = units_field.get_string().value();
-                    double price = opt::fast_stod(price_str);
-                    double units = opt::fast_stod(units_str);
+                    double price = opt::fast_stod(price_field.get_string().value());
+                    double units = opt::fast_stod(units_field.get_string().value());
                     total_cost += price * units;
                     total_units += units;
                 }
             }
 
-            if (total_units > 0) {
+            if (total_units > 0.0) {
                 order.filled_quantity = total_units;
                 order.average_price = total_cost / total_units;
-                Logger::info("[Bithumb] Fill: orderId={}, avgPrice={:.2f}, filledQty={:.8f}",
+                Logger::info("[Bithumb] Fill(legacy): orderId={}, avgPrice={:.2f}, filledQty={:.8f}",
                              order_id, order.average_price, order.filled_quantity);
                 return true;
             }
-
-            // Contract array empty — order may not be settled yet
-            Logger::warn("[Bithumb] Order {} contract empty, attempt {}/{}",
-                         order_id, attempt + 1, MAX_RETRIES);
         } catch (const simdjson::simdjson_error& e) {
-            Logger::warn("[Bithumb] Failed to parse order detail: {}", e.what());
+            Logger::debug("[Bithumb] Failed to parse legacy order detail for {}: {}", order_id, e.what());
         }
     }
 
-    Logger::error("[Bithumb] Failed to get fill price after {} retries for order {}",
-                  MAX_RETRIES, order_id);
+    return false;
+}
+
+bool BithumbExchange::query_order_detail(const std::string& order_id, const SymbolId& symbol, Order& order) {
+    static constexpr std::array<int, 7> v1_fast_delays_ms{0, 15, 25, 40, 60, 90, 140};
+
+    for (std::size_t attempt = 0; attempt < v1_fast_delays_ms.size(); ++attempt) {
+        if (v1_fast_delays_ms[attempt] > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(v1_fast_delays_ms[attempt]));
+        }
+        if (query_order_detail_v1(order_id, order)) {
+            return true;
+        }
+    }
+
+    Logger::debug("[Bithumb] v1 fill lookup missed for {}, falling back to legacy order_detail", order_id);
+    if (query_order_detail_legacy(order_id, symbol, order)) {
+        return true;
+    }
+
+    Logger::error("[Bithumb] Failed to get fill price via v1+legacy paths for order {}", order_id);
     return false;
 }
 

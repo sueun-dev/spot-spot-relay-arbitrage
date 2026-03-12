@@ -87,9 +87,19 @@ private:
     std::string generate_signature(const std::string& endpoint,
                                     const std::string& params,
                                     int64_t timestamp) const;
+    std::string generate_v1_jwt_token() const;
+    std::string generate_v1_jwt_token_with_query(const std::string& query_string) const;
 
     std::unordered_map<std::string, std::string> build_auth_headers(
         const std::string& endpoint, const std::string& params = "") const;
+    std::unordered_map<std::string, std::string> build_v1_auth_headers() const;
+    std::unordered_map<std::string, std::string> build_v1_auth_headers(
+        const std::string& query_string) const;
+
+    bool query_order_detail_v1(const std::string& order_id, Order& order);
+    bool query_order_detail_legacy(const std::string& order_id,
+                                   const SymbolId& symbol,
+                                   Order& order);
 
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
     std::vector<std::string> parse_orderbookdepth_message(std::string_view message);

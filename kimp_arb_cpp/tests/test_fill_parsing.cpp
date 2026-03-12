@@ -208,6 +208,65 @@ FillData parse_bithumb_detail_response(const std::string& response) {
 }
 
 // ============================================================
+// Bithumb v1 /order 응답 파싱 로직 재현
+// (bithumb.cpp fast path 와 동일한 구조)
+// ============================================================
+FillData parse_bithumb_v1_order_response(const std::string& response) {
+    FillData fill;
+    try {
+        simdjson::ondemand::parser parser;
+        simdjson::padded_string padded(response);
+        auto doc = parser.iterate(padded);
+
+        double executed_volume = 0.0;
+        auto executed = doc["executed_volume"];
+        if (!executed.error()) {
+            executed_volume = opt::fast_stod(executed.get_string().value());
+        }
+        if (executed_volume <= 0.0) return fill;
+
+        double total_funds = 0.0;
+        double total_units = 0.0;
+        auto trades = doc["trades"];
+        if (!trades.error()) {
+            for (auto trade : trades.get_array()) {
+                double volume = 0.0;
+                double funds = 0.0;
+
+                auto volume_field = trade["volume"];
+                if (!volume_field.error()) {
+                    volume = opt::fast_stod(volume_field.get_string().value());
+                }
+
+                auto funds_field = trade["funds"];
+                if (!funds_field.error()) {
+                    funds = opt::fast_stod(funds_field.get_string().value());
+                } else {
+                    auto price_field = trade["price"];
+                    if (!price_field.error()) {
+                        funds = opt::fast_stod(price_field.get_string().value()) * volume;
+                    }
+                }
+
+                if (volume > 0.0 && funds > 0.0) {
+                    total_units += volume;
+                    total_funds += funds;
+                }
+            }
+        }
+
+        fill.filled_quantity = total_units > 0.0 ? total_units : executed_volume;
+        if (total_units > 0.0 && total_funds > 0.0) {
+            fill.average_price = total_funds / total_units;
+        }
+        fill.success = true;
+    } catch (...) {
+        fill.success = false;
+    }
+    return fill;
+}
+
+// ============================================================
 // Order fallback 로직 재현
 // (order_manager.cpp:257-258 과 동일)
 // ============================================================
@@ -588,6 +647,59 @@ void test_bithumb_detail_empty_contract() {
     } catch (...) { FAIL("unexpected exception"); }
 }
 
+void test_bithumb_v1_order_with_trades() {
+    TEST("Bithumb v1 /order - trades 배열로 정확 체결가 계산") {
+        std::string json = R"({
+            "uuid": "C0101000000001799231",
+            "side": "bid",
+            "ord_type": "price",
+            "price": "25000",
+            "state": "done",
+            "market": "KRW-ETH",
+            "created_at": "2024-07-09T16:32:23+09:00",
+            "volume": "0.00638",
+            "remaining_volume": "0",
+            "executed_volume": "0.00638",
+            "trades_count": 2,
+            "trades": [
+                {"market":"KRW-ETH","uuid":"t1","price":"3920000","volume":"0.00500","funds":"19600","side":"bid","created_at":"2024-07-09T16:32:23+09:00"},
+                {"market":"KRW-ETH","uuid":"t2","price":"3921000","volume":"0.00138","funds":"5410.98","side":"bid","created_at":"2024-07-09T16:32:23+09:00"}
+            ]
+        })";
+
+        auto fill = parse_bithumb_v1_order_response(json);
+        ASSERT_TRUE(fill.success, "v1 parse should succeed");
+        ASSERT_NEAR(fill.filled_quantity, 0.00638, 0.0000001, "filled qty");
+        double expected_vwap = (19600.0 + 5410.98) / 0.00638;
+        ASSERT_NEAR(fill.average_price, expected_vwap, 0.01, "avg price from funds");
+        PASS();
+    } catch (...) { FAIL("unexpected exception"); }
+}
+
+void test_bithumb_v1_order_qty_only() {
+    TEST("Bithumb v1 /order - trades 없어도 executed_volume은 즉시 사용") {
+        std::string json = R"({
+            "uuid": "C0101000000001799231",
+            "side": "ask",
+            "ord_type": "market",
+            "state": "done",
+            "market": "KRW-XRP",
+            "created_at": "2024-07-09T16:32:23+09:00",
+            "volume": "25",
+            "remaining_volume": "0",
+            "executed_volume": "25",
+            "trades_count": 0,
+            "trades": []
+        })";
+
+        auto fill = parse_bithumb_v1_order_response(json);
+        ASSERT_TRUE(fill.success, "qty-only parse should still succeed");
+        ASSERT_NEAR(fill.filled_quantity, 25.0, 0.0001, "filled qty from executed_volume");
+        ASSERT_NEAR(fill.average_price, 0.0, 0.0001, "avg price unresolved without trades");
+        PASS();
+    } catch (...) { FAIL("unexpected exception"); }
+}
+
 void test_fallback_with_real_fill() {
     TEST("Fallback 로직 - fill 데이터 있을 때 실제값 사용") {
         // Simulating: order.filled_quantity = 0.01, order.average_price = 2718.35
@@ -892,6 +1004,8 @@ int main() {
     test_bithumb_detail_error_status();
     test_bithumb_detail_empty_contract();
     test_bithumb_sell_detail();
+    test_bithumb_v1_order_with_trades();
+    test_bithumb_v1_order_qty_only();
 
     std::cout << "\n[Fallback 로직]\n";
     test_fallback_with_real_fill();
