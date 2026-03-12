@@ -1317,26 +1317,43 @@ int main(int argc, char* argv[]) {
                 if (!premiums.empty()) {
                     std::sort(premiums.begin(), premiums.end(),
                         [](const auto& a, const auto& b) { return a.net_edge_pct > b.net_edge_pct; });
+                    std::vector<kimp::strategy::ArbitrageEngine::PremiumInfo> visible_premiums;
+                    visible_premiums.reserve(premiums.size());
+                    for (const auto& p : premiums) {
+                        const bool displayable =
+                            p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
+                            p.net_profit_krw > 0.0;
+                        if (displayable) {
+                            visible_premiums.push_back(p);
+                        }
+                    }
 
                     if (live_monitor_guard.active()) {
                         live_monitor_guard.clear_frame();
-                    } else {
+                    } else if (::isatty(STDOUT_FILENO) == 1) {
                         std::cout << "\033[2J\033[H";
                     }
-                    std::cout << fmt::format("=== Spot Relay Monitor | {} symbols | 환율: {:.2f} KRW/USDT | target: {:.2f} USDT | every {}s ===\n",
-                        premiums.size(), premiums[0].usdt_rate, kimp::TradingConfig::TARGET_ENTRY_USDT, monitor_interval_sec);
-                    std::cout << "Columns: 빗썸 ask/qty/총액, 바이비트 bid/qty, 매칭수량, gross/net, 수수료, 순손익, age/1틱\n";
+                    std::cout << fmt::format("=== Spot Relay Monitor | enterable {} / tracked {} | 환율: {:.2f} KRW/USDT | target: {:.2f} USDT | every {}s ===\n",
+                        std::count_if(visible_premiums.begin(), visible_premiums.end(), [](const auto& p) {
+                            return p.both_can_fill_target && p.match_qty > 0.0;
+                        }),
+                        premiums.size(), premiums[0].usdt_rate,
+                        kimp::TradingConfig::TARGET_ENTRY_USDT, monitor_interval_sec);
+                    std::cout << "Columns: 순손익 양수 코인만 표시 | 실제 진입 가능 여부는 Age/1Tick 의 YES/NO 로 확인\n";
                     std::cout << fmt::format(
-                        "{:<10} {:>11} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12} {:>6}\n",
+                        "{:<10} {:>11} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12}\n",
                         "Symbol", "B_ask", "B_qty", "B_KRW", "By_bid", "By_qty", "MatchQty",
-                        "Gross%", "Net%", "BFeeKRW", "ByFeeU", "NetKRW", "Age/1Tick", "Sig");
+                        "Gross%", "Net%", "BFeeKRW", "ByFeeU", "NetKRW", "Age/1Tick");
                     std::cout << std::string(180, '-') << "\n";
 
-                    for (const auto& p : premiums) {
+                    if (visible_premiums.empty()) {
+                        std::cout << "현재 순손익 양수 코인이 없습니다.\n";
+                    }
+
+                    for (const auto& p : visible_premiums) {
                         const char* one_tick = p.both_can_fill_target ? "YES" : "NO";
-                        const char* sig = p.entry_signal ? "ENT" : (p.exit_signal ? "EXT" : "-");
                         std::cout << fmt::format(
-                            "{:<10} {:>11.2f} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>11.2f} {:>12} {:>6}\n",
+                            "{:<10} {:>11.2f} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>11.2f} {:>12}\n",
                             p.symbol.get_base(),
                             p.korean_ask, p.korean_ask_qty,
                             p.bithumb_top_krw,
@@ -1346,14 +1363,20 @@ int main(int argc, char* argv[]) {
                             p.bithumb_total_fee_krw,
                             p.bybit_total_fee_usdt,
                             p.net_profit_krw,
-                            fmt::format("{}ms/{}", p.age_ms, one_tick),
-                            sig);
+                            fmt::format("{}ms/{}", p.age_ms, one_tick));
                     }
 
                     std::cout << std::string(180, '-') << "\n";
 
                     auto positive_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
-                        return p.entry_signal;
+                        return p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
+                               p.net_profit_krw > 0.0;
+                    });
+                    auto enterable_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
+                        return p.both_can_fill_target &&
+                               p.match_qty > 0.0 &&
+                               p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
+                               p.net_profit_krw > 0.0;
                     });
                     const auto bithumb_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
                         return p.korean_ask_qty > 0.0;
@@ -1365,11 +1388,12 @@ int main(int argc, char* argv[]) {
                         return p.korean_ask_qty > 0.0 && p.foreign_bid_qty > 0.0;
                     });
                     std::cout << fmt::format(
-                        "ready: bithumb {}/{} | bybit {}/{} | both {}/{} | positive+1tick {} | fee model: 빗썸 {}회 + 바이비트 {}회\n",
+                        "ready: bithumb {}/{} | bybit {}/{} | both {}/{} | positive net {} | enterable {} | fee model: 빗썸 {}회 + 바이비트 {}회\n",
                         bithumb_ready, premiums.size(),
                         bybit_ready, premiums.size(),
                         both_ready, premiums.size(),
                         positive_count,
+                        enterable_count,
                         kimp::TradingConfig::BITHUMB_FEE_EVENTS,
                         kimp::TradingConfig::BYBIT_FEE_EVENTS);
 
