@@ -334,7 +334,6 @@ struct TradingConfig {
     static constexpr double EXIT_PREMIUM_THRESHOLD = 0.25;    // Exit floor: premium >= +0.25%
 
     static constexpr double MAX_PRICE_DIFF_PERCENT = 50.0;
-    static constexpr int USDT_UPDATE_INTERVAL_MS = 180000;    // 3 minutes
     static constexpr double MIN_ORDER_KRW = 5000.0;           // Minimum order in KRW
 
     // Quote quality guards — ENTRY (strict: avoid bad fills on new positions)

@@ -29,7 +29,6 @@ struct RuntimeConfig {
     double entry_premium_threshold{TradingConfig::ENTRY_PREMIUM_THRESHOLD};
     double exit_premium_threshold{TradingConfig::EXIT_PREMIUM_THRESHOLD};
     double max_price_diff_percent{TradingConfig::MAX_PRICE_DIFF_PERCENT};
-    int usdt_update_interval_ms{TradingConfig::USDT_UPDATE_INTERVAL_MS};
 
     // Exchange credentials
     std::unordered_map<Exchange, ExchangeCredentials> exchanges;

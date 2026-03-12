@@ -10,7 +10,6 @@ trading:
   entry_premium_threshold: 0.0
   exit_premium_threshold: 0.25
   max_price_diff_percent: 50.0
-  usdt_update_interval_ms: 180000  # 3 minutes
 
 exchanges:
   upbit:

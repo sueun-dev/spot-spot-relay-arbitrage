@@ -916,7 +916,8 @@ int main(int argc, char* argv[]) {
     // STEP 13: Background Refresh Threads (REST fallback for data maintenance)
     // =========================================================================
 
-    // 13: Price refresh (every 4 minutes) - WS backup, USDT/KRW sync
+    // 13: Price refresh (every 4 minutes) - REST backup for non-USDT books only.
+    // USDT/KRW is owned by the live WebSocket stream and should not be periodically overwritten here.
     std::atomic<bool> price_refresh_running{true};
     std::mutex price_refresh_mutex;
     std::condition_variable price_refresh_cv;
@@ -943,13 +944,6 @@ int main(int argc, char* argv[]) {
 
             auto& cache = engine.get_price_cache();
             for (const auto& ticker : bithumb_tickers_refresh) {
-                if (ticker.symbol.get_base() == "USDT") {
-                    double usdt_price = ticker.last;
-                    if (ticker.bid > 0.0 && ticker.ask > 0.0 && ticker.ask >= ticker.bid) {
-                        usdt_price = (ticker.bid + ticker.ask) * 0.5;
-                    }
-                    cache.update_usdt_krw(ticker.exchange, usdt_price);
-                }
                 if (common_bases.count(std::string(ticker.symbol.get_base()))) {
                     cache.update(ticker.exchange, ticker.symbol, ticker.bid, ticker.ask, ticker.last,
                                  snapshot_ms, ticker.bid_qty, ticker.ask_qty);

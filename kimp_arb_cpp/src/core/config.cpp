@@ -42,7 +42,6 @@ RuntimeConfig ConfigLoader::load(const std::string& path) {
             if (t["entry_premium_threshold"]) config.entry_premium_threshold = t["entry_premium_threshold"].as<double>();
             if (t["exit_premium_threshold"]) config.exit_premium_threshold = t["exit_premium_threshold"].as<double>();
             if (t["max_price_diff_percent"]) config.max_price_diff_percent = t["max_price_diff_percent"].as<double>();
-            if (t["usdt_update_interval_ms"]) config.usdt_update_interval_ms = t["usdt_update_interval_ms"].as<int>();
         }
 
         // Exchange configs
