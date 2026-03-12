@@ -245,6 +245,7 @@ void WebSocketClient::on_read(beast::error_code ec, std::size_t bytes_transferre
         auto type = ws_->got_text() ? MessageType::Text : MessageType::Binary;
         on_message_(data, type);
     }
+    read_buffer_.consume(read_buffer_.size());
 
     // Continue reading
     do_read();

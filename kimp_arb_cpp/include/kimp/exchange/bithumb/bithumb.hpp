@@ -101,6 +101,7 @@ private:
                                    const SymbolId& symbol,
                                    Order& order);
 
+    std::optional<Ticker> make_bbo_ticker(const std::string& symbol_key);
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
     std::vector<std::string> parse_orderbookdepth_message(std::string_view message);
     void update_bbo(const std::string& symbol_key);

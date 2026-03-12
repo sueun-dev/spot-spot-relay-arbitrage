@@ -681,6 +681,13 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    bithumb->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
+        engine.on_ticker_update(ticker);
+    });
+    bybit->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
+        engine.on_ticker_update(ticker);
+    });
+
     // Connect
     spdlog::info("Connecting to exchanges...");
     bithumb->connect();
@@ -848,10 +855,6 @@ int main(int argc, char* argv[]) {
     // =========================================================================
     // STEP 12: WebSocket Subscriptions (real-time streaming)
     // =========================================================================
-    bithumb->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
-        engine.on_ticker_update(ticker);
-    });
-
     std::vector<kimp::SymbolId> bithumb_subs = common_symbols;
     bithumb_subs.emplace_back("USDT", "KRW");  // For exchange rate
     bithumb->subscribe_ticker(bithumb_subs);
@@ -862,23 +865,82 @@ int main(int argc, char* argv[]) {
     bithumb->subscribe_orderbook(bithumb_subs);
     spdlog::info("Bithumb orderbook snapshots primed; live cache will be driven by WebSocket only");
 
-    bybit->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
-        engine.on_ticker_update(ticker);
-    });
-
     std::vector<kimp::SymbolId> bybit_subs;
     for (const auto& s : common_symbols) {
         bybit_subs.emplace_back(std::string(s.get_base()), "USDT");
     }
-    bybit->subscribe_ticker(bybit_subs);
     bybit->subscribe_orderbook(bybit_subs);
-    spdlog::info("Subscribed to {} Bybit spot symbols (ticker + orderbook)", bybit_subs.size());
+    spdlog::info("Subscribed to {} Bybit spot symbols (orderbook-only BBO path)", bybit_subs.size());
 
     // =========================================================================
     // STEP 13: Warm-up
     // Market data updates are WebSocket-only after subscriptions.
     // =========================================================================
     spdlog::info("Market data path: WebSocket-only after startup subscriptions");
+
+    std::thread([&engine, common_symbols]() {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (g_shutdown) {
+            return;
+        }
+
+        size_t bithumb_ready = 0;
+        size_t bybit_ready = 0;
+        size_t both_ready = 0;
+        std::vector<std::string> missing_bithumb;
+        std::vector<std::string> missing_bybit;
+        missing_bithumb.reserve(5);
+        missing_bybit.reserve(5);
+        auto join_samples = [](const std::vector<std::string>& samples) {
+            std::string joined;
+            for (size_t i = 0; i < samples.size(); ++i) {
+                if (i > 0) {
+                    joined += ", ";
+                }
+                joined += samples[i];
+            }
+            return joined;
+        };
+
+        for (const auto& symbol : common_symbols) {
+            const auto korean_price = engine.get_price_cache().get_price(kimp::Exchange::Bithumb, symbol);
+            const kimp::SymbolId bybit_symbol(symbol.get_base(), "USDT");
+            const auto foreign_price = engine.get_price_cache().get_price(kimp::Exchange::Bybit, bybit_symbol);
+
+            const bool korean_ok = korean_price.valid && korean_price.ask > 0.0;
+            const bool foreign_ok = foreign_price.valid && foreign_price.bid > 0.0;
+
+            if (korean_ok) {
+                ++bithumb_ready;
+            } else if (missing_bithumb.size() < 5) {
+                missing_bithumb.push_back(symbol.to_string());
+            }
+
+            if (foreign_ok) {
+                ++bybit_ready;
+            } else if (missing_bybit.size() < 5) {
+                missing_bybit.push_back(bybit_symbol.to_string());
+            }
+
+            if (korean_ok && foreign_ok) {
+                ++both_ready;
+            }
+        }
+
+        const double usdt_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Bithumb);
+        spdlog::info("[MarketData] 5s snapshot: bithumb {}/{} | bybit {}/{} | both {}/{} | usdt {:.2f} | cache entries {}",
+                     bithumb_ready, common_symbols.size(),
+                     bybit_ready, common_symbols.size(),
+                     both_ready, common_symbols.size(),
+                     usdt_rate,
+                     engine.get_price_cache().size());
+
+        if (bithumb_ready != common_symbols.size() || bybit_ready != common_symbols.size() || usdt_rate <= 0.0) {
+            spdlog::warn("[MarketData] sample missing bithumb=[{}] bybit=[{}]",
+                         join_samples(missing_bithumb),
+                         join_samples(missing_bybit));
+        }
+    }).detach();
 
     // =========================================================================
     // STARTUP RECOVERY: Check for existing positions (trade mode only)

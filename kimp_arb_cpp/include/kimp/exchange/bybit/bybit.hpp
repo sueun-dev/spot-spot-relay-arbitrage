@@ -39,6 +39,7 @@ private:
     // Private WS for real-time fill data (replaces REST fill query)
     std::shared_ptr<network::WebSocketClient> private_ws_;
     std::atomic<bool> private_ws_authenticated_{false};
+    std::atomic<bool> public_ws_parse_warned_{false};
 
     // Fill cache: orderId → {avgPrice, filledQty} populated by Private WS order stream
     struct FillInfo {

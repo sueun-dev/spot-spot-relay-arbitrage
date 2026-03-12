@@ -140,6 +140,10 @@ target_link_libraries(kimp_test_export_async_stability PRIVATE kimp_lib)
 add_executable(kimp_test_fill tests/test_fill_parsing.cpp)
 target_link_libraries(kimp_test_fill PRIVATE kimp_lib)
 
+# Regression: Bybit orderbook WS payload must parse into callback-ready BBO ticker
+add_executable(kimp_test_bybit_orderbook_ws tests/test_bybit_orderbook_ws.cpp)
+target_link_libraries(kimp_test_bybit_orderbook_ws PRIVATE kimp_lib)
+
 # Section 1 test: Process startup & config loading
 add_executable(kimp_test_init_s1 tests/test_init_section1.cpp)
 target_link_libraries(kimp_test_init_s1 PRIVATE kimp_lib)

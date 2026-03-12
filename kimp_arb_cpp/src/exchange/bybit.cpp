@@ -644,6 +644,10 @@ void BybitExchange::on_ws_message(std::string_view message) {
     Ticker ticker;
     if (parse_ticker_message(message, ticker)) {
         dispatch_ticker(ticker);
+    } else if (!public_ws_parse_warned_.exchange(true, std::memory_order_relaxed) &&
+               message.find("orderbook.1.") != std::string_view::npos) {
+        Logger::warn("[Bybit-WS] Failed to parse orderbook payload: {}",
+                     std::string(message.substr(0, 240)));
     }
 }
 
@@ -743,15 +747,13 @@ bool BybitExchange::ensure_spot_margin_mode() {
 
 bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
     try {
-        // Use padded_string to satisfy simdjson's padding requirement
-        simdjson::ondemand::parser local_parser;
+        simdjson::dom::parser local_parser;
         simdjson::padded_string padded(message);
-        auto doc = local_parser.iterate(padded);
+        auto doc = local_parser.parse(padded);
 
-        auto topic = doc["topic"];
-        if (topic.error()) return false;
-
-        std::string_view topic_str = topic.get_string().value();
+        auto topic_elem = doc["topic"];
+        if (topic_elem.error()) return false;
+        std::string_view topic_str = std::string_view(topic_elem.get_c_str().value());
 
         auto data = doc["data"];
         if (data.error()) return false;
@@ -759,60 +761,62 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
         ticker.exchange = Exchange::Bybit;
         ticker.timestamp = std::chrono::steady_clock::now();
         if (topic_str.substr(0, 8) == "tickers.") {
-            std::string_view symbol_str = data["symbol"].get_string().value();
+            auto symbol_elem = data["symbol"];
+            if (symbol_elem.error()) return false;
+            std::string_view symbol_str = std::string_view(symbol_elem.get_c_str().value());
             if (symbol_str.size() > 4) {
                 std::string base(symbol_str.substr(0, symbol_str.size() - 4));
                 ticker.symbol = SymbolId(base, "USDT");
             }
 
-            std::string_view last_str = data["lastPrice"].get_string().value();
-            ticker.last = opt::fast_stod(last_str);
+            auto last_elem = data["lastPrice"];
+            if (last_elem.error()) return false;
+            ticker.last = opt::fast_stod(last_elem.get_c_str().value());
 
-            std::string_view bid_str = data["bid1Price"].get_string().value();
-            ticker.bid = opt::fast_stod(bid_str);
+            auto bid_elem = data["bid1Price"];
+            if (bid_elem.error()) return false;
+            ticker.bid = opt::fast_stod(bid_elem.get_c_str().value());
             auto bid_qty = data["bid1Size"];
             if (!bid_qty.error()) {
-                ticker.bid_qty = opt::fast_stod(bid_qty.get_string().value());
+                ticker.bid_qty = opt::fast_stod(bid_qty.get_c_str().value());
             }
 
-            std::string_view ask_str = data["ask1Price"].get_string().value();
-            ticker.ask = opt::fast_stod(ask_str);
+            auto ask_elem = data["ask1Price"];
+            if (ask_elem.error()) return false;
+            ticker.ask = opt::fast_stod(ask_elem.get_c_str().value());
             auto ask_qty = data["ask1Size"];
             if (!ask_qty.error()) {
-                ticker.ask_qty = opt::fast_stod(ask_qty.get_string().value());
+                ticker.ask_qty = opt::fast_stod(ask_qty.get_c_str().value());
             }
             return ticker.last > 0.0 && ticker.bid > 0.0 && ticker.ask > 0.0;
         }
 
         if (topic_str.substr(0, 12) != "orderbook.1.") return false;
 
-        std::string_view symbol_str = data["s"].get_string().value();
+        auto symbol_elem = data["s"];
+        if (symbol_elem.error()) return false;
+        std::string_view symbol_str = std::string_view(symbol_elem.get_c_str().value());
         if (symbol_str.size() <= 4) return false;
         ticker.symbol = SymbolId(std::string(symbol_str.substr(0, symbol_str.size() - 4)), "USDT");
 
-        auto bids = data["b"].get_array();
-        auto asks = data["a"].get_array();
-        auto bid_it = bids.begin();
-        auto ask_it = asks.begin();
-        if (bid_it == bids.end() || ask_it == asks.end()) return false;
+        auto bids = data["b"];
+        auto asks = data["a"];
+        if (bids.error() || asks.error()) return false;
 
-        auto bid_row = *bid_it;
-        auto ask_row = *ask_it;
-        auto bid_vals = bid_row.get_array();
-        auto ask_vals = ask_row.get_array();
-        auto bid_val_it = bid_vals.begin();
-        auto ask_val_it = ask_vals.begin();
-        if (bid_val_it == bid_vals.end() || ask_val_it == ask_vals.end()) return false;
-        ticker.bid = opt::fast_stod((*bid_val_it).get_string().value());
-        ++bid_val_it;
-        if (bid_val_it != bid_vals.end()) {
-            ticker.bid_qty = opt::fast_stod((*bid_val_it).get_string().value());
-        }
-        ticker.ask = opt::fast_stod((*ask_val_it).get_string().value());
-        ++ask_val_it;
-        if (ask_val_it != ask_vals.end()) {
-            ticker.ask_qty = opt::fast_stod((*ask_val_it).get_string().value());
-        }
+        auto bid_rows = bids.get_array().value();
+        auto ask_rows = asks.get_array().value();
+        if (bid_rows.size() == 0 || ask_rows.size() == 0) return false;
+
+        auto bid_row = bid_rows.at(0);
+        auto ask_row = ask_rows.at(0);
+        auto bid_vals = bid_row.get_array().value();
+        auto ask_vals = ask_row.get_array().value();
+        if (bid_vals.size() < 2 || ask_vals.size() < 2) return false;
+
+        ticker.bid = opt::fast_stod(bid_vals.at(0).get_c_str().value());
+        ticker.bid_qty = opt::fast_stod(bid_vals.at(1).get_c_str().value());
+        ticker.ask = opt::fast_stod(ask_vals.at(0).get_c_str().value());
+        ticker.ask_qty = opt::fast_stod(ask_vals.at(1).get_c_str().value());
 
         auto cached = get_cached_ticker(ticker.symbol);
         if (cached && cached->last > 0.0) {
