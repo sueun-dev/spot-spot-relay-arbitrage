@@ -3,6 +3,7 @@
 #include "kimp/core/logger.hpp"
 #include "kimp/core/optimization.hpp"
 #include "kimp/exchange/exchange_base.hpp"
+#include "kimp/strategy/arbitrage_engine.hpp"
 #include "kimp/utils/crypto.hpp"
 
 #include <simdjson.h>
@@ -30,6 +31,8 @@ using exchange::RestClient;
 struct BithumbQuote {
     double bid{0.0};
     double ask{0.0};
+    double bid_qty{0.0};
+    double ask_qty{0.0};
 };
 
 struct BithumbAssetStatus {
@@ -49,6 +52,8 @@ struct BybitSpotInstrument {
 struct BybitSpotQuote {
     double bid{0.0};
     double ask{0.0};
+    double bid_qty{0.0};
+    double ask_qty{0.0};
 };
 
 struct BybitChainInfo {
@@ -185,12 +190,17 @@ bool parse_bithumb_orderbooks(
         auto item = field.value().get_object();
         double bid = 0.0;
         double ask = 0.0;
+        double bid_qty = 0.0;
+        double ask_qty = 0.0;
 
         auto bids = item["bids"].get_array();
         if (!bids.error()) {
             for (auto bid_item : bids.value()) {
                 bid = parse_json_double(bid_item["price"]);
-                if (bid > 0.0) break;
+                if (bid > 0.0) {
+                    bid_qty = parse_json_double(bid_item["quantity"]);
+                    break;
+                }
             }
         }
 
@@ -198,12 +208,15 @@ bool parse_bithumb_orderbooks(
         if (!asks.error()) {
             for (auto ask_item : asks.value()) {
                 ask = parse_json_double(ask_item["price"]);
-                if (ask > 0.0) break;
+                if (ask > 0.0) {
+                    ask_qty = parse_json_double(ask_item["quantity"]);
+                    break;
+                }
             }
         }
 
         if (bid > 0.0 && ask > 0.0) {
-            quotes.emplace(std::move(key), BithumbQuote{bid, ask});
+            quotes.emplace(std::move(key), BithumbQuote{bid, ask, bid_qty, ask_qty});
         }
     }
 
@@ -354,8 +367,10 @@ bool parse_bybit_spot_tickers(
         std::string base = symbol.substr(0, symbol.size() - 4);
         double bid = parse_json_double(item["bid1Price"]);
         double ask = parse_json_double(item["ask1Price"]);
+        double bid_qty = parse_json_double(item["bid1Size"]);
+        double ask_qty = parse_json_double(item["ask1Size"]);
         if (bid <= 0.0 || ask <= 0.0) continue;
-        quotes.emplace(std::move(base), BybitSpotQuote{bid, ask});
+        quotes.emplace(std::move(base), BybitSpotQuote{bid, ask, bid_qty, ask_qty});
     }
 
     return !quotes.empty();
@@ -501,11 +516,32 @@ bool write_candidates_json(
         out << fmt::format("      \"bybitSymbol\": \"{}\",\n", json_escape(c.bybit_symbol));
         out << fmt::format("      \"bithumbBidKrw\": {:.8f},\n", c.bithumb_bid_krw);
         out << fmt::format("      \"bithumbAskKrw\": {:.8f},\n", c.bithumb_ask_krw);
+        out << fmt::format("      \"bithumbBidQty\": {:.8f},\n", c.bithumb_bid_qty);
+        out << fmt::format("      \"bithumbAskQty\": {:.8f},\n", c.bithumb_ask_qty);
         out << fmt::format("      \"bybitBidUsdt\": {:.8f},\n", c.bybit_bid_usdt);
         out << fmt::format("      \"bybitAskUsdt\": {:.8f},\n", c.bybit_ask_usdt);
+        out << fmt::format("      \"bybitBidQty\": {:.8f},\n", c.bybit_bid_qty);
+        out << fmt::format("      \"bybitAskQty\": {:.8f},\n", c.bybit_ask_qty);
         out << fmt::format("      \"usdtBidKrw\": {:.8f},\n", c.usdt_bid_krw);
         out << fmt::format("      \"usdtAskKrw\": {:.8f},\n", c.usdt_ask_krw);
         out << fmt::format("      \"grossEdgePct\": {:.6f},\n", c.gross_edge_pct);
+        out << fmt::format("      \"netEdgePct\": {:.6f},\n", c.net_edge_pct);
+        out << fmt::format("      \"matchQty\": {:.8f},\n", c.match_qty);
+        out << fmt::format("      \"targetCoinQty\": {:.8f},\n", c.target_coin_qty);
+        out << fmt::format("      \"maxTradableUsdtAtBest\": {:.8f},\n", c.max_tradable_usdt_at_best);
+        out << fmt::format("      \"bithumbTopKrw\": {:.8f},\n", c.bithumb_top_krw);
+        out << fmt::format("      \"bithumbTopUsdt\": {:.8f},\n", c.bithumb_top_usdt);
+        out << fmt::format("      \"bybitTopUsdt\": {:.8f},\n", c.bybit_top_usdt);
+        out << fmt::format("      \"bybitTopKrw\": {:.8f},\n", c.bybit_top_krw);
+        out << fmt::format("      \"bithumbTotalFeeKrw\": {:.8f},\n", c.bithumb_total_fee_krw);
+        out << fmt::format("      \"bybitTotalFeeUsdt\": {:.8f},\n", c.bybit_total_fee_usdt);
+        out << fmt::format("      \"bybitTotalFeeKrw\": {:.8f},\n", c.bybit_total_fee_krw);
+        out << fmt::format("      \"totalFeeKrw\": {:.8f},\n", c.total_fee_krw);
+        out << fmt::format("      \"netProfitKrw\": {:.8f},\n", c.net_profit_krw);
+        out << fmt::format("      \"bithumbCanFillTarget\": {},\n", c.bithumb_can_fill_target ? "true" : "false");
+        out << fmt::format("      \"bybitCanFillTarget\": {},\n", c.bybit_can_fill_target ? "true" : "false");
+        out << fmt::format("      \"bothCanFillTarget\": {},\n", c.both_can_fill_target ? "true" : "false");
+        out << fmt::format("      \"enterable\": {},\n", c.enterable() ? "true" : "false");
         out << fmt::format("      \"bithumbWithdrawEnabled\": {},\n", c.bithumb_withdraw_enabled ? "true" : "false");
         out << fmt::format("      \"bybitSpotTrading\": {},\n", c.bybit_spot_trading ? "true" : "false");
         out << fmt::format("      \"bybitMarginEnabled\": {},\n", c.bybit_margin_enabled ? "true" : "false");
@@ -658,8 +694,12 @@ bool SpotRelayScanner::run(const RuntimeConfig& config, const Options& options, 
         candidate.bybit_symbol = instr.symbol;
         candidate.bithumb_bid_krw = kr.bid;
         candidate.bithumb_ask_krw = kr.ask;
+        candidate.bithumb_bid_qty = kr.bid_qty;
+        candidate.bithumb_ask_qty = kr.ask_qty;
         candidate.bybit_bid_usdt = spot.bid;
         candidate.bybit_ask_usdt = spot.ask;
+        candidate.bybit_bid_qty = spot.bid_qty;
+        candidate.bybit_ask_qty = spot.ask_qty;
         candidate.usdt_bid_krw = usdt_it->second.bid;
         candidate.usdt_ask_krw = usdt_it->second.ask;
         candidate.bybit_spot_trading = instr.trading;
@@ -676,6 +716,29 @@ bool SpotRelayScanner::run(const RuntimeConfig& config, const Options& options, 
             candidate.gross_edge_pct =
                 ((conservative_krw_out - candidate.bithumb_ask_krw) / candidate.bithumb_ask_krw) * 100.0;
         }
+
+        auto relay_metrics = PremiumCalculator::calculate_relay_metrics(
+            candidate.bithumb_ask_krw,
+            candidate.bithumb_ask_qty,
+            candidate.bybit_bid_usdt,
+            candidate.bybit_bid_qty,
+            candidate.usdt_bid_krw);
+        candidate.net_edge_pct = relay_metrics.net_edge_pct;
+        candidate.match_qty = relay_metrics.match_qty;
+        candidate.target_coin_qty = relay_metrics.target_coin_qty;
+        candidate.max_tradable_usdt_at_best = relay_metrics.max_tradable_usdt_at_best;
+        candidate.bithumb_top_krw = relay_metrics.bithumb_top_krw;
+        candidate.bithumb_top_usdt = relay_metrics.bithumb_top_usdt;
+        candidate.bybit_top_usdt = relay_metrics.bybit_top_usdt;
+        candidate.bybit_top_krw = relay_metrics.bybit_top_krw;
+        candidate.bithumb_total_fee_krw = relay_metrics.bithumb_total_fee_krw;
+        candidate.bybit_total_fee_usdt = relay_metrics.bybit_total_fee_usdt;
+        candidate.bybit_total_fee_krw = relay_metrics.bybit_total_fee_krw;
+        candidate.total_fee_krw = relay_metrics.total_fee_krw;
+        candidate.net_profit_krw = relay_metrics.net_profit_krw;
+        candidate.bithumb_can_fill_target = relay_metrics.bithumb_can_fill_target;
+        candidate.bybit_can_fill_target = relay_metrics.bybit_can_fill_target;
+        candidate.both_can_fill_target = relay_metrics.both_can_fill_target;
 
         if (bybit_auth) {
             const auto coin_it = bybit_coin_info.find(base);
@@ -708,6 +771,20 @@ bool SpotRelayScanner::run(const RuntimeConfig& config, const Options& options, 
 
     std::sort(candidates.begin(), candidates.end(),
               [](const SpotRelayCandidate& a, const SpotRelayCandidate& b) {
+                  if (a.enterable() != b.enterable()) {
+                      return a.enterable() > b.enterable();
+                  }
+                  const bool a_positive_net = a.net_profit_krw > 0.0;
+                  const bool b_positive_net = b.net_profit_krw > 0.0;
+                  if (a_positive_net != b_positive_net) {
+                      return a_positive_net > b_positive_net;
+                  }
+                  if (a.both_can_fill_target != b.both_can_fill_target) {
+                      return a.both_can_fill_target > b.both_can_fill_target;
+                  }
+                  if (a.net_edge_pct != b.net_edge_pct) {
+                      return a.net_edge_pct > b.net_edge_pct;
+                  }
                   if (a.transfer_ready() != b.transfer_ready()) {
                       return a.transfer_ready() > b.transfer_ready();
                   }
@@ -723,25 +800,53 @@ bool SpotRelayScanner::run(const RuntimeConfig& config, const Options& options, 
     }
     write_candidates_json(options.json_output_path, candidates, bybit_auth);
 
+    size_t positive_net_count = 0;
+    size_t enterable_count = 0;
+    for (const auto& c : candidates) {
+        if (c.net_profit_krw > 0.0) {
+            ++positive_net_count;
+        }
+        if (c.enterable()) {
+            ++enterable_count;
+        }
+    }
+
     out << fmt::format(
         "[spot-relay] common={} auth_enriched={} json={}\n",
         candidates.size(),
         bybit_auth ? "true" : "false",
         options.json_output_path);
-    out << "base        edge%    transfer  bybitShort  marginMode    sharedNetworks\n";
-    out << "-----------------------------------------------------------------------\n";
+    out << fmt::format(
+        "[spot-relay] positive_net={} enterable={} target_usdt={:.2f} fee_model=빗썸 {}회 + 바이비트 {}회\n",
+        positive_net_count,
+        enterable_count,
+        TradingConfig::TARGET_ENTRY_USDT,
+        TradingConfig::BITHUMB_FEE_EVENTS,
+        TradingConfig::BYBIT_FEE_EVENTS);
+    out << "base        bAsk      bAskQty      byBid     byBidQty    matchQty     topUSDT   gross%     net%       feeKRW     netKRW  70qty    1tick   signal  transfer  bybitShort  marginMode    sharedNetworks\n";
+    out << "-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
-    const size_t max_rows = std::min<size_t>(50, candidates.size());
-    for (size_t i = 0; i < max_rows; ++i) {
-        const auto& c = candidates[i];
+    for (const auto& c : candidates) {
         std::string nets = c.shared_networks.empty() ? "-" : c.shared_networks.front();
         if (c.shared_networks.size() > 1) {
             nets += fmt::format("+{}", c.shared_networks.size() - 1);
         }
         out << fmt::format(
-            "{:<10} {:>7.3f} {:>10} {:>11} {:<13} {}\n",
+            "{:<10} {:>9.4f} {:>10.4f} {:>10.6f} {:>11.4f} {:>11.4f} {:>11.4f} {:>8.3f}% {:>8.3f}% {:>12.2f} {:>10.2f} {:>7.4f} {:>8} {:>10} {:>11} {:<13} {}\n",
             c.base,
+            c.bithumb_ask_krw,
+            c.bithumb_ask_qty,
+            c.bybit_bid_usdt,
+            c.bybit_bid_qty,
+            c.match_qty,
+            c.max_tradable_usdt_at_best,
             c.gross_edge_pct,
+            c.net_edge_pct,
+            c.total_fee_krw,
+            c.net_profit_krw,
+            c.target_coin_qty,
+            c.both_can_fill_target ? "YES" : "NO",
+            c.enterable() ? "YES" : "NO",
             c.transfer_ready() ? "Y" : "N",
             c.bybit_shortable ? "Y" : "N",
             c.bybit_margin_mode.empty() ? "-" : c.bybit_margin_mode,
