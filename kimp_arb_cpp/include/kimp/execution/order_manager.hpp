@@ -5,11 +5,14 @@
 #include "kimp/exchange/upbit/upbit.hpp"
 #include "kimp/exchange/bithumb/bithumb.hpp"
 #include "kimp/exchange/bybit/bybit.hpp"
+#include "kimp/execution/lifecycle_executor.hpp"
 #include "kimp/strategy/arbitrage_engine.hpp"
 
+#include <cstddef>
+#include <latch>
 #include <memory>
-#include <unordered_set>
 #include <mutex>
+#include <unordered_set>
 
 namespace kimp::execution {
 
@@ -40,7 +43,22 @@ public:
     using KoreanExchangePtr = std::shared_ptr<exchange::KoreanExchangeBase>;
     using BybitExchangePtr = std::shared_ptr<exchange::bybit::BybitExchange>;
 
+    OrderManager();
+
 private:
+    struct FillQueryTask {
+        enum class Kind : uint8_t {
+            Foreign,
+            Korean,
+        };
+
+        Kind kind{Kind::Foreign};
+        Exchange ex{Exchange::Bybit};
+        SymbolId symbol{};
+        Order* order{nullptr};
+        std::latch* done{nullptr};
+    };
+
     // Exchange references
     std::array<ExchangePtr, static_cast<size_t>(Exchange::Count)> exchanges_{};
 
@@ -48,9 +66,9 @@ private:
     strategy::ArbitrageEngine* engine_{nullptr};
 
     std::atomic<bool> running_{true};
+    LifecycleExecutor<FillQueryTask, 64> fill_query_executor_;
 
 public:
-    OrderManager() = default;
     ~OrderManager();
 
     // Configuration
@@ -117,6 +135,9 @@ private:
     // Async fill price queries (parallel with hedge orders)
     void query_foreign_fill(Exchange ex, Order& order);
     void query_korean_fill(Exchange ex, const SymbolId& symbol, Order& order);
+    void handle_fill_query(FillQueryTask&& task, std::size_t worker_index);
+    void dispatch_fill_query(FillQueryTask task);
+    void wait_for_next_market_update(uint64_t update_seq_before_trade);
 };
 
 } // namespace kimp::execution

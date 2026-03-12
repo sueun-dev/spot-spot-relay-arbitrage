@@ -2,16 +2,15 @@
 #include "kimp/core/logger.hpp"
 
 #include <algorithm>
-#include <thread>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <future>
 #include <iomanip>
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <ctime>
 #include <cstdio>
 
@@ -282,8 +281,21 @@ bool quote_pair_is_usable(const kimp::strategy::PriceCache::PriceData& korean_pr
 
 namespace kimp::execution {
 
+OrderManager::OrderManager()
+    : fill_query_executor_([this](FillQueryTask&& task, std::size_t worker_index) {
+          handle_fill_query(std::move(task), worker_index);
+      }) {
+    LifecycleExecutorOptions options;
+    options.worker_count = 2;
+    options.push_spin_count = 128;
+    options.empty_spin_count = 1024;
+    options.idle_wait = std::chrono::microseconds(100);
+    fill_query_executor_.start(options);
+}
+
 OrderManager::~OrderManager() {
     running_ = false;
+    fill_query_executor_.stop();
 }
 
 void OrderManager::set_exchange(Exchange ex, ExchangePtr exchange) {
@@ -515,6 +527,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
 
         double min_split_usd = min_executable_usd(current_foreign_bid, current_korean_ask);
 
+        const uint64_t update_seq_before_trade = engine_ ? engine_->get_update_seq() : 0;
         auto split_start = std::chrono::steady_clock::now();
 
         if (relay_metrics.net_edge_pct > TradingConfig::MIN_NET_EDGE_PCT &&
@@ -530,7 +543,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
 
             if (foreign_order.status != OrderStatus::Filled) {
                 Logger::error("[RELAY-ENTRY] Bybit spot-margin short failed, retrying next cycle");
-                std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+                wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
 
@@ -564,29 +577,31 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                     );
                     return result;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+                wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
 
-            // PARALLEL: Bybit fill query + Bithumb BUY
-            auto bybit_fill_future = std::async(std::launch::async, [&]() {
-                query_foreign_fill(signal.foreign_exchange, foreign_order);
+            // Reuse dedicated fill workers instead of spawning per-order async threads.
+            std::latch fill_done(2);
+            dispatch_fill_query(FillQueryTask{
+                FillQueryTask::Kind::Foreign,
+                signal.foreign_exchange,
+                SymbolId{},
+                &foreign_order,
+                &fill_done,
             });
 
             Order korean_order = execute_korean_buy(signal.korean_exchange, signal.symbol, actual_filled, krw_amount);
-
-            // Wait for Bybit fill query to complete
-            bybit_fill_future.get();
-
-            // Bithumb fill query (runs while we process results)
-            auto bithumb_fill_future = std::async(std::launch::async, [&]() {
-                query_korean_fill(signal.korean_exchange, signal.symbol, korean_order);
+            dispatch_fill_query(FillQueryTask{
+                FillQueryTask::Kind::Korean,
+                signal.korean_exchange,
+                signal.symbol,
+                &korean_order,
+                &fill_done,
             });
+            fill_done.wait();
 
             if (korean_order.status == OrderStatus::Filled) {
-                // Wait for Bithumb fill price
-                bithumb_fill_future.get();
-
                 double short_price = foreign_order.average_price;
                 if (short_price <= 0) {
                     short_price = current_foreign_bid;
@@ -647,7 +662,6 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                                  signal.symbol.to_string(), new_held_value);
                 }
             } else {
-                bithumb_fill_future.get();  // Don't leak the future
                 Logger::error("[RELAY-ENTRY] Korean BUY failed, rolling back Bybit spot-margin short");
                 Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
                 if (rollback.status != OrderStatus::Filled) {
@@ -695,28 +709,32 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
 
             if (foreign_order.status != OrderStatus::Filled) {
                 Logger::error("[ADAPTIVE-EXIT] Bybit spot-margin cover failed during entry, retrying");
-                std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+                wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
 
             double actual_covered = foreign_order.quantity;
 
-            // PARALLEL: Bybit fill query + Bithumb SELL
-            auto bybit_fill_future = std::async(std::launch::async, [&]() {
-                query_foreign_fill(signal.foreign_exchange, foreign_order);
+            std::latch fill_done(2);
+            dispatch_fill_query(FillQueryTask{
+                FillQueryTask::Kind::Foreign,
+                signal.foreign_exchange,
+                SymbolId{},
+                &foreign_order,
+                &fill_done,
             });
 
             Order korean_order = execute_korean_sell(signal.korean_exchange, signal.symbol, actual_covered);
-
-            bybit_fill_future.get();
-
-            auto bithumb_fill_future = std::async(std::launch::async, [&]() {
-                query_korean_fill(signal.korean_exchange, signal.symbol, korean_order);
+            dispatch_fill_query(FillQueryTask{
+                FillQueryTask::Kind::Korean,
+                signal.korean_exchange,
+                signal.symbol,
+                &korean_order,
+                &fill_done,
             });
+            fill_done.wait();
 
             if (korean_order.status == OrderStatus::Filled) {
-                bithumb_fill_future.get();
-
                 // Reconcile filled_quantity if available
                 if (foreign_order.filled_quantity > 0) actual_covered = foreign_order.filled_quantity;
 
@@ -813,7 +831,6 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                     result.position.entry_premium = 0.0;
                 }
             } else {
-                bithumb_fill_future.get();
                 // SELL failed after COVER — retry to avoid unhedged state
                 // Resolve fill prices for P&L on retry path
                 double cover_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_ask;
@@ -882,13 +899,8 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
             continue;
         }
 
-        // Smart sleep: deduct execution time from split interval
-        auto split_elapsed = std::chrono::steady_clock::now() - split_start;
-        auto remaining_sleep = std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS) -
-            std::chrono::duration_cast<std::chrono::milliseconds>(split_elapsed);
-        if (remaining_sleep > std::chrono::milliseconds(0)) {
-            std::this_thread::sleep_for(remaining_sleep);
-        }
+        // Event-driven post-trade wait: continue immediately on the next WS update.
+        wait_for_next_market_update(update_seq_before_trade);
     }
 
     // Loop exited = shutdown. Return current state.
@@ -1045,7 +1057,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                 TradingConfig::EXIT_PREMIUM_THRESHOLD);
         }
 
-        auto split_start = std::chrono::steady_clock::now();
+        const uint64_t update_seq_before_trade = engine_ ? engine_->get_update_seq() : 0;
 
         if (exit_premium >= dynamic_exit_threshold) {
             // ==================== EXIT SPLIT ====================
@@ -1067,28 +1079,32 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
 
             if (foreign_order.status != OrderStatus::Filled) {
                 Logger::error("[ADAPTIVE-EXIT] Bybit spot-margin cover failed, retrying");
-                std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+                wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
 
             double actual_covered = foreign_order.quantity;
 
-            // PARALLEL: Bybit fill query + Bithumb SELL
-            auto bybit_fill_future = std::async(std::launch::async, [&]() {
-                query_foreign_fill(signal.foreign_exchange, foreign_order);
+            std::latch fill_done(2);
+            dispatch_fill_query(FillQueryTask{
+                FillQueryTask::Kind::Foreign,
+                signal.foreign_exchange,
+                SymbolId{},
+                &foreign_order,
+                &fill_done,
             });
 
             Order korean_order = execute_korean_sell(signal.korean_exchange, position.symbol, actual_covered);
-
-            bybit_fill_future.get();
-
-            auto bithumb_fill_future = std::async(std::launch::async, [&]() {
-                query_korean_fill(signal.korean_exchange, position.symbol, korean_order);
+            dispatch_fill_query(FillQueryTask{
+                FillQueryTask::Kind::Korean,
+                signal.korean_exchange,
+                position.symbol,
+                &korean_order,
+                &fill_done,
             });
+            fill_done.wait();
 
             if (korean_order.status == OrderStatus::Filled) {
-                bithumb_fill_future.get();
-
                 if (foreign_order.filled_quantity > 0) actual_covered = foreign_order.filled_quantity;
 
                 double cover_price = foreign_order.average_price;
@@ -1148,7 +1164,6 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                     }
                 }
             } else {
-                bithumb_fill_future.get();
                 double cover_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_ask;
 
                 // SELL failed after COVER — retry to avoid unhedged state
@@ -1215,7 +1230,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
 
             if (foreign_order.status != OrderStatus::Filled) {
                 Logger::error("[ADAPTIVE-REENTRY] Bybit spot-margin short failed, retrying");
-                std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+                wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
 
@@ -1243,26 +1258,30 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                     );
                     return result;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+                wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
 
-            // PARALLEL: Bybit fill query + Bithumb BUY
-            auto bybit_fill_future = std::async(std::launch::async, [&]() {
-                query_foreign_fill(signal.foreign_exchange, foreign_order);
+            std::latch fill_done(2);
+            dispatch_fill_query(FillQueryTask{
+                FillQueryTask::Kind::Foreign,
+                signal.foreign_exchange,
+                SymbolId{},
+                &foreign_order,
+                &fill_done,
             });
 
             Order korean_order = execute_korean_buy(signal.korean_exchange, position.symbol, actual_filled, krw_amount);
-
-            bybit_fill_future.get();
-
-            auto bithumb_fill_future = std::async(std::launch::async, [&]() {
-                query_korean_fill(signal.korean_exchange, position.symbol, korean_order);
+            dispatch_fill_query(FillQueryTask{
+                FillQueryTask::Kind::Korean,
+                signal.korean_exchange,
+                position.symbol,
+                &korean_order,
+                &fill_done,
             });
+            fill_done.wait();
 
             if (korean_order.status == OrderStatus::Filled) {
-                bithumb_fill_future.get();
-
                 if (foreign_order.filled_quantity > 0) actual_filled = foreign_order.filled_quantity;
 
                 double short_price = foreign_order.average_price;
@@ -1302,7 +1321,6 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                     on_position_update_(&snap);
                 }
             } else {
-                bithumb_fill_future.get();
                 Logger::error("[ADAPTIVE-REENTRY] Korean BUY failed, rolling back Bybit spot-margin short");
                 Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
                 if (rollback.status != OrderStatus::Filled) {
@@ -1336,13 +1354,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
             continue;
         }
 
-        // Smart sleep: deduct execution time from split interval
-        auto split_elapsed = std::chrono::steady_clock::now() - split_start;
-        auto remaining_sleep = std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS) -
-            std::chrono::duration_cast<std::chrono::milliseconds>(split_elapsed);
-        if (remaining_sleep > std::chrono::milliseconds(0)) {
-            std::this_thread::sleep_for(remaining_sleep);
-        }
+        wait_for_next_market_update(update_seq_before_trade);
     }
 
     // Shutdown interrupted exit - return with remaining position
@@ -1470,6 +1482,41 @@ void OrderManager::query_korean_fill(Exchange ex, const SymbolId& symbol, Order&
     if (ex == Exchange::Bithumb) {
         auto bithumb = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(korean_ex);
         if (bithumb) bithumb->query_order_detail(order.order_id_str, symbol, order);
+    }
+}
+
+void OrderManager::handle_fill_query(FillQueryTask&& task, std::size_t /*worker_index*/) {
+    auto countdown = [&]() {
+        if (task.done) {
+            task.done->count_down();
+        }
+    };
+
+    if (!task.order) {
+        countdown();
+        return;
+    }
+
+    if (task.kind == FillQueryTask::Kind::Foreign) {
+        query_foreign_fill(task.ex, *task.order);
+    } else {
+        query_korean_fill(task.ex, task.symbol, *task.order);
+    }
+    countdown();
+}
+
+void OrderManager::dispatch_fill_query(FillQueryTask task) {
+    if (!fill_query_executor_.enqueue(task)) {
+        handle_fill_query(std::move(task), 0);
+    }
+}
+
+void OrderManager::wait_for_next_market_update(uint64_t update_seq_before_trade) {
+    if (engine_) {
+        engine_->wait_for_update(update_seq_before_trade,
+                                 std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
+    } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(TradingConfig::ORDER_INTERVAL_MS));
     }
 }
 
