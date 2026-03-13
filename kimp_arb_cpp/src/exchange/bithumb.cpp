@@ -770,7 +770,7 @@ double BithumbExchange::get_balance(const std::string& currency) {
     auto response = rest_client_->post(endpoint, params, headers);
     if (!response.success) {
         Logger::error("[Bithumb] Failed to fetch balance: {}", response.error);
-        return 0.0;
+        return -1.0;
     }
 
     try {
@@ -791,7 +791,7 @@ double BithumbExchange::get_balance(const std::string& currency) {
         Logger::error("[Bithumb] Failed to parse balance: {}", e.what());
     }
 
-    return 0.0;
+    return -1.0;
 }
 
 void BithumbExchange::on_ws_message(std::string_view message) {
@@ -1152,7 +1152,10 @@ std::vector<SymbolId> BithumbExchange::parse_orderbookdepth_message(std::string_
 
         for (const auto& item : fast_updates) {
             auto it = orderbook_state_.find(item.symbol);
-            if (it == orderbook_state_.end() || !it->second.initialized) continue;
+            if (it == orderbook_state_.end() || !it->second.initialized) {
+                Logger::debug("[Bithumb] Orderbook update for uninitialized symbol {}, skipping", item.symbol.to_string());
+                continue;
+            }
 
             auto& state = it->second;
             if (item.is_bid) {
