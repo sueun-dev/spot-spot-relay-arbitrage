@@ -25,10 +25,11 @@ public:
         unsigned char result[EVP_MAX_MD_SIZE];
         unsigned int result_len = 0;
 
-        HMAC(EVP_sha256(),
+        auto* ret = HMAC(EVP_sha256(),
              key.data(), static_cast<int>(key.size()),
              reinterpret_cast<const unsigned char*>(data.data()), data.size(),
              result, &result_len);
+        if (!ret) return {};
 
         return to_hex(result, result_len);
     }
@@ -38,10 +39,11 @@ public:
         std::vector<uint8_t> result(EVP_MAX_MD_SIZE);
         unsigned int result_len = 0;
 
-        HMAC(EVP_sha256(),
+        auto* ret = HMAC(EVP_sha256(),
              key.data(), static_cast<int>(key.size()),
              reinterpret_cast<const unsigned char*>(data.data()), data.size(),
              result.data(), &result_len);
+        if (!ret) return {};
 
         result.resize(result_len);
         return result;
@@ -52,10 +54,11 @@ public:
         unsigned char result[EVP_MAX_MD_SIZE];
         unsigned int result_len = 0;
 
-        HMAC(EVP_sha512(),
+        auto* ret = HMAC(EVP_sha512(),
              key.data(), static_cast<int>(key.size()),
              reinterpret_cast<const unsigned char*>(data.data()), data.size(),
              result, &result_len);
+        if (!ret) return {};
 
         return to_hex(result, result_len);
     }
@@ -80,7 +83,7 @@ public:
     static std::string generate_uuid() {
         static constexpr char h[] = "0123456789abcdef";
         std::array<uint8_t, 16> bytes;
-        RAND_bytes(bytes.data(), bytes.size());
+        if (RAND_bytes(bytes.data(), bytes.size()) != 1) return {};
 
         // Set version to 4
         bytes[6] = (bytes[6] & 0x0F) | 0x40;
@@ -101,7 +104,7 @@ public:
     // Generate random nonce
     static std::string generate_nonce() {
         std::array<uint8_t, 16> bytes;
-        RAND_bytes(bytes.data(), bytes.size());
+        if (RAND_bytes(bytes.data(), bytes.size()) != 1) return {};
         return to_hex(bytes.data(), bytes.size());
     }
 
