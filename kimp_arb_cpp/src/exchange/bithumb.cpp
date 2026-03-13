@@ -975,7 +975,16 @@ void BithumbExchange::on_private_ws_message(std::string_view message) {
 std::string BithumbExchange::generate_signature(const std::string& endpoint,
                                                   const std::string& params,
                                                   int64_t timestamp) const {
-    std::string message = endpoint + '\0' + params + '\0' + std::to_string(timestamp);
+    // Build message: endpoint \0 params \0 timestamp — avoid 3+ string temporaries
+    std::string message;
+    message.reserve(endpoint.size() + params.size() + 20);
+    message.append(endpoint);
+    message.push_back('\0');
+    message.append(params);
+    message.push_back('\0');
+    char ts_buf[24];
+    int ts_len = std::snprintf(ts_buf, sizeof(ts_buf), "%lld", static_cast<long long>(timestamp));
+    message.append(ts_buf, static_cast<size_t>(ts_len));
     return utils::Crypto::hmac_sha512(credentials_.secret_key, message);
 }
 
@@ -995,22 +1004,26 @@ std::unordered_map<std::string, std::string> BithumbExchange::build_auth_headers
 }
 
 std::string BithumbExchange::generate_v1_jwt_token() const {
-    std::ostringstream payload;
-    payload << R"({"access_key":")" << credentials_.api_key
-            << R"(","nonce":")" << utils::Crypto::generate_uuid()
-            << R"(","timestamp":)" << utils::Crypto::timestamp_ms()
-            << "}";
-    return sign_bithumb_v1_jwt(credentials_.secret_key, payload.str());
+    char buf[512];
+    int len = std::snprintf(buf, sizeof(buf),
+        "{\"access_key\":\"%s\",\"nonce\":\"%s\",\"timestamp\":%lld}",
+        credentials_.api_key.c_str(),
+        utils::Crypto::generate_uuid().c_str(),
+        static_cast<long long>(utils::Crypto::timestamp_ms()));
+    return sign_bithumb_v1_jwt(credentials_.secret_key, std::string(buf, static_cast<size_t>(len)));
 }
 
 std::string BithumbExchange::generate_v1_jwt_token_with_query(const std::string& query_string) const {
-    std::ostringstream payload;
-    payload << R"({"access_key":")" << credentials_.api_key
-            << R"(","nonce":")" << utils::Crypto::generate_uuid()
-            << R"(","timestamp":)" << utils::Crypto::timestamp_ms()
-            << R"(,"query_hash":")" << utils::Crypto::sha512(query_string)
-            << R"(","query_hash_alg":"SHA512"})";
-    return sign_bithumb_v1_jwt(credentials_.secret_key, payload.str());
+    std::string hash = utils::Crypto::sha512(query_string);
+    char buf[768];
+    int len = std::snprintf(buf, sizeof(buf),
+        "{\"access_key\":\"%s\",\"nonce\":\"%s\",\"timestamp\":%lld,"
+        "\"query_hash\":\"%s\",\"query_hash_alg\":\"SHA512\"}",
+        credentials_.api_key.c_str(),
+        utils::Crypto::generate_uuid().c_str(),
+        static_cast<long long>(utils::Crypto::timestamp_ms()),
+        hash.c_str());
+    return sign_bithumb_v1_jwt(credentials_.secret_key, std::string(buf, static_cast<size_t>(len)));
 }
 
 std::unordered_map<std::string, std::string> BithumbExchange::build_v1_auth_headers() const {
