@@ -1302,7 +1302,7 @@ bool BithumbExchange::query_order_detail_ws(const std::string& order_id, Order& 
         return false;
     }
 
-    bool found = fill_cache_cv_.wait_for(lock, std::chrono::milliseconds(250), [&]() {
+    bool found = fill_cache_cv_.wait_for(lock, std::chrono::milliseconds(150), [&]() {
         return fill_cache_.find(order_id) != fill_cache_.end();
     });
     if (!found) {
