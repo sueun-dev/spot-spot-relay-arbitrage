@@ -410,16 +410,15 @@ Order BybitExchange::place_market_order(const SymbolId& symbol, Side side, Quant
     order.client_order_id = generate_order_id();
     order.create_time = std::chrono::system_clock::now();
 
-    std::ostringstream body;
-    body << R"({"category":"spot",)";
-    body << R"("symbol":")" << symbol_to_bybit(symbol) << R"(",)";
-    body << R"("side":")" << (side == Side::Buy ? "Buy" : "Sell") << R"(",)";
-    body << R"("orderType":"Market",)";
-    body << R"("qty":")" << std::fixed << std::setprecision(8) << quantity << R"(",)";
-    body << R"("orderFilter":"Order",)";
-    body << R"("marketUnit":"baseCoin"})";
-
-    std::string body_str = body.str();
+    char body_buf[512];
+    int body_len = std::snprintf(body_buf, sizeof(body_buf),
+        "{\"category\":\"spot\",\"symbol\":\"%s\",\"side\":\"%s\","
+        "\"orderType\":\"Market\",\"qty\":\"%.8f\","
+        "\"orderFilter\":\"Order\",\"marketUnit\":\"baseCoin\"}",
+        symbol_to_bybit(symbol).c_str(),
+        side == Side::Buy ? "Buy" : "Sell",
+        quantity);
+    std::string body_str(body_buf, static_cast<size_t>(body_len));
     auto headers = build_auth_headers(body_str);
     headers["Content-Type"] = "application/json";
 
@@ -472,17 +471,13 @@ Order BybitExchange::open_short(const SymbolId& symbol, Quantity quantity) {
     }
 
     // REST fallback
-    std::ostringstream body;
-    body << R"({"category":"spot",)";
-    body << R"("symbol":")" << symbol_to_bybit(symbol) << R"(",)";
-    body << R"("side":"Sell",)";
-    body << R"("orderType":"Market",)";
-    body << R"("qty":")" << std::fixed << std::setprecision(8) << adj_qty << R"(",)";
-    body << R"("isLeverage":1,)";
-    body << R"("orderFilter":"Order",)";
-    body << R"("marketUnit":"baseCoin"})";
-
-    std::string body_str = body.str();
+    char body_buf[512];
+    int body_len = std::snprintf(body_buf, sizeof(body_buf),
+        "{\"category\":\"spot\",\"symbol\":\"%s\",\"side\":\"Sell\","
+        "\"orderType\":\"Market\",\"qty\":\"%.8f\",\"isLeverage\":1,"
+        "\"orderFilter\":\"Order\",\"marketUnit\":\"baseCoin\"}",
+        symbol_to_bybit(symbol).c_str(), adj_qty);
+    std::string body_str(body_buf, static_cast<size_t>(body_len));
     auto headers = build_auth_headers(body_str);
     headers["Content-Type"] = "application/json";
 
@@ -538,17 +533,13 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
     }
 
     // REST fallback
-    std::ostringstream body;
-    body << R"({"category":"spot",)";
-    body << R"("symbol":")" << symbol_to_bybit(symbol) << R"(",)";
-    body << R"("side":"Buy",)";
-    body << R"("orderType":"Market",)";
-    body << R"("qty":")" << std::fixed << std::setprecision(8) << adj_qty << R"(",)";
-    body << R"("isLeverage":1,)";
-    body << R"("orderFilter":"Order",)";
-    body << R"("marketUnit":"baseCoin"})";
-
-    std::string body_str = body.str();
+    char body_buf[512];
+    int body_len = std::snprintf(body_buf, sizeof(body_buf),
+        "{\"category\":\"spot\",\"symbol\":\"%s\",\"side\":\"Buy\","
+        "\"orderType\":\"Market\",\"qty\":\"%.8f\",\"isLeverage\":1,"
+        "\"orderFilter\":\"Order\",\"marketUnit\":\"baseCoin\"}",
+        symbol_to_bybit(symbol).c_str(), adj_qty);
+    std::string body_str(body_buf, static_cast<size_t>(body_len));
     auto headers = build_auth_headers(body_str);
     headers["Content-Type"] = "application/json";
 
