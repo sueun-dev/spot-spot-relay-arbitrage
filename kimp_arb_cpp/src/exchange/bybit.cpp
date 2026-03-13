@@ -89,7 +89,7 @@ bool parse_orderbook_fast(std::string_view message, Ticker& ticker) {
 
     ticker.exchange = Exchange::Bybit;
     ticker.timestamp = std::chrono::steady_clock::now();
-    ticker.symbol = SymbolId(std::string(topic_symbol.substr(0, topic_symbol.size() - 4)), "USDT");
+    ticker.symbol = SymbolId(topic_symbol.substr(0, topic_symbol.size() - 4), "USDT");
     ticker.bid = bid;
     ticker.bid_qty = bid_qty;
     ticker.ask = ask;
@@ -897,7 +897,7 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
         if (symbol_elem.error()) return false;
         std::string_view symbol_str = std::string_view(symbol_elem.get_c_str().value());
         if (symbol_str.size() <= 4) return false;
-        ticker.symbol = SymbolId(std::string(symbol_str.substr(0, symbol_str.size() - 4)), "USDT");
+        ticker.symbol = SymbolId(symbol_str.substr(0, symbol_str.size() - 4), "USDT");
 
         auto bids = data["b"];
         auto asks = data["a"];
