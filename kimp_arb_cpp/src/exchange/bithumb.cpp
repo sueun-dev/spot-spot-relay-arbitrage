@@ -111,17 +111,17 @@ bool parse_orderbookdepth_fast(std::string_view message,
         }
 
         std::string_view order_type_sv;
-        if (!extract_quoted_value(item, order_type_marker, 0, order_type_sv, field_end)) {
+        if (!extract_quoted_value(item, order_type_marker, field_end, order_type_sv, field_end)) {
             return false;
         }
 
         std::string_view price_sv;
-        if (!extract_quoted_value(item, price_marker, 0, price_sv, field_end)) {
+        if (!extract_quoted_value(item, price_marker, field_end, price_sv, field_end)) {
             return false;
         }
 
         std::string_view quantity_sv;
-        if (!extract_quoted_value(item, quantity_marker, 0, quantity_sv, field_end)) {
+        if (!extract_quoted_value(item, quantity_marker, field_end, quantity_sv, field_end)) {
             return false;
         }
 
