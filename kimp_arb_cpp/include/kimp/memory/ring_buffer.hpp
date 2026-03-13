@@ -195,6 +195,13 @@ public:
         const auto tail = tail_.load(std::memory_order_acquire);
         return ((head + 1) & MASK) == tail;
     }
+
+    void reset() noexcept {
+        head_.store(0, std::memory_order_relaxed);
+        tail_.store(0, std::memory_order_relaxed);
+        cached_tail_ = 0;
+        cached_head_ = 0;
+    }
 };
 
 /**

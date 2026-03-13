@@ -1,7 +1,9 @@
 #include "kimp/core/types.hpp"
 #include "kimp/core/config.hpp"
 #include "kimp/core/logger.hpp"
+#include "kimp/core/latency_probe.hpp"
 #include "kimp/core/optimization.hpp"
+#include "kimp/core/price_format.hpp"
 #include "kimp/core/simd_premium.hpp"
 #include "kimp/exchange/bithumb/bithumb.hpp"
 #include "kimp/exchange/bybit/bybit.hpp"
@@ -15,7 +17,6 @@
 #include <yaml-cpp/yaml.h>
 
 #include <iostream>
-#include <cstdio>
 #include <csignal>
 #include <atomic>
 #include <thread>
@@ -28,8 +29,6 @@
 #include <mutex>
 #include <sstream>
 #include <cctype>
-#include <condition_variable>
-#include <cmath>
 #include <optional>
 #include <poll.h>
 #include <unistd.h>
@@ -115,11 +114,7 @@ void signal_handler(int) {
 std::string format_time(const kimp::SystemTimestamp& ts) {
     auto tt = std::chrono::system_clock::to_time_t(ts);
     std::tm tm{};
-#if defined(_WIN32)
-    localtime_s(&tm, &tt);
-#else
     localtime_r(&tt, &tm);
-#endif
     std::ostringstream oss;
     oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
     return oss.str();
@@ -159,8 +154,8 @@ void append_trade_log(const kimp::Position& pos,
         << pos.symbol.to_string() << ','
         << std::fixed << std::setprecision(6) << pos.entry_premium << ','
         << std::fixed << std::setprecision(6) << pos.exit_premium << ','
-        << std::fixed << std::setprecision(2) << pos.korean_entry_price << ','
-        << std::fixed << std::setprecision(2) << pos.korean_exit_price << ','
+        << std::fixed << std::setprecision(8) << pos.korean_entry_price << ','
+        << std::fixed << std::setprecision(8) << pos.korean_exit_price << ','
         << std::fixed << std::setprecision(6) << pos.foreign_entry_price << ','
         << std::fixed << std::setprecision(6) << pos.foreign_exit_price << ','
         << std::fixed << std::setprecision(8) << pos.korean_amount << ','
@@ -204,7 +199,7 @@ void save_active_position(const kimp::Position& pos) {
         "  \"position_size_usd\": {:.2f},\n"
         "  \"korean_amount\": {:.8f},\n"
         "  \"foreign_amount\": {:.8f},\n"
-        "  \"korean_entry_price\": {:.2f},\n"
+        "  \"korean_entry_price\": {},\n"
         "  \"foreign_entry_price\": {:.8f},\n"
         "  \"realized_pnl_krw\": {:.2f},\n"
         "  \"is_active\": true\n"
@@ -213,7 +208,7 @@ void save_active_position(const kimp::Position& pos) {
         static_cast<int>(pos.korean_exchange), static_cast<int>(pos.foreign_exchange),
         entry_ms, pos.entry_premium, pos.position_size_usd,
         pos.korean_amount, pos.foreign_amount,
-        pos.korean_entry_price, pos.foreign_entry_price,
+        kimp::format::format_decimal_trimmed(pos.korean_entry_price), pos.foreign_entry_price,
         pos.realized_pnl_krw
     );
 
@@ -299,23 +294,17 @@ std::string expand_env(const std::string& val) {
     if (val.size() > 3 && val[0] == '$' && val[1] == '{' && val.back() == '}') {
         std::string env_name = val.substr(2, val.size() - 3);
         const char* env_val = std::getenv(env_name.c_str());
-        if (!env_val) {
-            std::cerr << "FATAL: Environment variable '" << env_name
-                      << "' is not set" << std::endl;
-            return {};
-        }
+        if (!env_val) return {};
         return env_val;
     }
     return val;
 }
 
-std::string expand_env_if_present(const std::string& val) {
+std::optional<std::string> env_placeholder_name(const std::string& val) {
     if (val.size() > 3 && val[0] == '$' && val[1] == '{' && val.back() == '}') {
-        std::string env_name = val.substr(2, val.size() - 3);
-        const char* env_val = std::getenv(env_name.c_str());
-        return env_val ? std::string(env_val) : std::string();
+        return val.substr(2, val.size() - 3);
     }
-    return val;
+    return std::nullopt;
 }
 
 // NOTE: Trading parameters (thresholds, position sizes, fees) are compile-time
@@ -368,20 +357,43 @@ std::optional<kimp::RuntimeConfig> load_config(const std::string& path,
             }
 
             if (e["ws_endpoint"]) creds.ws_endpoint = e["ws_endpoint"].as<std::string>();
+            if (e["ws_private_endpoint"]) creds.ws_private_endpoint = e["ws_private_endpoint"].as<std::string>();
+            if (e["ws_trade_endpoint"]) creds.ws_trade_endpoint = e["ws_trade_endpoint"].as<std::string>();
             if (e["rest_endpoint"]) creds.rest_endpoint = e["rest_endpoint"].as<std::string>();
             if (e["api_key"]) {
                 std::string raw = e["api_key"].as<std::string>();
-                creds.api_key = require_private_keys ? expand_env(raw) : expand_env_if_present(raw);
+                creds.api_key = require_private_keys ? expand_env(raw) : expand_env(raw);
             }
             if (e["secret_key"]) {
                 std::string raw = e["secret_key"].as<std::string>();
-                creds.secret_key = require_private_keys ? expand_env(raw) : expand_env_if_present(raw);
+                creds.secret_key = require_private_keys ? expand_env(raw) : expand_env(raw);
             }
 
             if (require_private_keys &&
                 (creds.api_key.empty() || creds.secret_key.empty())) {
-                std::cerr << "Exchange '" << name
-                          << "': api_key or secret_key is missing" << std::endl;
+                std::vector<std::string> missing_vars;
+                if (e["api_key"]) {
+                    if (auto env_name = env_placeholder_name(e["api_key"].as<std::string>());
+                        env_name && creds.api_key.empty()) {
+                        missing_vars.push_back(*env_name);
+                    }
+                }
+                if (e["secret_key"]) {
+                    if (auto env_name = env_placeholder_name(e["secret_key"].as<std::string>());
+                        env_name && creds.secret_key.empty()) {
+                        missing_vars.push_back(*env_name);
+                    }
+                }
+
+                std::cerr << "Exchange '" << name << "': private API credentials are missing";
+                if (!missing_vars.empty()) {
+                    std::cerr << " (set " << missing_vars.front();
+                    for (std::size_t i = 1; i < missing_vars.size(); ++i) {
+                        std::cerr << ", " << missing_vars[i];
+                    }
+                    std::cerr << ")";
+                }
+                std::cerr << ". Real trading requires exchange keys." << std::endl;
                 return false;
             }
 
@@ -407,6 +419,9 @@ int main(int argc, char* argv[]) {
     bool monitor_only = false;
     bool scan_spot_relay = false;
     std::optional<bool> dashboard_stream_override;
+    std::optional<bool> latency_probe_override;
+    std::optional<bool> latency_summary_override;
+    kimp::LatencyOutputMode latency_output_mode = kimp::LatencyOutputMode::MmapBinary;
     int monitor_interval_sec = 2;
 
     for (int i = 1; i < argc; ++i) {
@@ -432,6 +447,30 @@ int main(int argc, char* argv[]) {
             dashboard_stream_override = true;
         } else if (arg == "--no-dashboard-stream") {
             dashboard_stream_override = false;
+        } else if (arg == "--latency-probe") {
+            latency_probe_override = true;
+        } else if (arg == "--no-latency-probe") {
+            latency_probe_override = false;
+        } else if (arg == "--latency-probe-summary") {
+            latency_summary_override = true;
+        } else if (arg == "--no-latency-probe-summary") {
+            latency_summary_override = false;
+        } else if (arg == "--latency-probe-output") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --latency-probe-output requires csv|binary|mmap\n";
+                return 1;
+            }
+            std::string mode = argv[++i];
+            if (mode == "csv") {
+                latency_output_mode = kimp::LatencyOutputMode::CsvText;
+            } else if (mode == "binary") {
+                latency_output_mode = kimp::LatencyOutputMode::Binary;
+            } else if (mode == "mmap") {
+                latency_output_mode = kimp::LatencyOutputMode::MmapBinary;
+            } else {
+                std::cerr << "Error: --latency-probe-output must be csv, binary, or mmap\n";
+                return 1;
+            }
         } else if (arg == "--monitor-interval-sec") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --monitor-interval-sec requires a numeric argument\n";
@@ -452,6 +491,11 @@ int main(int argc, char* argv[]) {
                       << "      --monitor-only   Monitor only (no position prompts, no auto-trading)\n"
                       << "      --dashboard-stream  Enable JSON exporter + local relay WS output\n"
                       << "      --no-dashboard-stream  Disable JSON exporter + local relay WS output\n"
+                      << "      --latency-probe  Enable async latency event recording\n"
+                      << "      --no-latency-probe  Disable async latency event recording\n"
+                      << "      --latency-probe-output <csv|binary|mmap>  Latency event export format (default: mmap)\n"
+                      << "      --latency-probe-summary  Enable latency summary export (default: OFF)\n"
+                      << "      --no-latency-probe-summary  Disable latency summary export\n"
                       << "      --scan-spot-relay  Scan Bithumb↔Bybit spot-transfer candidates\n"
                       << "      --monitor-interval-sec <n>  Monitor refresh interval (default: 2)\n"
                       << "  -h, --help           Show this help\n";
@@ -464,6 +508,31 @@ int main(int argc, char* argv[]) {
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+
+    const bool latency_probe_enabled = latency_probe_override.value_or(!monitor_only && !scan_spot_relay);
+    const bool latency_summary_enabled = latency_summary_override.value_or(false);
+    kimp::LatencyProbeStartOptions latency_probe_options;
+    latency_probe_options.enabled = latency_probe_enabled;
+    latency_probe_options.output_mode = latency_output_mode;
+    latency_probe_options.summary_enabled = latency_summary_enabled;
+    switch (latency_output_mode) {
+        case kimp::LatencyOutputMode::CsvText:
+            latency_probe_options.events_path = "trade_logs/latency_events.csv";
+            break;
+        case kimp::LatencyOutputMode::Binary:
+            latency_probe_options.events_path = "trade_logs/latency_events.bin";
+            break;
+        case kimp::LatencyOutputMode::MmapBinary:
+            latency_probe_options.events_path = "trade_logs/latency_events.mmapbin";
+            break;
+    }
+    latency_probe_options.summary_path = "trade_logs/latency_summary.csv";
+    kimp::LatencyProbe::instance().start(std::move(latency_probe_options));
+    struct LatencyProbeGuard {
+        ~LatencyProbeGuard() {
+            kimp::LatencyProbe::instance().stop();
+        }
+    } latency_probe_guard;
 
     auto config_opt = load_config(config_path, !(monitor_only || scan_spot_relay));
     if (!config_opt) {
@@ -495,6 +564,13 @@ int main(int argc, char* argv[]) {
     spdlog::info("=== KIMP Arbitrage Bot Starting ===");
     spdlog::info("Premium calculation: {} (4-8x faster batch processing)",
                  kimp::SIMDPremiumCalculator::get_simd_type());
+    if (latency_probe_enabled) {
+        spdlog::info("[LatencyProbe] enabled with {} ({:.2f} ns/read), output={}, summary={}",
+                     kimp::latency_clock_source_name(kimp::LatencyProbe::instance().clock_source()),
+                     kimp::LatencyProbe::instance().clock_cost_ns(),
+                     kimp::latency_output_mode_name(kimp::LatencyProbe::instance().output_mode()),
+                     kimp::LatencyProbe::instance().summary_enabled() ? "on" : "off");
+    }
 
     if (scan_spot_relay) {
         kimp::strategy::SpotRelayScanner scanner;
@@ -551,10 +627,24 @@ int main(int argc, char* argv[]) {
         [&](LifecycleTask&& task, std::size_t worker_index) {
             LoopGuard guard(g_active_loops, &engine);
 
-            const auto pickup_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - task.signal.timestamp).count();
+            const uint64_t pickup_now_ns = kimp::LatencyProbe::instance().capture_now_ns();
+            const uint64_t pickup_ns =
+                task.signal.trace_start_ns > 0 && pickup_now_ns >= task.signal.trace_start_ns
+                    ? (pickup_now_ns - task.signal.trace_start_ns)
+                    : 0;
+            kimp::LatencyProbe::instance().record_at_ns(
+                task.signal.trace_id,
+                task.signal.trace_symbol,
+                kimp::LatencyStage::LifecyclePickedUp,
+                task.signal.trace_start_ns,
+                pickup_now_ns,
+                static_cast<int64_t>(worker_index),
+                0,
+                static_cast<double>(pickup_ns),
+                0.0);
             spdlog::debug("[LIFECYCLE] {} picked up by worker {} in {}us",
-                          task.signal.symbol.to_string(), worker_index, pickup_us);
+                          task.signal.symbol.to_string(), worker_index,
+                          static_cast<long long>(pickup_ns / 1000ULL));
 
             auto result = order_manager.execute_spot_relay_entry(
                 task.signal, task.initial_position);
@@ -623,6 +713,15 @@ int main(int argc, char* argv[]) {
                 spdlog::error("[LIFECYCLE] enqueue failed for {}", signal.symbol.to_string());
                 return;
             }
+            kimp::LatencyProbe::instance().record(
+                signal.trace_id,
+                signal.trace_symbol,
+                kimp::LatencyStage::LifecycleEnqueued,
+                signal.trace_start_ns,
+                static_cast<int64_t>(lifecycle_executor.pending()),
+                0,
+                signal.net_edge_pct,
+                signal.max_tradable_usdt_at_best);
 
             spdlog::debug("[LIFECYCLE] queued {} (slot {}/{}, pending={})",
                           signal.symbol.to_string(),
@@ -823,11 +922,13 @@ int main(int argc, char* argv[]) {
                             if (!first) json += ",";
                             first = false;
                             json += fmt::format(
-                                "{{\"s\":\"{}/{}\",\"kb\":{:.2f},\"ka\":{:.2f},\"fb\":{:.8f},\"fa\":{:.8f},\"kp\":{:.2f},\"fp\":{:.8f},\"r\":{:.4f},\"ep\":{:.4f},\"xp\":{:.4f},\"sp\":{:.4f},\"pm\":{:.4f},\"sg\":{}}}",
+                                "{{\"s\":\"{}/{}\",\"kb\":{},\"ka\":{},\"fb\":{:.8f},\"fa\":{:.8f},\"kp\":{},\"fp\":{:.8f},\"r\":{:.4f},\"ep\":{:.4f},\"xp\":{:.4f},\"sp\":{:.4f},\"pm\":{:.4f},\"sg\":{}}}",
                                 p.symbol.get_base(), p.symbol.get_quote(),
-                                p.korean_bid, p.korean_ask,
+                                kimp::format::format_decimal_trimmed(p.korean_bid),
+                                kimp::format::format_decimal_trimmed(p.korean_ask),
                                 p.foreign_bid, p.foreign_ask,
-                                p.korean_price, p.foreign_price, p.usdt_rate,
+                                kimp::format::format_decimal_trimmed(p.korean_price),
+                                p.foreign_price, p.usdt_rate,
                                 p.entry_premium, p.exit_premium, p.premium_spread, p.premium,
                                 p.entry_signal ? "1" : (p.exit_signal ? "2" : "0")
                             );
@@ -878,7 +979,7 @@ int main(int argc, char* argv[]) {
     // =========================================================================
     spdlog::info("Market data path: WebSocket-only after startup subscriptions");
 
-    std::thread([&engine, common_symbols]() {
+    std::thread warmup_thread([&engine, common_symbols]() {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         if (g_shutdown) {
             return;
@@ -940,7 +1041,7 @@ int main(int argc, char* argv[]) {
                          join_samples(missing_bithumb),
                          join_samples(missing_bybit));
         }
-    }).detach();
+    });
 
     // =========================================================================
     // STARTUP RECOVERY: Check for existing positions (trade mode only)
@@ -1229,9 +1330,8 @@ int main(int argc, char* argv[]) {
             spdlog::info("=== Bot Running (Auto-Trading ENABLED) ===");
             spdlog::info("Mode: relay gate (70 USDT, 1-tick only) | Max positions: {}",
                          kimp::TradingConfig::MAX_POSITIONS);
-            spdlog::info("Capital: ${:.2f} | Position size: ${:.2f}/side (복리 성장)",
-                         engine.get_current_capital(), engine.get_position_size_usd());
-            spdlog::info("Entry: positive net edge + both venues can fill {:.2f} USDT at top-of-book",
+            spdlog::info("Entry: positive net edge + projected NetKRW >= {:.0f} + both venues can fill {:.2f} USDT at top-of-book",
+                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
                          kimp::TradingConfig::TARGET_ENTRY_USDT);
             spdlog::info("Entry fee model: Bithumb {}x + Bybit {}x = {:.2f}%",
                          kimp::TradingConfig::BITHUMB_FEE_EVENTS,
@@ -1255,6 +1355,9 @@ int main(int argc, char* argv[]) {
                 spdlog::error("[RECOVERY] No lifecycle slot available for {}", rpos.symbol.to_string());
             } else {
                 kimp::ArbitrageSignal signal;
+                signal.trace_id = kimp::LatencyProbe::instance().next_trace_id();
+                signal.trace_start_ns = kimp::LatencyProbe::instance().capture_now_ns();
+                signal.trace_symbol = kimp::LatencyProbe::format_symbol_fast(rpos.symbol);
                 signal.symbol = rpos.symbol;
                 signal.korean_exchange = rpos.korean_exchange;
                 signal.foreign_exchange = rpos.foreign_exchange;
@@ -1262,12 +1365,20 @@ int main(int argc, char* argv[]) {
                 signal.korean_ask = rpos.korean_entry_price;
                 signal.foreign_bid = rpos.foreign_entry_price;
                 signal.usdt_krw_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Bithumb);
-                signal.timestamp = std::chrono::steady_clock::now();
 
                 if (!lifecycle_executor.enqueue(LifecycleTask{signal, rpos})) {
                     release_claimed_lifecycle_slot();
                     spdlog::error("[RECOVERY] enqueue failed for {}", rpos.symbol.to_string());
                 } else {
+                    kimp::LatencyProbe::instance().record(
+                        signal.trace_id,
+                        signal.trace_symbol,
+                        kimp::LatencyStage::LifecycleEnqueued,
+                        signal.trace_start_ns,
+                        static_cast<int64_t>(lifecycle_executor.pending()),
+                        1,
+                        signal.premium,
+                        0.0);
                     spdlog::info("[RECOVERY] Queued lifecycle loop for {}",
                                  rpos.symbol.to_string());
                 }
@@ -1292,7 +1403,7 @@ int main(int argc, char* argv[]) {
                     for (const auto& p : premiums) {
                         const bool displayable =
                             p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
-                            p.net_profit_krw > 0.0;
+                            kimp::TradingConfig::meets_entry_profit_floor(p.net_profit_krw);
                         if (displayable) {
                             visible_premiums.push_back(p);
                         }
@@ -1309,23 +1420,27 @@ int main(int argc, char* argv[]) {
                         }),
                         premiums.size(), premiums[0].usdt_rate,
                         kimp::TradingConfig::TARGET_ENTRY_USDT, monitor_interval_sec);
-                    std::cout << "Columns: 순손익 양수 코인만 표시 | 실제 진입 가능 여부는 Age/1Tick 의 YES/NO 로 확인\n";
                     std::cout << fmt::format(
-                        "{:<10} {:>11} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12}\n",
+                        "Columns: NetKRW {:.0f}원 이상 코인만 표시 | 실제 진입 가능 여부는 Age/1Tick 의 YES/NO 로 확인\n",
+                        kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
+                    std::cout << fmt::format(
+                        "{:<10} {:>14} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12}\n",
                         "Symbol", "B_ask", "B_qty", "B_KRW", "By_bid", "By_qty", "MatchQty",
                         "Gross%", "Net%", "BFeeKRW", "ByFeeU", "NetKRW", "Age/1Tick");
                     std::cout << std::string(180, '-') << "\n";
 
                     if (visible_premiums.empty()) {
-                        std::cout << "현재 순손익 양수 코인이 없습니다.\n";
+                        std::cout << fmt::format("현재 NetKRW {:.0f}원 이상 코인이 없습니다.\n",
+                                                 kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
                     }
 
                     for (const auto& p : visible_premiums) {
                         const char* one_tick = p.both_can_fill_target ? "YES" : "NO";
+                        const std::string korean_ask = kimp::format::format_decimal_trimmed(p.korean_ask);
                         std::cout << fmt::format(
-                            "{:<10} {:>11.2f} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>11.2f} {:>12}\n",
+                            "{:<10} {:>14} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>11.2f} {:>12}\n",
                             p.symbol.get_base(),
-                            p.korean_ask, p.korean_ask_qty,
+                            korean_ask, p.korean_ask_qty,
                             p.bithumb_top_krw,
                             p.foreign_bid, p.foreign_bid_qty,
                             p.match_qty,
@@ -1338,15 +1453,12 @@ int main(int argc, char* argv[]) {
 
                     std::cout << std::string(180, '-') << "\n";
 
-                    auto positive_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
-                        return p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
-                               p.net_profit_krw > 0.0;
-                    });
                     auto enterable_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
-                        return p.both_can_fill_target &&
-                               p.match_qty > 0.0 &&
-                               p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
-                               p.net_profit_krw > 0.0;
+                        return kimp::TradingConfig::entry_gate_passes(
+                            p.both_can_fill_target,
+                            p.match_qty,
+                            p.net_edge_pct,
+                            p.net_profit_krw);
                     });
                     const auto bithumb_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
                         return p.korean_ask_qty > 0.0;
@@ -1358,11 +1470,12 @@ int main(int argc, char* argv[]) {
                         return p.korean_ask_qty > 0.0 && p.foreign_bid_qty > 0.0;
                     });
                     std::cout << fmt::format(
-                        "ready: bithumb {}/{} | bybit {}/{} | both {}/{} | positive net {} | enterable {} | fee model: 빗썸 {}회 + 바이비트 {}회\n",
+                        "ready: bithumb {}/{} | bybit {}/{} | both {}/{} | net>={:.0f} {} | enterable {} | fee model: 빗썸 {}회 + 바이비트 {}회\n",
                         bithumb_ready, premiums.size(),
                         bybit_ready, premiums.size(),
                         both_ready, premiums.size(),
-                        positive_count,
+                        kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
+                        visible_premiums.size(),
                         enterable_count,
                         kimp::TradingConfig::BITHUMB_FEE_EVENTS,
                         kimp::TradingConfig::BYBIT_FEE_EVENTS);
@@ -1392,29 +1505,14 @@ int main(int argc, char* argv[]) {
                         std::cout << std::string(94, '-') << "\n";
                     }
 
-                    const auto& tracker = engine.get_capital_tracker();
-                    std::cout << fmt::format("Positions: {}/{} | Capital: ${:.2f} (+{:.2f}%) | Size: ${:.2f}/side\n",
-                        engine.get_position_count(), kimp::TradingConfig::MAX_POSITIONS,
-                        tracker.get_current_capital(), tracker.get_return_percent(),
-                        engine.get_position_size_usd());
-                    std::cout << fmt::format("Entry: net>0 + both fill {:.2f} USDT | Exit >= max(entry + {:.2f}%, +{:.2f}%) | Trades: {} ({:.1f}% win)\n",
-                        kimp::TradingConfig::TARGET_ENTRY_USDT,
-                        kimp::TradingConfig::DYNAMIC_EXIT_SPREAD,
-                        kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD,
-                        tracker.get_total_trades(), tracker.get_win_rate());
+                    std::cout << fmt::format("Entry: NetKRW>={:.0f} + both fill {:.2f} USDT\n",
+                        kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
+                        kimp::TradingConfig::TARGET_ENTRY_USDT);
                     std::cout << "Ctrl+C to stop\n";
                     std::cout.flush();
                 }
             }
 
-            // Non-monitor mode: periodic status log
-            if (!monitor_mode && tick % 30 == 0) {
-                const auto& tracker = engine.get_capital_tracker();
-                spdlog::info("Status: positions={}/{} | Capital: ${:.2f} (+{:.2f}%) | Next size: ${:.2f}/side",
-                             engine.get_position_count(), kimp::TradingConfig::MAX_POSITIONS,
-                             tracker.get_current_capital(), tracker.get_return_percent(),
-                             engine.get_position_size_usd());
-            }
         }
     }
 
@@ -1430,6 +1528,9 @@ int main(int argc, char* argv[]) {
     if (ws_server) {
         ws_server->stop();  // Stop WebSocket server
     }
+    if (warmup_thread.joinable()) {
+        warmup_thread.join();
+    }
     order_manager.request_shutdown();  // Break adaptive loops before stopping engine
     lifecycle_executor.stop();
     engine.stop_async_exporter();
@@ -1437,12 +1538,7 @@ int main(int argc, char* argv[]) {
     bithumb->disconnect();
     bybit->disconnect();
 
-    work_guard.reset();
-    io_context.stop();
-
-    for (auto& t : io_threads) {
-        if (t.joinable()) t.join();
-    }
+    stop_io_threads();
 
     spdlog::info("=== Bot Stopped ===");
     kimp::Logger::shutdown();

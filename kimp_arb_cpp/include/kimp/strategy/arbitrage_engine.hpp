@@ -89,8 +89,7 @@ private:
         return shards_[shard_index(key)];
     }
 
-    // USDT/KRW prices
-    std::atomic<double> usdt_krw_upbit_{0.0};
+    // USDT/KRW price from the active Korean venue.
     std::atomic<double> usdt_krw_bithumb_{0.0};
 
 public:
@@ -134,9 +133,7 @@ public:
     }
 
     void update_usdt_krw(Exchange ex, double price) {
-        if (ex == Exchange::Upbit) {
-            usdt_krw_upbit_.store(price, std::memory_order_release);
-        } else if (ex == Exchange::Bithumb) {
+        if (ex == Exchange::Bithumb) {
             usdt_krw_bithumb_.store(price, std::memory_order_release);
         }
     }
@@ -164,9 +161,7 @@ public:
     }
 
     double get_usdt_krw(Exchange ex) const {
-        if (ex == Exchange::Upbit) {
-            return usdt_krw_upbit_.load(std::memory_order_acquire);
-        } else if (ex == Exchange::Bithumb) {
+        if (ex == Exchange::Bithumb) {
             return usdt_krw_bithumb_.load(std::memory_order_acquire);
         }
         return 0.0;
@@ -323,7 +318,7 @@ public:
  */
 class CapitalTracker {
 private:
-    std::atomic<double> initial_capital_{2000.0};     // Starting capital in USD
+    std::atomic<double> initial_capital_{TradingConfig::TOTAL_CAPITAL_USD};  // Starting capital in USD (both venues combined)
     std::atomic<double> realized_pnl_usd_{0.0};       // Accumulated P&L in USD
     std::atomic<int> total_trades_{0};                 // Total trades closed
     std::atomic<int> winning_trades_{0};               // Winning trades count
@@ -376,7 +371,7 @@ public:
     double get_position_size_usd() const {
         double current = get_current_capital();
         // Position size = min(capital/max_positions/2, POSITION_SIZE_USD)
-        // Example: $2000 / 1 / 2 = $1000, capped to $250 per side
+        // Example: $6000 / 1 / 2 = $3000 per side budget, capped to the configured side limit.
         double dynamic = current / static_cast<double>(TradingConfig::MAX_POSITIONS) / 2.0;
         return std::min(dynamic, TradingConfig::POSITION_SIZE_USD);
     }
@@ -450,7 +445,7 @@ public:
         double total_fee_krw{0.0};
         double gross_spread_krw{0.0};
         double gross_edge_pct{0.0};
-        double net_profit_krw{0.0};
+        double net_profit_krw{0.0}; // Uses the immediately executable entry size, capped at TARGET_ENTRY_USDT
         double net_basis_krw{0.0};
         double net_edge_pct{0.0};
     };
@@ -496,14 +491,17 @@ public:
         metrics.bithumb_top_usdt = metrics.bithumb_top_krw / usdt_krw_rate;
         metrics.bybit_top_usdt = foreign_bid * foreign_bid_qty;
         metrics.bybit_top_krw = metrics.bybit_top_usdt * usdt_krw_rate;
-        metrics.match_buy_krw = korean_ask * metrics.match_qty;
-        metrics.match_sell_usdt = foreign_bid * metrics.match_qty;
-        metrics.match_sell_krw = metrics.match_sell_usdt * usdt_krw_rate;
-        metrics.max_tradable_usdt_at_best = metrics.match_sell_usdt;
+        metrics.max_tradable_usdt_at_best = foreign_bid * metrics.match_qty;
         metrics.target_coin_qty = TradingConfig::TARGET_ENTRY_USDT / foreign_bid;
         metrics.bithumb_can_fill_target = korean_ask_qty >= metrics.target_coin_qty;
         metrics.bybit_can_fill_target = foreign_bid_qty >= metrics.target_coin_qty;
         metrics.both_can_fill_target = metrics.bithumb_can_fill_target && metrics.bybit_can_fill_target;
+
+        // Price the entry on the immediately executable size, capped at the live target notional.
+        const double effective_entry_qty = std::min(metrics.match_qty, metrics.target_coin_qty);
+        metrics.match_buy_krw = korean_ask * effective_entry_qty;
+        metrics.match_sell_usdt = foreign_bid * effective_entry_qty;
+        metrics.match_sell_krw = metrics.match_sell_usdt * usdt_krw_rate;
 
         const double bithumb_fee_per_trade_krw = metrics.match_buy_krw * TradingConfig::BITHUMB_FEE_RATE;
         const double bybit_fee_per_trade_usdt = metrics.match_sell_usdt * TradingConfig::BYBIT_FEE_RATE;
@@ -659,7 +657,7 @@ private:
     // Price and position tracking
     PriceCache price_cache_;
     PositionTracker position_tracker_;
-    CapitalTracker capital_tracker_{2000.0};  // 초기 자본 $2000
+    CapitalTracker capital_tracker_{TradingConfig::TOTAL_CAPITAL_USD};  // 초기 자본: 거래소별 $3000, 총 $6000
 
     // ── Incremental entry premium cache (lock-free, O(1) per-symbol update) ──
     // Every ticker update recomputes only the affected symbol's premium.
@@ -731,7 +729,7 @@ private:
     void sync_entry_state_bits(size_t idx, bool qualifies, bool signal_fired);
 
     static bool is_korean_exchange(Exchange ex) {
-        return ex == Exchange::Upbit || ex == Exchange::Bithumb;
+        return ex == Exchange::Bithumb;
     }
 };
 

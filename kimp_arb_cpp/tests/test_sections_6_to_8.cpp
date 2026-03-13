@@ -59,10 +59,10 @@ void test_section6_thread_config_optimal() {
     int cores = std::thread::hardware_concurrency();
 
     if (cores >= 8) {
-        TEST("8+ cores: dedicated io_bithumb_core=1", cfg.io_bithumb_core == 1);
-        TEST("8+ cores: dedicated io_bybit_core=2", cfg.io_bybit_core == 2);
-        TEST("8+ cores: strategy_core=3", cfg.strategy_core == 3);
-        TEST("8+ cores: execution_core=4", cfg.execution_core == 4);
+        TEST("8+ cores: dedicated io_bithumb_core=0", cfg.io_bithumb_core == 0);
+        TEST("8+ cores: dedicated io_bybit_core=1", cfg.io_bybit_core == 1);
+        TEST("8+ cores: strategy_core=2", cfg.strategy_core == 2);
+        TEST("8+ cores: execution_core=3", cfg.execution_core == 3);
     } else if (cores >= 4) {
         TEST("4+ cores: shared io cores", cfg.io_bithumb_core == 0 && cfg.io_bybit_core == 1);
         TEST("4+ cores: strategy_core=2", cfg.strategy_core == 2);
@@ -415,30 +415,30 @@ void test_section8_premium_calculator() {
 void test_section8_capital_tracker() {
     std::cout << "\n--- Section 8.6: CapitalTracker ---\n";
 
-    kimp::strategy::CapitalTracker tracker(2000.0);
+    kimp::strategy::CapitalTracker tracker;
 
-    TEST_NEAR("Initial capital = $2000", tracker.get_initial_capital(), 2000.0, 1e-10);
-    TEST_NEAR("Current capital = $2000 (no P&L)", tracker.get_current_capital(), 2000.0, 1e-10);
+    TEST_NEAR("Initial capital = $6000", tracker.get_initial_capital(), 6000.0, 1e-10);
+    TEST_NEAR("Current capital = $6000 (no P&L)", tracker.get_current_capital(), 6000.0, 1e-10);
     TEST_NEAR("Realized P&L = $0", tracker.get_realized_pnl(), 0.0, 1e-10);
 
-    TEST_NEAR("Position size = $70 relay target", tracker.get_position_size_usd(), 70.0, 1e-10);
+    TEST_NEAR("Position size = $3000 per-side cap", tracker.get_position_size_usd(), 3000.0, 1e-10);
 
     // Add profit
     tracker.add_realized_pnl(1.50);  // $1.50 profit
-    TEST_NEAR("After +$1.50: capital = $2001.50", tracker.get_current_capital(), 2001.50, 1e-10);
+    TEST_NEAR("After +$1.50: capital = $6001.50", tracker.get_current_capital(), 6001.50, 1e-10);
     TEST("Total trades = 1", tracker.get_total_trades() == 1);
     TEST("Winning trades = 1", tracker.get_winning_trades() == 1);
     TEST_NEAR("Win rate = 100%", tracker.get_win_rate(), 100.0, 1e-10);
 
     // Add loss
     tracker.add_realized_pnl(-0.30);  // $0.30 loss
-    TEST_NEAR("After -$0.30: capital = $2001.20", tracker.get_current_capital(), 2001.20, 1e-10);
+    TEST_NEAR("After -$0.30: capital = $6001.20", tracker.get_current_capital(), 6001.20, 1e-10);
     TEST("Total trades = 2", tracker.get_total_trades() == 2);
     TEST("Winning trades still = 1", tracker.get_winning_trades() == 1);
     TEST_NEAR("Win rate = 50%", tracker.get_win_rate(), 50.0, 1e-10);
 
     // Return percent
-    TEST_NEAR("Return = 0.06%", tracker.get_return_percent(), 0.06, 0.001);
+    TEST_NEAR("Return = 0.02%", tracker.get_return_percent(), 0.02, 0.001);
 }
 
 void test_section8_price_cache_thread_safety() {
@@ -468,12 +468,10 @@ void test_section8_price_cache_thread_safety() {
     });
 
     std::thread reader([&]() {
-        int reads = 0;
         while (done.load() < 2) {
             auto p1 = cache.get_price(kimp::Exchange::Bithumb, sol);
             auto p2 = cache.get_price(kimp::Exchange::Bybit, sol_usdt);
             (void)p1; (void)p2;
-            ++reads;
         }
     });
 
@@ -554,9 +552,8 @@ void test_section8_dynamic_exit_threshold() {
               kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD, 1e-10);
 
     TEST("SPLIT_ORDERS = 1", kimp::TradingConfig::SPLIT_ORDERS == 1);
-    TEST_NEAR("ORDER_SIZE * SPLITS = POSITION_SIZE",
-              kimp::TradingConfig::ORDER_SIZE_USD * kimp::TradingConfig::SPLIT_ORDERS,
-              kimp::TradingConfig::POSITION_SIZE_USD, 1e-10);
+    TEST_NEAR("ORDER_SIZE = 70 USDT per add", kimp::TradingConfig::ORDER_SIZE_USD, 70.0, 1e-10);
+    TEST_NEAR("POSITION_SIZE = $3000 side cap", kimp::TradingConfig::POSITION_SIZE_USD, 3000.0, 1e-10);
 }
 
 // =========================================================================

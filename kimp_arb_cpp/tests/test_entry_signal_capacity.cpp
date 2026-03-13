@@ -55,7 +55,7 @@ int main() {
         engine.on_ticker_update(make_ticker(
             Exchange::Bybit, SymbolId(base, "USDT"), 100.0, 100.1, 100.05, 10.0, 10.0));
         engine.on_ticker_update(make_ticker(
-            Exchange::Bithumb, SymbolId(base, "KRW"), 99550.0, 99600.0, 99575.0, 10.0, 10.0));
+            Exchange::Bithumb, SymbolId(base, "KRW"), 97950.0, 98000.0, 97975.0, 10.0, 10.0));
     }
 
     // Trigger one more full pass after all quotes are populated.

@@ -73,10 +73,6 @@ private:
 // Default WebSocket endpoints
 namespace endpoints {
 
-// Upbit
-constexpr const char* UPBIT_WS = "wss://api.upbit.com/websocket/v1";
-constexpr const char* UPBIT_REST = "https://api.upbit.com";
-
 // Bithumb
 constexpr const char* BITHUMB_WS = "wss://pubwss.bithumb.com/pub/ws";
 constexpr const char* BITHUMB_REST = "https://api.bithumb.com";

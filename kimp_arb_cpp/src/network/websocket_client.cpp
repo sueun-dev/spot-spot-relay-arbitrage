@@ -234,6 +234,7 @@ void WebSocketClient::do_read() {
 }
 
 void WebSocketClient::on_read(beast::error_code ec, std::size_t bytes_transferred) {
+    (void)bytes_transferred;
     if (ec) {
         if (ec == websocket::error::closed) {
             Logger::info("[{}] WebSocket closed by server", name_);
@@ -278,6 +279,7 @@ void WebSocketClient::do_write() {
 }
 
 void WebSocketClient::on_write(beast::error_code ec, std::size_t bytes_transferred) {
+    (void)bytes_transferred;
     if (ec) {
         handle_error("write", ec);
         current_write_message_.clear();

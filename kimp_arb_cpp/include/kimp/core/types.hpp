@@ -20,15 +20,13 @@ using Quantity = double;
 
 // Exchange identifiers
 enum class Exchange : uint8_t {
-    Upbit = 0,
-    Bithumb = 1,
-    Bybit = 2,
-    Count = 3
+    Bithumb = 0,
+    Bybit = 1,
+    Count = 2
 };
 
 inline constexpr const char* exchange_name(Exchange ex) noexcept {
     switch (ex) {
-        case Exchange::Upbit: return "Upbit";
         case Exchange::Bithumb: return "Bithumb";
         case Exchange::Bybit: return "Bybit";
         default: return "Unknown";
@@ -36,7 +34,7 @@ inline constexpr const char* exchange_name(Exchange ex) noexcept {
 }
 
 inline constexpr bool is_korean_exchange(Exchange ex) noexcept {
-    return ex == Exchange::Upbit || ex == Exchange::Bithumb;
+    return ex == Exchange::Bithumb;
 }
 
 inline constexpr bool is_foreign_exchange(Exchange ex) noexcept {
@@ -109,11 +107,7 @@ struct SymbolId {
         return std::string(get_base()) + "/" + std::string(get_quote());
     }
 
-    // Korean format: "KRW-BTC" for Upbit, "BTC_KRW" for Bithumb
-    std::string to_upbit_format() const {
-        return std::string(get_quote()) + "-" + std::string(get_base());
-    }
-
+    // Korean format: "BTC_KRW" for Bithumb
     std::string to_bithumb_format() const {
         return std::string(get_base()) + "_" + std::string(get_quote());
     }
@@ -266,6 +260,9 @@ struct Order {
 
 // Arbitrage signal
 struct ArbitrageSignal {
+    uint64_t trace_id{0};
+    uint64_t trace_start_ns{0};
+    std::array<char, 24> trace_symbol{};
     SymbolId symbol;
     Exchange korean_exchange{};
     Exchange foreign_exchange{};
@@ -289,6 +286,9 @@ struct ArbitrageSignal {
 
 // Exit signal
 struct ExitSignal {
+    uint64_t trace_id{0};
+    uint64_t trace_start_ns{0};
+    std::array<char, 24> trace_symbol{};
     SymbolId symbol;
     Exchange korean_exchange{};
     Exchange foreign_exchange{};
@@ -307,15 +307,18 @@ struct TradingConfig {
     // 병렬 포지션 관리: 조건 만족하는 모든 코인에 동시 진입, 개별 청산
     // ==========================================================================
     static inline int MAX_POSITIONS = 1;                       // 최대 동시 포지션 수 (런타임 설정, 1~4)
-    static constexpr double TARGET_ENTRY_USDT = 70.0;         // Relay gate: exact 70 USDT notional per entry
-    static constexpr double POSITION_SIZE_USD = TARGET_ENTRY_USDT;
-    static constexpr double ORDER_SIZE_USD = TARGET_ENTRY_USDT;
-    static constexpr int SPLIT_ORDERS = 1;                    // Relay mode: single-shot fill only
-    static constexpr int ORDER_INTERVAL_MS = 100;             // Retry quickly on missed 1-tick capacity
+    static constexpr double CAPITAL_PER_EXCHANGE_USD = 3000.0; // Risk budget per venue (Bithumb $3000, Bybit $3000)
+    static constexpr double TOTAL_CAPITAL_USD = CAPITAL_PER_EXCHANGE_USD * 2.0;
+    static constexpr double TARGET_ENTRY_USDT = 70.0;         // Per-check entry unit: exact 70 USDT notional per add
+    static constexpr double POSITION_SIZE_USD = CAPITAL_PER_EXCHANGE_USD; // Max side exposure per symbol / per venue
+    static constexpr double ORDER_SIZE_USD = TARGET_ENTRY_USDT;           // Each submit adds 70 USDT
+    static constexpr int SPLIT_ORDERS = 1;                    // Each cycle submits one 70 USDT order, then re-checks
+    static constexpr int ORDER_INTERVAL_MS = 100;             // Re-check quickly on next market update / retry
 
     // Entry threshold
     static constexpr double ENTRY_PREMIUM_THRESHOLD = 0.0;    // Legacy/monitor alias only
     static constexpr double MIN_NET_EDGE_PCT = 0.0;           // Enter only when net edge is positive
+    static constexpr double MIN_ENTRY_NET_PROFIT_KRW = 800.0; // Enter only when projected NetKRW for the executable entry size is >= 800
 
     // Fee structure for the relay model
     static constexpr int BITHUMB_FEE_EVENTS = 1;
@@ -329,6 +332,20 @@ struct TradingConfig {
     static constexpr double ROUND_TRIP_FEE_PCT = ENTRY_TOTAL_FEE_PCT;  // Legacy alias for older diagnostics/tests
     static constexpr double MIN_NET_PROFIT_PCT = 0.00;
     static constexpr double DYNAMIC_EXIT_SPREAD = ENTRY_TOTAL_FEE_PCT + MIN_NET_PROFIT_PCT;
+
+    static constexpr bool meets_entry_profit_floor(double net_profit_krw) noexcept {
+        return net_profit_krw >= MIN_ENTRY_NET_PROFIT_KRW;
+    }
+
+    static constexpr bool entry_gate_passes(bool both_can_fill_target,
+                                            double match_qty,
+                                            double net_edge_pct,
+                                            double net_profit_krw) noexcept {
+        return both_can_fill_target &&
+               match_qty > 0.0 &&
+               net_edge_pct > MIN_NET_EDGE_PCT &&
+               meets_entry_profit_floor(net_profit_krw);
+    }
 
     // Fallback fixed exit threshold (used when no position entry_premium available)
     static constexpr double EXIT_PREMIUM_THRESHOLD = 0.25;    // Exit floor: premium >= +0.25%

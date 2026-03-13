@@ -6,6 +6,7 @@
 #include <simdjson.h>
 #include <map>
 #include <condition_variable>
+#include <thread>
 
 namespace kimp::exchange::bithumb {
 
@@ -20,6 +21,10 @@ namespace kimp::exchange::bithumb {
  */
 class BithumbExchange : public KoreanExchangeBase {
 private:
+    static constexpr std::size_t ORDERBOOK_SNAPSHOT_DEPTH = 5;
+    static constexpr std::size_t ORDERBOOK_BBO_DEPTH = 1;
+    static constexpr auto ORDERBOOK_RESYNC_INTERVAL = std::chrono::milliseconds(500);
+
     simdjson::ondemand::parser json_parser_;
     simdjson::padded_string json_buffer_{4096};
 
@@ -60,6 +65,8 @@ private:
     };
     std::unordered_map<std::string, BBO> orderbook_bbo_;
     std::atomic<bool> orderbook_ready_{false};
+    std::atomic<bool> orderbook_resync_running_{false};
+    std::thread orderbook_resync_thread_;
 
     // Cache last known ticker price per symbol for orderbookdepth-driven dispatch
     std::unordered_map<std::string, double> last_price_cache_;
@@ -68,6 +75,7 @@ public:
     BithumbExchange(net::io_context& ioc, ExchangeCredentials creds)
         : KoreanExchangeBase(Exchange::Bithumb, MarketType::Spot, "Bithumb", ioc, std::move(creds)) {
     }
+    ~BithumbExchange() override;
 
     bool connect() override;
     void disconnect() override;
@@ -118,11 +126,14 @@ private:
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
     std::vector<std::string> parse_orderbookdepth_message(std::string_view message);
     void update_bbo(const std::string& symbol_key);
+    void start_orderbook_resync_loop();
+    void stop_orderbook_resync_loop();
     std::string resolve_private_ws_endpoint() const;
     void subscribe_private_myorder();
 
 public:
-    void fetch_all_orderbook_snapshots(const std::vector<SymbolId>& symbols);
+    void fetch_all_orderbook_snapshots(const std::vector<SymbolId>& symbols,
+                                       std::size_t depth_count = ORDERBOOK_SNAPSHOT_DEPTH);
 };
 
 } // namespace kimp::exchange::bithumb

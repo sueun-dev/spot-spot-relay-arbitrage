@@ -88,7 +88,7 @@ include_directories(
 )
 
 # Collect source files
-file(GLOB_RECURSE LIB_SOURCES
+file(GLOB_RECURSE LIB_SOURCES CONFIGURE_DEPENDS
     "src/core/*.cpp"
     "src/memory/*.cpp"
     "src/network/*.cpp"
@@ -133,6 +133,22 @@ target_link_libraries(kimp_test_entry_capacity PRIVATE kimp_lib)
 add_executable(kimp_test_lifecycle_executor tests/test_lifecycle_executor.cpp)
 target_link_libraries(kimp_test_lifecycle_executor PRIVATE kimp_lib)
 
+# Regression: latency probe must flush nanosecond events and summary spans
+add_executable(kimp_test_latency_probe tests/test_latency_probe.cpp)
+target_link_libraries(kimp_test_latency_probe PRIVATE kimp_lib)
+
+# Benchmark: compare precise clock sources and legacy vs optimized trace math
+add_executable(kimp_bench_latency_probe tests/bench_latency_probe.cpp)
+target_link_libraries(kimp_bench_latency_probe PRIVATE kimp_lib)
+
+# Benchmark: isolate hot-path components and compare queue topologies
+add_executable(kimp_bench_latency_probe_hotpath tests/bench_latency_probe_hotpath.cpp)
+target_link_libraries(kimp_bench_latency_probe_hotpath PRIVATE kimp_lib)
+
+# Regression: realized exit P&L must match actual split fills
+add_executable(kimp_test_order_manager_pnl tests/test_order_manager_pnl.cpp)
+target_link_libraries(kimp_test_order_manager_pnl PRIVATE kimp_lib)
+
 # Regression: atomic bitset must keep deterministic set iteration/counts
 add_executable(kimp_test_atomic_bitset tests/test_atomic_bitset.cpp)
 target_link_libraries(kimp_test_atomic_bitset PRIVATE kimp_lib)
@@ -160,6 +176,10 @@ target_link_libraries(kimp_test_bithumb_ws PRIVATE kimp_lib)
 # Regression: Bithumb private myOrder WS payloads must populate fill cache before REST fallback
 add_executable(kimp_test_bithumb_private_ws tests/test_bithumb_private_ws.cpp)
 target_link_libraries(kimp_test_bithumb_private_ws PRIVATE kimp_lib)
+
+# Regression: KRW price formatting must not round sub-won Bithumb quotes into fake prices
+add_executable(kimp_test_price_format tests/test_price_format.cpp)
+target_link_libraries(kimp_test_price_format PRIVATE kimp_lib)
 
 # Section 1 test: Process startup & config loading
 add_executable(kimp_test_init_s1 tests/test_init_section1.cpp)

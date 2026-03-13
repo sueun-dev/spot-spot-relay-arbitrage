@@ -84,10 +84,10 @@ void test_selects_best_net_edge() {
     h.add_coin("BBB");
     h.add_coin("CCC");
 
-    h.set_korean_book("AAA", 1980.0, 1985.0, 80.0, 80.0);
+    h.set_korean_book("AAA", 1955.0, 1960.0, 80.0, 80.0);
     h.set_foreign_book("AAA", 2.0, 2.01, 80.0, 80.0);
 
-    h.set_korean_book("BBB", 2960.0, 2965.0, 30.0, 30.0);
+    h.set_korean_book("BBB", 2905.0, 2910.0, 30.0, 30.0);
     h.set_foreign_book("BBB", 3.0, 3.01, 30.0, 30.0);
 
     // Positive spread but insufficient first-tick liquidity for 70 USDT.
@@ -99,6 +99,7 @@ void test_selects_best_net_edge() {
     assert(h.captured_signal.has_value());
     assert(h.captured_signal->symbol.get_base() == "BBB");
     assert(h.captured_signal->net_edge_pct > 0.0);
+    assert(h.captured_signal->net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
     assert(h.captured_signal->both_can_fill_target);
 
     std::cout << "PASS (" << h.captured_signal->symbol.get_base()
@@ -135,13 +136,28 @@ void test_blocks_when_fee_adjusted_net_edge_is_negative() {
     std::cout << "PASS" << std::endl;
 }
 
-void test_signal_contains_relay_metrics() {
-    std::cout << "TEST 4: 시그널에 relay 지표 포함... ";
+void test_blocks_when_net_profit_is_below_800_krw() {
+    std::cout << "TEST 4: NetKRW 800 미만이면 진입 차단... ";
 
     TestHarness h;
     h.add_coin("AAA");
 
-    h.set_korean_book("AAA", 1980.0, 1985.0, 50.0, 50.0);
+    // Positive edge on the 70 USDT target, but projected net profit stays below 800 KRW.
+    h.set_korean_book("AAA", 1975.0, 1980.0, 100.0, 100.0);
+    h.set_foreign_book("AAA", 2.0, 2.01, 100.0, 100.0);
+    h.set_usdt_rate(USDT_KRW);
+
+    assert(!h.captured_signal.has_value());
+    std::cout << "PASS" << std::endl;
+}
+
+void test_signal_contains_relay_metrics() {
+    std::cout << "TEST 5: 시그널에 relay 지표 포함... ";
+
+    TestHarness h;
+    h.add_coin("AAA");
+
+    h.set_korean_book("AAA", 1955.0, 1960.0, 50.0, 50.0);
     h.set_foreign_book("AAA", 2.0, 2.01, 50.0, 50.0);
     h.set_usdt_rate(USDT_KRW);
 
@@ -152,7 +168,7 @@ void test_signal_contains_relay_metrics() {
     assert(std::abs(sig.foreign_bid_qty - 50.0) < 1e-9);
     assert(std::abs(sig.match_qty - 50.0) < 1e-9);
     assert(sig.net_edge_pct > 0.0);
-    assert(sig.net_profit_krw > 0.0);
+    assert(sig.net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
     assert(sig.both_can_fill_target);
 
     std::cout << "PASS (targetQty=" << sig.target_coin_qty
@@ -161,15 +177,15 @@ void test_signal_contains_relay_metrics() {
 }
 
 void test_no_entry_when_position_held() {
-    std::cout << "TEST 5: 포지션 보유 중이면 새 진입 차단... ";
+    std::cout << "TEST 6: 포지션 보유 중이면 새 진입 차단... ";
 
     TestHarness h;
     h.add_coin("AAA");
     h.add_coin("BBB");
 
-    h.set_korean_book("AAA", 1980.0, 1985.0, 80.0, 80.0);
+    h.set_korean_book("AAA", 1955.0, 1960.0, 80.0, 80.0);
     h.set_foreign_book("AAA", 2.0, 2.01, 80.0, 80.0);
-    h.set_korean_book("BBB", 2960.0, 2965.0, 30.0, 30.0);
+    h.set_korean_book("BBB", 2905.0, 2910.0, 30.0, 30.0);
     h.set_foreign_book("BBB", 3.0, 3.01, 30.0, 30.0);
 
     Position pos;
@@ -193,9 +209,10 @@ int main() {
     test_selects_best_net_edge();
     test_blocks_when_first_tick_cannot_fill_70_usdt();
     test_blocks_when_fee_adjusted_net_edge_is_negative();
+    test_blocks_when_net_profit_is_below_800_krw();
     test_signal_contains_relay_metrics();
     test_no_entry_when_position_held();
 
-    std::cout << "\n===== 전체 5개 테스트 PASS =====\n" << std::endl;
+    std::cout << "\n===== 전체 6개 테스트 PASS =====\n" << std::endl;
     return 0;
 }

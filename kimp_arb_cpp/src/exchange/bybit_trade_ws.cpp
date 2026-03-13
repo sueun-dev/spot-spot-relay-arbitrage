@@ -13,7 +13,7 @@ bool BybitTradeWS::connect() {
 
     ws_ = std::make_shared<network::WebSocketClient>(io_context_, "Bybit-Trade-WS");
 
-    ws_->set_message_callback([this](std::string_view msg, network::MessageType type) {
+    ws_->set_message_callback([this](std::string_view msg, network::MessageType /*type*/) {
         on_message(msg);
     });
 

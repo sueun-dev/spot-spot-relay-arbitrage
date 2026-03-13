@@ -51,7 +51,11 @@ struct SpotRelayCandidate {
     std::vector<std::string> shared_networks;
 
     bool enterable() const noexcept {
-        return both_can_fill_target && net_profit_krw > 0.0;
+        return TradingConfig::entry_gate_passes(
+            both_can_fill_target,
+            match_qty,
+            net_edge_pct,
+            net_profit_krw);
     }
 
     bool transfer_ready() const noexcept {

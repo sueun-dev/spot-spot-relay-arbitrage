@@ -182,11 +182,10 @@ inline double fast_stod(std::string_view sv, double default_val = 0.0) noexcept 
 
 // ============== Thread Configuration ==============
 struct ThreadConfig {
-    int io_upbit_core = 0;
-    int io_bithumb_core = 1;
-    int io_bybit_core = 2;
-    int strategy_core = 3;
-    int execution_core = 4;
+    int io_bithumb_core = 0;
+    int io_bybit_core = 1;
+    int strategy_core = 2;
+    int execution_core = 3;
 
     static ThreadConfig optimal() {
         ThreadConfig cfg;
@@ -194,21 +193,18 @@ struct ThreadConfig {
 
         if (num_cores >= 8) {
             // High-end server: dedicated cores
-            cfg.io_upbit_core = 0;
-            cfg.io_bithumb_core = 1;
-            cfg.io_bybit_core = 2;
-            cfg.strategy_core = 3;
-            cfg.execution_core = 4;
+            cfg.io_bithumb_core = 0;
+            cfg.io_bybit_core = 1;
+            cfg.strategy_core = 2;
+            cfg.execution_core = 3;
         } else if (num_cores >= 4) {
             // Mid-range: share some cores
-            cfg.io_upbit_core = 0;
             cfg.io_bithumb_core = 0;
             cfg.io_bybit_core = 1;
             cfg.strategy_core = 2;
             cfg.execution_core = 3;
         } else {
             // Low-end: no pinning
-            cfg.io_upbit_core = -1;
             cfg.io_bithumb_core = -1;
             cfg.io_bybit_core = -1;
             cfg.strategy_core = -1;

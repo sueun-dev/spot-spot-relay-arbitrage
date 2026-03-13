@@ -53,8 +53,7 @@ int main() {
     executor.start(options);
 
     for (int i = 0; i < 8; ++i) {
-        const bool ok = executor.enqueue(TestTask{i});
-        assert(ok);
+        assert(executor.enqueue(TestTask{i}));
     }
 
     const auto deadline = std::chrono::steady_clock::now() + 2s;

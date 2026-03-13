@@ -236,7 +236,7 @@ public:
     }
 
     // Cost-based market buy (override in Korean exchanges)
-    Order place_market_buy_cost(const SymbolId& symbol, Price cost) override {
+    Order place_market_buy_cost(const SymbolId& /*symbol*/, Price /*cost*/) override {
         // Default: convert cost to quantity using current price
         Order order;
         order.status = OrderStatus::Rejected;
@@ -311,7 +311,7 @@ protected:
 };
 
 /**
- * Korean exchange base (Upbit, Bithumb)
+ * Korean exchange base
  * Specialized for KRW spot markets
  */
 class KoreanExchangeBase : public ExchangeBase {

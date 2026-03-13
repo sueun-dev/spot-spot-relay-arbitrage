@@ -774,8 +774,8 @@ bool SpotRelayScanner::run(const RuntimeConfig& config, const Options& options, 
                   if (a.enterable() != b.enterable()) {
                       return a.enterable() > b.enterable();
                   }
-                  const bool a_positive_net = a.net_profit_krw > 0.0;
-                  const bool b_positive_net = b.net_profit_krw > 0.0;
+                  const bool a_positive_net = TradingConfig::meets_entry_profit_floor(a.net_profit_krw);
+                  const bool b_positive_net = TradingConfig::meets_entry_profit_floor(b.net_profit_krw);
                   if (a_positive_net != b_positive_net) {
                       return a_positive_net > b_positive_net;
                   }
@@ -800,11 +800,11 @@ bool SpotRelayScanner::run(const RuntimeConfig& config, const Options& options, 
     }
     write_candidates_json(options.json_output_path, candidates, bybit_auth);
 
-    size_t positive_net_count = 0;
+    size_t min_net_profit_count = 0;
     size_t enterable_count = 0;
     for (const auto& c : candidates) {
-        if (c.net_profit_krw > 0.0) {
-            ++positive_net_count;
+        if (TradingConfig::meets_entry_profit_floor(c.net_profit_krw)) {
+            ++min_net_profit_count;
         }
         if (c.enterable()) {
             ++enterable_count;
@@ -817,8 +817,9 @@ bool SpotRelayScanner::run(const RuntimeConfig& config, const Options& options, 
         bybit_auth ? "true" : "false",
         options.json_output_path);
     out << fmt::format(
-        "[spot-relay] positive_net={} enterable={} target_usdt={:.2f} fee_model=빗썸 {}회 + 바이비트 {}회\n",
-        positive_net_count,
+        "[spot-relay] net_profit>={:.0f}krw={} enterable={} target_usdt={:.2f} fee_model=빗썸 {}회 + 바이비트 {}회\n",
+        TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
+        min_net_profit_count,
         enterable_count,
         TradingConfig::TARGET_ENTRY_USDT,
         TradingConfig::BITHUMB_FEE_EVENTS,

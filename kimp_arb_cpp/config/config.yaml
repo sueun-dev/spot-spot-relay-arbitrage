@@ -12,13 +12,6 @@ trading:
   max_price_diff_percent: 50.0
 
 exchanges:
-  upbit:
-    enabled: true
-    ws_endpoint: "wss://api.upbit.com/websocket/v1"
-    rest_endpoint: "https://api.upbit.com"
-    api_key: "${UPBIT_ACCESS_KEY}"
-    secret_key: "${UPBIT_SECRET_KEY}"
-
   bithumb:
     enabled: true
     ws_endpoint: "wss://pubwss.bithumb.com/pub/ws"

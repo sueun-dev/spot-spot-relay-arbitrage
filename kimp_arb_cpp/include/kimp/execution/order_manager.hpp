@@ -1,8 +1,8 @@
 #pragma once
 
 #include "kimp/core/types.hpp"
+#include "kimp/core/latency_probe.hpp"
 #include "kimp/exchange/exchange_base.hpp"
-#include "kimp/exchange/upbit/upbit.hpp"
 #include "kimp/exchange/bithumb/bithumb.hpp"
 #include "kimp/exchange/bybit/bybit.hpp"
 #include "kimp/execution/lifecycle_executor.hpp"
@@ -55,13 +55,18 @@ private:
         Kind kind{Kind::Foreign};
         Exchange ex{Exchange::Bybit};
         SymbolId symbol{};
+        uint64_t trace_id{0};
+        uint64_t trace_start_ns{0};
+        LatencySymbol trace_symbol{};
+        LatencyStage enqueue_stage{LatencyStage::EntryForeignFillQueryStart};
+        LatencyStage worker_stage{LatencyStage::EntryForeignFillWorkerStart};
+        LatencyStage done_stage{LatencyStage::EntryForeignFillDone};
         Order* order{nullptr};
         std::latch* done{nullptr};
     };
 
     // Exchange references
     std::array<ExchangePtr, static_cast<size_t>(Exchange::Count)> exchanges_{};
-    std::shared_ptr<exchange::upbit::UpbitExchange> upbit_exchange_;
     std::shared_ptr<exchange::bithumb::BithumbExchange> bithumb_exchange_;
     std::shared_ptr<exchange::bybit::BybitExchange> bybit_exchange_;
 

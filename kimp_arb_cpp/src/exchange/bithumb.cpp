@@ -93,27 +93,35 @@ bool parse_orderbookdepth_fast(std::string_view message,
     cursor += list_marker.size();
 
     while (true) {
-        std::string_view symbol_sv;
-        size_t symbol_end = 0;
-        if (!extract_quoted_value(message, symbol_marker, cursor, symbol_sv, symbol_end)) {
+        const size_t object_start = message.find('{', cursor);
+        if (object_start == std::string_view::npos) {
             break;
+        }
+        const size_t object_end = message.find('}', object_start);
+        if (object_end == std::string_view::npos) {
+            return false;
+        }
+        std::string_view item = message.substr(object_start, object_end - object_start + 1);
+
+        std::string_view symbol_sv;
+        size_t field_end = 0;
+        if (!extract_quoted_value(item, symbol_marker, 0, symbol_sv, field_end)) {
+            cursor = object_end + 1;
+            continue;
         }
 
         std::string_view order_type_sv;
-        size_t order_type_end = 0;
-        if (!extract_quoted_value(message, order_type_marker, symbol_end, order_type_sv, order_type_end)) {
+        if (!extract_quoted_value(item, order_type_marker, 0, order_type_sv, field_end)) {
             return false;
         }
 
         std::string_view price_sv;
-        size_t price_end = 0;
-        if (!extract_quoted_value(message, price_marker, order_type_end, price_sv, price_end)) {
+        if (!extract_quoted_value(item, price_marker, 0, price_sv, field_end)) {
             return false;
         }
 
         std::string_view quantity_sv;
-        size_t quantity_end = 0;
-        if (!extract_quoted_value(message, quantity_marker, price_end, quantity_sv, quantity_end)) {
+        if (!extract_quoted_value(item, quantity_marker, 0, quantity_sv, field_end)) {
             return false;
         }
 
@@ -124,7 +132,7 @@ bool parse_orderbookdepth_fast(std::string_view message,
         update.quantity = kimp::opt::fast_stod(quantity_sv);
         updates.push_back(std::move(update));
 
-        cursor = quantity_end;
+        cursor = object_end + 1;
     }
 
     return !updates.empty();
@@ -169,6 +177,10 @@ std::string sign_bithumb_v1_jwt(std::string_view secret_key,
 
 namespace kimp::exchange::bithumb {
 
+BithumbExchange::~BithumbExchange() {
+    stop_orderbook_resync_loop();
+}
+
 bool BithumbExchange::connect() {
     if (connected_) {
         Logger::warn("[Bithumb] Already connected");
@@ -186,7 +198,7 @@ bool BithumbExchange::connect() {
 
     ws_client_ = std::make_shared<network::WebSocketClient>(io_context_, "Bithumb-WS");
 
-    ws_client_->set_message_callback([this](std::string_view msg, network::MessageType type) {
+    ws_client_->set_message_callback([this](std::string_view msg, network::MessageType /*type*/) {
         on_ws_message(msg);
     });
 
@@ -198,7 +210,7 @@ bool BithumbExchange::connect() {
         }
     });
 
-    ws_client_->set_disconnect_callback([this](const std::string& reason) {
+    ws_client_->set_disconnect_callback([this](const std::string& /*reason*/) {
         on_ws_disconnected();
     });
 
@@ -241,6 +253,8 @@ bool BithumbExchange::connect() {
 }
 
 void BithumbExchange::disconnect() {
+    stop_orderbook_resync_loop();
+
     if (private_ws_) {
         private_ws_->disconnect();
         private_ws_authenticated_ = false;
@@ -336,6 +350,53 @@ void BithumbExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) 
 
     Logger::info("[Bithumb] Subscribed to {} orderbook depth streams in {} batches",
                  symbols.size(), (symbols.size() + BATCH_SIZE - 1) / BATCH_SIZE);
+
+    start_orderbook_resync_loop();
+}
+
+void BithumbExchange::start_orderbook_resync_loop() {
+    if (orderbook_resync_running_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    Logger::info("[Bithumb] Starting authoritative orderbook BBO resync loop ({} ms)",
+                 ORDERBOOK_RESYNC_INTERVAL.count());
+    orderbook_resync_thread_ = std::thread([this]() {
+        constexpr auto sleep_slice = std::chrono::milliseconds(50);
+        while (orderbook_resync_running_.load(std::memory_order_acquire)) {
+            for (auto slept = std::chrono::milliseconds(0);
+                 slept < ORDERBOOK_RESYNC_INTERVAL &&
+                 orderbook_resync_running_.load(std::memory_order_acquire);
+                 slept += sleep_slice) {
+                std::this_thread::sleep_for(sleep_slice);
+            }
+            if (!orderbook_resync_running_.load(std::memory_order_acquire)) break;
+            if (!connected_.load(std::memory_order_acquire)) {
+                continue;
+            }
+
+            std::vector<SymbolId> symbols;
+            {
+                std::lock_guard lock(subscription_mutex_);
+                symbols = subscribed_orderbooks_;
+            }
+            if (symbols.empty()) {
+                continue;
+            }
+
+            fetch_all_orderbook_snapshots(symbols, ORDERBOOK_BBO_DEPTH);
+        }
+    });
+}
+
+void BithumbExchange::stop_orderbook_resync_loop() {
+    if (!orderbook_resync_running_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (orderbook_resync_thread_.joinable()) {
+        orderbook_resync_thread_.join();
+    }
+    Logger::info("[Bithumb] Stopped authoritative orderbook BBO resync loop");
 }
 
 std::vector<SymbolId> BithumbExchange::get_available_symbols() {
@@ -439,8 +500,12 @@ std::vector<Ticker> BithumbExchange::fetch_all_tickers() {
     return tickers;
 }
 
-void BithumbExchange::fetch_all_orderbook_snapshots(const std::vector<SymbolId>& symbols) {
-    auto response = rest_client_->get("/public/orderbook/ALL_KRW?count=5");
+void BithumbExchange::fetch_all_orderbook_snapshots(const std::vector<SymbolId>& symbols,
+                                                    std::size_t depth_count) {
+    const std::size_t requested_depth =
+        depth_count == 0 ? ORDERBOOK_BBO_DEPTH : depth_count;
+    auto response = rest_client_->get(
+        "/public/orderbook/ALL_KRW?count=" + std::to_string(requested_depth));
     if (!response.success) {
         Logger::error("[Bithumb] Failed to fetch orderbook snapshots: {}", response.error);
         return;
@@ -522,7 +587,8 @@ void BithumbExchange::fetch_all_orderbook_snapshots(const std::vector<SymbolId>&
         }
 
         orderbook_ready_.store(true, std::memory_order_release);
-        Logger::info("[Bithumb] Loaded orderbook snapshots for {} symbols", count);
+        Logger::info("[Bithumb] Loaded orderbook snapshots for {} symbols (depth={})",
+                     count, requested_depth);
 
         int dispatched = 0;
         for (const auto& symbol_key : seeded_symbols) {
@@ -690,7 +756,7 @@ Order BithumbExchange::place_market_buy_quantity(const SymbolId& symbol, Quantit
     return order;
 }
 
-bool BithumbExchange::cancel_order(uint64_t order_id) {
+bool BithumbExchange::cancel_order(uint64_t /*order_id*/) {
     // Bithumb cancel implementation
     return false;  // TODO: Implement if needed
 }
@@ -1202,10 +1268,16 @@ void BithumbExchange::update_bbo(const std::string& symbol_key) {
     if (!state.bids.empty()) {
         bbo.best_bid.store(state.bids.begin()->first, std::memory_order_release);
         bbo.best_bid_qty.store(state.bids.begin()->second, std::memory_order_release);
+    } else {
+        bbo.best_bid.store(0.0, std::memory_order_release);
+        bbo.best_bid_qty.store(0.0, std::memory_order_release);
     }
     if (!state.asks.empty()) {
         bbo.best_ask.store(state.asks.begin()->first, std::memory_order_release);
         bbo.best_ask_qty.store(state.asks.begin()->second, std::memory_order_release);
+    } else {
+        bbo.best_ask.store(0.0, std::memory_order_release);
+        bbo.best_ask_qty.store(0.0, std::memory_order_release);
     }
 }
 

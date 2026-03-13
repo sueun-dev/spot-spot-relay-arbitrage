@@ -176,8 +176,8 @@ private:
             out << format_time(x.time) << ','
                 << x.symbol << ','
                 << std::fixed << std::setprecision(8) << x.split_qty << ','
-                << std::fixed << std::setprecision(2) << x.korean_entry_price << ','
-                << std::fixed << std::setprecision(2) << x.korean_exit_price << ','
+                << std::fixed << std::setprecision(8) << x.korean_entry_price << ','
+                << std::fixed << std::setprecision(8) << x.korean_exit_price << ','
                 << std::fixed << std::setprecision(6) << x.foreign_entry_price << ','
                 << std::fixed << std::setprecision(6) << x.foreign_exit_price << ','
                 << std::fixed << std::setprecision(2) << x.pnl_krw << ','
@@ -294,9 +294,7 @@ OrderManager::~OrderManager() {
 
 void OrderManager::set_exchange(Exchange ex, ExchangePtr exchange) {
     exchanges_[static_cast<size_t>(ex)] = exchange;
-    if (ex == Exchange::Upbit) {
-        upbit_exchange_ = std::dynamic_pointer_cast<exchange::upbit::UpbitExchange>(exchange);
-    } else if (ex == Exchange::Bithumb) {
+    if (ex == Exchange::Bithumb) {
         bithumb_exchange_ = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(exchange);
     } else if (ex == Exchange::Bybit) {
         bybit_exchange_ = std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(exchange);
@@ -304,9 +302,7 @@ void OrderManager::set_exchange(Exchange ex, ExchangePtr exchange) {
 }
 
 OrderManager::KoreanExchangePtr OrderManager::get_korean_exchange(Exchange ex) {
-    if (ex == Exchange::Upbit) {
-        return upbit_exchange_;
-    } else if (ex == Exchange::Bithumb) {
+    if (ex == Exchange::Bithumb) {
         return bithumb_exchange_;
     }
     return nullptr;
@@ -349,6 +345,20 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
     }
 
     SymbolId foreign_symbol(signal.symbol.get_base(), "USDT");
+    auto& probe = LatencyProbe::instance();
+    const uint64_t trace_id = signal.trace_id != 0 ? signal.trace_id : probe.next_trace_id();
+    const LatencySymbol trace_symbol =
+        signal.trace_symbol[0] != '\0' ? signal.trace_symbol : LatencyProbe::format_symbol_fast(signal.symbol);
+    const uint64_t trace_start_ns =
+        signal.trace_start_ns != 0 ? signal.trace_start_ns : probe.capture_now_ns();
+    auto record_latency = [&](LatencyStage stage,
+                              int64_t aux0 = 0,
+                              int64_t aux1 = 0,
+                              double value0 = 0.0,
+                              double value1 = 0.0) {
+        probe.record(trace_id, trace_symbol, stage, trace_start_ns, aux0, aux1, value0, value1);
+    };
+    record_latency(LatencyStage::EntryLoopStart, 0, 0, signal.net_edge_pct, signal.max_tradable_usdt_at_best);
 
     // =========================================================================
     // SPOT RELAY LIFECYCLE
@@ -367,7 +377,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
     if (initial_position) {
         Logger::info("[TOPUP] Resuming entry for {} from {:.8f} coins (${:.2f}/{:.2f})",
                      signal.symbol.to_string(), held_amount,
-                     held_amount * signal.foreign_bid, position_size_usd);
+                     total_foreign_value, position_size_usd);
     }
 
     auto calculate_effective_entry_pm = [&](double usdt_rate) {
@@ -496,15 +506,16 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
             exit_premium = ((current_korean_bid - foreign_krw) / foreign_krw) * 100.0;
         }
 
-        double held_value_usd = held_amount * current_foreign_bid;
-        double remaining_position_usd = std::max(0.0, position_size_usd - held_value_usd);
-        double required_coin_amount = current_foreign_bid > 0.0
-            ? (remaining_position_usd / current_foreign_bid)
+        const double open_entry_notional_usd = total_foreign_value;
+        double remaining_position_usd = std::max(0.0, position_size_usd - open_entry_notional_usd);
+        const double next_order_usd = std::min(TradingConfig::ORDER_SIZE_USD, remaining_position_usd);
+        double next_order_coin_amount = current_foreign_bid > 0.0
+            ? (next_order_usd / current_foreign_bid)
             : 0.0;
-        bool korean_can_fill_required = required_coin_amount > 0.0 &&
-                                        current_korean_ask_qty >= required_coin_amount;
-        bool foreign_can_fill_required = required_coin_amount > 0.0 &&
-                                         current_foreign_bid_qty >= required_coin_amount;
+        bool korean_can_fill_required = next_order_coin_amount > 0.0 &&
+                                        current_korean_ask_qty >= next_order_coin_amount;
+        bool foreign_can_fill_required = next_order_coin_amount > 0.0 &&
+                                         current_foreign_bid_qty >= next_order_coin_amount;
         auto relay_metrics = strategy::PremiumCalculator::calculate_relay_metrics(
             current_korean_ask,
             current_korean_ask_qty,
@@ -529,16 +540,23 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
         if (relay_metrics.net_edge_pct > TradingConfig::MIN_NET_EDGE_PCT &&
             korean_can_fill_required &&
             foreign_can_fill_required &&
-            remaining_position_usd >= min_split_usd) {
+            next_order_usd >= min_split_usd) {
             // ==================== ENTRY ====================
-            double order_size_usd = std::min(TradingConfig::ORDER_SIZE_USD, remaining_position_usd);
-            double coin_amount = std::min(order_size_usd / current_foreign_bid, required_coin_amount);
+            double order_size_usd = next_order_usd;
+            double coin_amount = next_order_coin_amount;
 
             // Open Bybit spot-margin short first (no fill query — deferred to parallel)
+            record_latency(LatencyStage::EntryForeignSubmitStart, 0, 0, coin_amount, order_size_usd);
             Order foreign_order = execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
+            record_latency(LatencyStage::EntryForeignSubmitAck,
+                           static_cast<int64_t>(foreign_order.status),
+                           0,
+                           foreign_order.quantity,
+                           foreign_order.average_price);
 
             if (foreign_order.status != OrderStatus::Filled) {
                 Logger::error("[RELAY-ENTRY] Bybit spot-margin short failed, retrying next cycle");
+                record_latency(LatencyStage::Error, static_cast<int64_t>(foreign_order.status));
                 wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
@@ -583,15 +601,33 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                 FillQueryTask::Kind::Foreign,
                 signal.foreign_exchange,
                 SymbolId{},
+                trace_id,
+                trace_start_ns,
+                trace_symbol,
+                LatencyStage::EntryForeignFillQueryStart,
+                LatencyStage::EntryForeignFillWorkerStart,
+                LatencyStage::EntryForeignFillDone,
                 &foreign_order,
                 &fill_done,
             });
 
+            record_latency(LatencyStage::EntryKoreanSubmitStart, 0, 0, actual_filled, krw_amount);
             Order korean_order = execute_korean_buy(signal.korean_exchange, signal.symbol, actual_filled, krw_amount);
+            record_latency(LatencyStage::EntryKoreanSubmitAck,
+                           static_cast<int64_t>(korean_order.status),
+                           0,
+                           korean_order.quantity,
+                           korean_order.average_price);
             dispatch_fill_query(FillQueryTask{
                 FillQueryTask::Kind::Korean,
                 signal.korean_exchange,
                 signal.symbol,
+                trace_id,
+                trace_start_ns,
+                trace_symbol,
+                LatencyStage::EntryKoreanFillQueryStart,
+                LatencyStage::EntryKoreanFillWorkerStart,
+                LatencyStage::EntryKoreanFillDone,
                 &korean_order,
                 &fill_done,
             });
@@ -617,7 +653,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                 total_korean_cost += actual_korean_cost;
                 total_foreign_value += actual_filled * short_price;
 
-                double new_held_value = held_amount * current_foreign_bid;
+                double new_open_notional_usd = total_foreign_value;
                 double effective_entry_pm = calculate_effective_entry_pm(usdt_rate);
                 double target_exit_pm = std::max(
                     effective_entry_pm + TradingConfig::DYNAMIC_EXIT_SPREAD,
@@ -629,12 +665,12 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                              "net_edge_now: {:.4f}%, entry_pm_now: {:.4f}%, eff_entry_pm: {:.4f}%, "
                              "target_exit_pm: {:.4f}%, buy_price: {:.2f}, exec_ms: {}",
                              signal.symbol.to_string(), actual_filled, order_size_usd,
-                             new_held_value, position_size_usd, relay_metrics.net_edge_pct,
+                             new_open_notional_usd, position_size_usd, relay_metrics.net_edge_pct,
                              entry_premium, effective_entry_pm, target_exit_pm, buy_price, split_elapsed);
 
                 // Log entry split to CSV (actual fill price)
                 append_entry_split_log(signal.symbol, actual_filled, buy_price,
-                                       short_price, usdt_rate, new_held_value,
+                                       short_price, usdt_rate, new_open_notional_usd,
                                        position_size_usd, effective_entry_pm);
 
                 // Build current position snapshot
@@ -653,12 +689,14 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                 snap.is_active = true;
                 persist_snapshot(snap);
 
-                if (new_held_value >= position_size_usd) {
+                if (new_open_notional_usd >= position_size_usd) {
                     Logger::info("[ADAPTIVE] {} fully entered: ${:.2f}, monitoring for exit",
-                                 signal.symbol.to_string(), new_held_value);
+                                 signal.symbol.to_string(), new_open_notional_usd);
                 }
+                record_latency(LatencyStage::EntryCompleted, 0, 0, actual_filled, new_open_notional_usd);
             } else {
                 Logger::error("[RELAY-ENTRY] Korean BUY failed, rolling back Bybit spot-margin short");
+                record_latency(LatencyStage::Error, static_cast<int64_t>(korean_order.status));
                 Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
                 if (rollback.status != OrderStatus::Filled) {
                     Position mismatch;
@@ -687,6 +725,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
 
         } else if (exit_premium >= dynamic_exit_threshold && held_amount > 0) {
             // ==================== EXIT SPLIT ====================
+            record_latency(LatencyStage::ExitLoopStart, 0, 0, exit_premium, dynamic_exit_threshold);
             double remaining_value_usd = held_amount * current_foreign_ask;
             double exit_coin_amount;
 
@@ -701,10 +740,17 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                          signal.symbol.to_string(), exit_premium, dynamic_exit_threshold);
 
             // Cover Bybit spot-margin short first (no fill query — deferred to parallel)
+            record_latency(LatencyStage::ExitForeignSubmitStart, 0, 0, exit_coin_amount, remaining_value_usd);
             Order foreign_order = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, exit_coin_amount);
+            record_latency(LatencyStage::ExitForeignSubmitAck,
+                           static_cast<int64_t>(foreign_order.status),
+                           0,
+                           foreign_order.quantity,
+                           foreign_order.average_price);
 
             if (foreign_order.status != OrderStatus::Filled) {
                 Logger::error("[ADAPTIVE-EXIT] Bybit spot-margin cover failed during entry, retrying");
+                record_latency(LatencyStage::Error, static_cast<int64_t>(foreign_order.status));
                 wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
@@ -716,15 +762,33 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                 FillQueryTask::Kind::Foreign,
                 signal.foreign_exchange,
                 SymbolId{},
+                trace_id,
+                trace_start_ns,
+                trace_symbol,
+                LatencyStage::ExitForeignFillQueryStart,
+                LatencyStage::ExitForeignFillWorkerStart,
+                LatencyStage::ExitForeignFillDone,
                 &foreign_order,
                 &fill_done,
             });
 
+            record_latency(LatencyStage::ExitKoreanSubmitStart, 0, 0, actual_covered, current_korean_bid);
             Order korean_order = execute_korean_sell(signal.korean_exchange, signal.symbol, actual_covered);
+            record_latency(LatencyStage::ExitKoreanSubmitAck,
+                           static_cast<int64_t>(korean_order.status),
+                           0,
+                           korean_order.quantity,
+                           korean_order.average_price);
             dispatch_fill_query(FillQueryTask{
                 FillQueryTask::Kind::Korean,
                 signal.korean_exchange,
                 signal.symbol,
+                trace_id,
+                trace_start_ns,
+                trace_symbol,
+                LatencyStage::ExitKoreanFillQueryStart,
+                LatencyStage::ExitKoreanFillWorkerStart,
+                LatencyStage::ExitKoreanFillDone,
                 &korean_order,
                 &fill_done,
             });
@@ -769,6 +833,9 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
 
                 Logger::info("[ADAPTIVE-EXIT] {} -{:.8f} coins, P&L: {:.0f} KRW, remaining: {:.8f}, exit_pm: {:.4f}%",
                              signal.symbol.to_string(), actual_covered, split_pnl_krw, held_amount, exit_premium);
+                if (held_amount <= 0) {
+                    record_latency(LatencyStage::ExitCompleted, 0, 0, actual_covered, realized_pnl_krw);
+                }
 
                 // Update position file after exit split
                 if (on_position_update_) {
@@ -832,6 +899,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                 double cover_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_ask;
 
                 Logger::error("[ADAPTIVE-EXIT] Korean SELL failed after COVER, retrying... Unhedged: {:.8f} coins", actual_covered);
+                record_latency(LatencyStage::Error, static_cast<int64_t>(korean_order.status));
                 for (int retry = 1; retry <= 5; ++retry) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(300 * retry));
                     Logger::warn("[ADAPTIVE-EXIT] SELL retry {}/5 for {:.8f} coins", retry, actual_covered);
@@ -853,6 +921,9 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                         total_korean_cost *= (1.0 - exit_ratio);
                         total_foreign_value *= (1.0 - exit_ratio);
                         held_amount -= actual_covered;
+                        if (held_amount <= 0) {
+                            record_latency(LatencyStage::ExitCompleted, 0, 0, actual_covered, realized_pnl_krw);
+                        }
 
                         Logger::info("[ADAPTIVE-EXIT] SELL retry succeeded: {:.8f} coins @ {:.2f}, P&L: {:.0f} KRW",
                                      actual_covered, sell_price, split_pnl_krw);
@@ -933,6 +1004,19 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
     }
 
     SymbolId foreign_symbol(position.symbol.get_base(), "USDT");
+    auto& probe = LatencyProbe::instance();
+    const uint64_t trace_id = signal.trace_id != 0 ? signal.trace_id : probe.next_trace_id();
+    const LatencySymbol trace_symbol =
+        signal.trace_symbol[0] != '\0' ? signal.trace_symbol : LatencyProbe::format_symbol_fast(position.symbol);
+    const uint64_t trace_start_ns =
+        signal.trace_start_ns != 0 ? signal.trace_start_ns : probe.capture_now_ns();
+    auto record_latency = [&](LatencyStage stage,
+                              int64_t aux0 = 0,
+                              int64_t aux1 = 0,
+                              double value0 = 0.0,
+                              double value1 = 0.0) {
+        probe.record(trace_id, trace_symbol, stage, trace_start_ns, aux0, aux1, value0, value1);
+    };
 
     // =========================================================================
     // ADAPTIVE SPLIT EXECUTION: 청산/재진입 유기적 전환
@@ -1057,6 +1141,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
 
         if (exit_premium >= dynamic_exit_threshold) {
             // ==================== EXIT SPLIT ====================
+            record_latency(LatencyStage::ExitLoopStart, 0, 0, exit_premium, dynamic_exit_threshold);
             double remaining_value_usd = remaining_amount * current_foreign_ask;
             double exit_coin_amount;
 
@@ -1071,10 +1156,17 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
             }
 
             // Cover Bybit spot-margin short first (no fill query — deferred to parallel)
+            record_latency(LatencyStage::ExitForeignSubmitStart, 0, 0, exit_coin_amount, remaining_value_usd);
             Order foreign_order = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, exit_coin_amount);
+            record_latency(LatencyStage::ExitForeignSubmitAck,
+                           static_cast<int64_t>(foreign_order.status),
+                           0,
+                           foreign_order.quantity,
+                           foreign_order.average_price);
 
             if (foreign_order.status != OrderStatus::Filled) {
                 Logger::error("[ADAPTIVE-EXIT] Bybit spot-margin cover failed, retrying");
+                record_latency(LatencyStage::Error, static_cast<int64_t>(foreign_order.status));
                 wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
@@ -1086,15 +1178,33 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                 FillQueryTask::Kind::Foreign,
                 signal.foreign_exchange,
                 SymbolId{},
+                trace_id,
+                trace_start_ns,
+                trace_symbol,
+                LatencyStage::ExitForeignFillQueryStart,
+                LatencyStage::ExitForeignFillWorkerStart,
+                LatencyStage::ExitForeignFillDone,
                 &foreign_order,
                 &fill_done,
             });
 
+            record_latency(LatencyStage::ExitKoreanSubmitStart, 0, 0, actual_covered, current_korean_bid);
             Order korean_order = execute_korean_sell(signal.korean_exchange, position.symbol, actual_covered);
+            record_latency(LatencyStage::ExitKoreanSubmitAck,
+                           static_cast<int64_t>(korean_order.status),
+                           0,
+                           korean_order.quantity,
+                           korean_order.average_price);
             dispatch_fill_query(FillQueryTask{
                 FillQueryTask::Kind::Korean,
                 signal.korean_exchange,
                 position.symbol,
+                trace_id,
+                trace_start_ns,
+                trace_symbol,
+                LatencyStage::ExitKoreanFillQueryStart,
+                LatencyStage::ExitKoreanFillWorkerStart,
+                LatencyStage::ExitKoreanFillDone,
                 &korean_order,
                 &fill_done,
             });
@@ -1143,6 +1253,9 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
 
                 Logger::info("[ADAPTIVE-EXIT] {} -{:.8f} coins, P&L: {:.0f} KRW, remaining: {:.8f}, exit_pm: {:.4f}%",
                              position.symbol.to_string(), actual_covered, split_pnl_krw, remaining_amount, exit_premium);
+                if (final_split) {
+                    record_latency(LatencyStage::ExitCompleted, 0, 0, actual_covered, realized_pnl_krw);
+                }
 
                 // Update position file
                 if (on_position_update_) {
@@ -1164,6 +1277,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
 
                 // SELL failed after COVER — retry to avoid unhedged state
                 Logger::error("[EXIT] Korean SELL failed after COVER, retrying... Unhedged: {:.8f} coins", actual_covered);
+                record_latency(LatencyStage::Error, static_cast<int64_t>(korean_order.status));
                 for (int retry = 1; retry <= 5; ++retry) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(300 * retry));
                     Logger::warn("[EXIT] SELL retry {}/5 for {:.8f} coins", retry, actual_covered);
@@ -1189,6 +1303,9 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                         total_korean_cost *= (1.0 - exit_ratio);
                         total_foreign_value *= (1.0 - exit_ratio);
                         remaining_amount -= actual_covered;
+                        if (remaining_amount <= 0) {
+                            record_latency(LatencyStage::ExitCompleted, 0, 0, actual_covered, realized_pnl_krw);
+                        }
 
                         Logger::info("[EXIT] SELL retry succeeded: {:.8f} coins @ {:.2f}, P&L: {:.0f} KRW",
                                      actual_covered, sell_price, split_pnl_krw);
@@ -1217,15 +1334,23 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
 
         } else if (entry_premium <= TradingConfig::ENTRY_PREMIUM_THRESHOLD && remaining_amount < original_amount) {
             // ==================== RE-ENTRY SPLIT ====================
+            record_latency(LatencyStage::ReentryLoopStart, 0, 0, entry_premium, remaining_amount);
             double max_reentry_coins = original_amount - remaining_amount;
             double reentry_usd = std::min(TradingConfig::ORDER_SIZE_USD, max_reentry_coins * current_foreign_bid);
             double coin_amount = reentry_usd / current_foreign_bid;
 
             // Open Bybit spot-margin short first (no fill query — deferred to parallel)
+            record_latency(LatencyStage::ReentryForeignSubmitStart, 0, 0, coin_amount, reentry_usd);
             Order foreign_order = execute_foreign_short(signal.foreign_exchange, foreign_symbol, coin_amount);
+            record_latency(LatencyStage::ReentryForeignSubmitAck,
+                           static_cast<int64_t>(foreign_order.status),
+                           0,
+                           foreign_order.quantity,
+                           foreign_order.average_price);
 
             if (foreign_order.status != OrderStatus::Filled) {
                 Logger::error("[ADAPTIVE-REENTRY] Bybit spot-margin short failed, retrying");
+                record_latency(LatencyStage::Error, static_cast<int64_t>(foreign_order.status));
                 wait_for_next_market_update(update_seq_before_trade);
                 continue;
             }
@@ -1263,15 +1388,33 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                 FillQueryTask::Kind::Foreign,
                 signal.foreign_exchange,
                 SymbolId{},
+                trace_id,
+                trace_start_ns,
+                trace_symbol,
+                LatencyStage::ReentryForeignFillQueryStart,
+                LatencyStage::ReentryForeignFillWorkerStart,
+                LatencyStage::ReentryForeignFillDone,
                 &foreign_order,
                 &fill_done,
             });
 
+            record_latency(LatencyStage::ReentryKoreanSubmitStart, 0, 0, actual_filled, krw_amount);
             Order korean_order = execute_korean_buy(signal.korean_exchange, position.symbol, actual_filled, krw_amount);
+            record_latency(LatencyStage::ReentryKoreanSubmitAck,
+                           static_cast<int64_t>(korean_order.status),
+                           0,
+                           korean_order.quantity,
+                           korean_order.average_price);
             dispatch_fill_query(FillQueryTask{
                 FillQueryTask::Kind::Korean,
                 signal.korean_exchange,
                 position.symbol,
+                trace_id,
+                trace_start_ns,
+                trace_symbol,
+                LatencyStage::ReentryKoreanFillQueryStart,
+                LatencyStage::ReentryKoreanFillWorkerStart,
+                LatencyStage::ReentryKoreanFillDone,
                 &korean_order,
                 &fill_done,
             });
@@ -1298,6 +1441,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
 
                 Logger::info("[ADAPTIVE-REENTRY] {} +{:.8f} coins, remaining: {:.8f}/{:.8f}, entry_pm: {:.4f}%, buy_price: {:.2f}",
                              position.symbol.to_string(), actual_filled, remaining_amount, original_amount, entry_premium, buy_price);
+                record_latency(LatencyStage::ReentryCompleted, 0, 0, actual_filled, remaining_amount);
 
                 // Log re-entry split to CSV (actual fill price)
                 append_entry_split_log(position.symbol, actual_filled, buy_price,
@@ -1318,6 +1462,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                 }
             } else {
                 Logger::error("[ADAPTIVE-REENTRY] Korean BUY failed, rolling back Bybit spot-margin short");
+                record_latency(LatencyStage::Error, static_cast<int64_t>(korean_order.status));
                 Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
                 if (rollback.status != OrderStatus::Filled) {
                     Position mismatch = position;
@@ -1379,6 +1524,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
         result.position.korean_exit_price = total_korean_proceeds / total_exited_amount;
         result.position.foreign_exit_price = total_foreign_cost / total_exited_amount;
     }
+    record_latency(LatencyStage::ExitCompleted, 0, 0, total_exited_amount, realized_pnl_krw);
 
     Logger::info("[ADAPTIVE] {} fully exited. Total P&L: {:.0f} KRW",
                  position.symbol.to_string(), realized_pnl_krw);
@@ -1502,11 +1648,29 @@ void OrderManager::ensure_fill_query_executor_started() {
     });
 }
 
-void OrderManager::handle_fill_query(FillQueryTask&& task, std::size_t /*worker_index*/) {
+void OrderManager::handle_fill_query(FillQueryTask&& task, std::size_t worker_index) {
     auto countdown = [&]() {
         if (task.done) {
             task.done->count_down();
         }
+    };
+    auto record_stage = [&](LatencyStage stage,
+                            int64_t aux0 = 0,
+                            int64_t aux1 = 0,
+                            double value0 = 0.0,
+                            double value1 = 0.0) {
+        if (task.trace_id == 0) {
+            return;
+        }
+        LatencyProbe::instance().record(
+            task.trace_id,
+            task.trace_symbol,
+            stage,
+            task.trace_start_ns,
+            aux0,
+            aux1,
+            value0,
+            value1);
     };
 
     if (!task.order) {
@@ -1514,18 +1678,38 @@ void OrderManager::handle_fill_query(FillQueryTask&& task, std::size_t /*worker_
         return;
     }
 
+    const int64_t worker_aux =
+        worker_index == static_cast<std::size_t>(-1) ? -1 : static_cast<int64_t>(worker_index);
+    record_stage(task.worker_stage, worker_aux, static_cast<int64_t>(task.kind));
+
     if (task.kind == FillQueryTask::Kind::Foreign) {
         query_foreign_fill(task.ex, *task.order);
     } else {
         query_korean_fill(task.ex, task.symbol, *task.order);
     }
+    record_stage(task.done_stage,
+                 static_cast<int64_t>(task.order->status),
+                 worker_aux,
+                 task.order->filled_quantity,
+                 task.order->average_price);
     countdown();
 }
 
 void OrderManager::dispatch_fill_query(FillQueryTask task) {
     ensure_fill_query_executor_started();
+    if (task.trace_id != 0) {
+        LatencyProbe::instance().record(
+            task.trace_id,
+            task.trace_symbol,
+            task.enqueue_stage,
+            task.trace_start_ns,
+            static_cast<int64_t>(fill_query_executor_.pending()),
+            static_cast<int64_t>(task.kind),
+            task.order ? task.order->quantity : 0.0,
+            0.0);
+    }
     if (!fill_query_executor_.enqueue(task)) {
-        handle_fill_query(std::move(task), 0);
+        handle_fill_query(std::move(task), static_cast<std::size_t>(-1));
     }
 }
 

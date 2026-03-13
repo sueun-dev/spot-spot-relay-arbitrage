@@ -62,7 +62,6 @@ RuntimeConfig ConfigLoader::load(const std::string& path) {
             }
         };
 
-        load_exchange("upbit", Exchange::Upbit);
         load_exchange("bithumb", Exchange::Bithumb);
         load_exchange("bybit", Exchange::Bybit);
         // Threading config
@@ -104,16 +103,6 @@ RuntimeConfig ConfigLoader::load_from_env() {
     RuntimeConfig config = get_default();
 
     // Load from environment variables
-    config.exchanges[Exchange::Upbit] = {
-        get_env("UPBIT_ACCESS_KEY"),
-        get_env("UPBIT_SECRET_KEY"),
-        endpoints::UPBIT_WS,
-        "",
-        "",
-        endpoints::UPBIT_REST,
-        true
-    };
-
     config.exchanges[Exchange::Bithumb] = {
         get_env("BITHUMB_API_KEY"),
         get_env("BITHUMB_SECRET_KEY"),
@@ -141,9 +130,6 @@ RuntimeConfig ConfigLoader::get_default() {
     RuntimeConfig config;
 
     // Default exchange endpoints
-    config.exchanges[Exchange::Upbit] = {
-        "", "", endpoints::UPBIT_WS, "", "", endpoints::UPBIT_REST, false
-    };
     config.exchanges[Exchange::Bithumb] = {
         "", "", endpoints::BITHUMB_WS, "", "", endpoints::BITHUMB_REST, false
     };

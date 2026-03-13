@@ -123,7 +123,7 @@ bool BybitExchange::connect() {
 
     ws_client_ = std::make_shared<network::WebSocketClient>(io_context_, "Bybit-WS");
 
-    ws_client_->set_message_callback([this](std::string_view msg, network::MessageType type) {
+    ws_client_->set_message_callback([this](std::string_view msg, network::MessageType /*type*/) {
         on_ws_message(msg);
     });
 
@@ -135,7 +135,7 @@ bool BybitExchange::connect() {
         }
     });
 
-    ws_client_->set_disconnect_callback([this](const std::string& reason) {
+    ws_client_->set_disconnect_callback([this](const std::string& /*reason*/) {
         on_ws_disconnected();
     });
 
@@ -610,7 +610,7 @@ double BybitExchange::normalize_order_qty(const SymbolId& symbol, double qty, bo
     return qty;
 }
 
-bool BybitExchange::cancel_order(uint64_t order_id) {
+bool BybitExchange::cancel_order(uint64_t /*order_id*/) {
     // TODO: Implement if needed
     return false;
 }

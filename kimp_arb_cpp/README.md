@@ -17,6 +17,26 @@ cmake --build build/build/Release -j 10
 ./build/build/Release/kimp_bot --monitor-only
 ```
 
+실거래 latency probe:
+
+```bash
+./build/build/Release/kimp_bot --latency-probe
+./build/build/Release/kimp_bot --latency-probe --latency-probe-summary
+./build/build/Release/kimp_bot --latency-probe --latency-probe-output mmap
+```
+
+- 기본 live hot path: `trade_logs/latency_events.mmapbin`
+- 구간별 summary: `trade_logs/latency_summary.csv`
+- summary 주요 span:
+  - `entry_loop_prep_ns`
+  - `entry_foreign_submit_ns`
+  - `entry_foreign_fill_queue_ns`
+  - `entry_foreign_fill_ns`
+  - `exit_loop_prep_ns`
+  - `exit_total_ns`
+  - `reentry_loop_prep_ns`
+  - `reentry_total_ns`
+
 핵심 테스트:
 
 ```bash
@@ -25,6 +45,10 @@ cmake --build build/build/Release -j 10
 ./build/build/Release/kimp_test_atomic_bitset
 ./build/build/Release/kimp_test_entry_bitmap
 ./build/build/Release/kimp_test_lifecycle_executor
+./build/build/Release/kimp_test_latency_probe
+./build/build/Release/kimp_test_order_manager_pnl
+./build/build/Release/kimp_bench_latency_probe
+./build/build/Release/kimp_bench_latency_probe_hotpath
 ./build/build/Release/kimp_test_s1_to_s4
 ./build/build/Release/kimp_test_s6_to_s8
 ```
