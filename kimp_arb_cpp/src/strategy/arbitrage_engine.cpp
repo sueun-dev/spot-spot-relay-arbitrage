@@ -675,10 +675,7 @@ void ArbitrageEngine::check_exit_conditions() {
     // Fast check: no position = no exit check needed
     if (!position_tracker_.has_any_position()) return;
 
-    auto positions = position_tracker_.get_active_positions();
-    if (positions.empty()) return;
-
-    for (const auto& pos : positions) {
+    position_tracker_.for_each_active_position([this](const Position& pos) {
         // O(1) hash map lookup instead of linear search
         const SymbolId* foreign_symbol_ptr = nullptr;
         SymbolId fallback_symbol;
@@ -693,14 +690,14 @@ void ArbitrageEngine::check_exit_conditions() {
 
         // Get prices
         auto korean_price = price_cache_.get_price(pos.korean_exchange, pos.symbol);
-        if (!korean_price.valid || korean_price.bid <= 0) continue;
+        if (!korean_price.valid || korean_price.bid <= 0) return;
 
         auto foreign_price = price_cache_.get_price(pos.foreign_exchange, *foreign_symbol_ptr);
-        if (!foreign_price.valid || foreign_price.ask <= 0) continue;
-        if (!quote_pair_is_usable(pos.korean_exchange, pos.foreign_exchange, korean_price, foreign_price, /*is_exit=*/true)) continue;
+        if (!foreign_price.valid || foreign_price.ask <= 0) return;
+        if (!quote_pair_is_usable(pos.korean_exchange, pos.foreign_exchange, korean_price, foreign_price, /*is_exit=*/true)) return;
 
         double usdt_rate = price_cache_.get_usdt_krw(pos.korean_exchange);
-        if (usdt_rate <= 0) continue;  // No real USDT/KRW rate
+        if (usdt_rate <= 0) return;  // No real USDT/KRW rate
 
         // Calculate exit premium
         double premium = PremiumCalculator::calculate_exit_premium(
@@ -710,7 +707,7 @@ void ArbitrageEngine::check_exit_conditions() {
         double dynamic_exit = std::max(
             pos.entry_premium + TradingConfig::DYNAMIC_EXIT_SPREAD,
             TradingConfig::EXIT_PREMIUM_THRESHOLD);
-        if (premium < dynamic_exit) continue;
+        if (premium < dynamic_exit) return;
 
         // Generate signal
         ExitSignal signal;
@@ -729,7 +726,7 @@ void ArbitrageEngine::check_exit_conditions() {
             on_exit_signal_(signal);
         }
         exit_signals_.try_push(signal);
-    }
+    });
 }
 
 void ArbitrageEngine::check_symbol_exit(size_t idx) {
