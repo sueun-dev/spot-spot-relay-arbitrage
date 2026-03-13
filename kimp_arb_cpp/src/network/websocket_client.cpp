@@ -115,7 +115,7 @@ void WebSocketClient::send(std::string message) {
     }
 
     if (!is_writing_.exchange(true)) {
-        net::post(strand_, [self = shared_from_this()] {
+        net::dispatch(strand_, [self = shared_from_this()] {
             self->do_write();
         });
     }
@@ -229,7 +229,6 @@ void WebSocketClient::on_handshake(beast::error_code ec) {
 }
 
 void WebSocketClient::do_read() {
-    read_buffer_.clear();
     ws_->async_read(
         read_buffer_,
         beast::bind_front_handler(&WebSocketClient::on_read, shared_from_this()));

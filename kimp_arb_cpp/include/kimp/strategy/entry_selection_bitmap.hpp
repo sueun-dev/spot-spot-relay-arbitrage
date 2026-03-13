@@ -5,7 +5,6 @@
 #include <array>
 #include <cstddef>
 #include <algorithm>
-#include <vector>
 
 namespace kimp::strategy {
 
@@ -60,8 +59,8 @@ EntrySelectionResult<MaxSymbols> select_entry_candidates(
         }
     }
 
-    std::vector<std::size_t> fresh_candidates;
-    fresh_candidates.reserve(symbol_count);
+    std::array<std::size_t, MaxSymbols> fresh_candidates;
+    std::size_t fresh_count = 0;
     candidate_bits.for_each_set(symbol_count, [&](std::size_t idx) {
         const bool has_position = position_state[idx] != 0;
         const bool partial = position_state[idx] == 2;
@@ -76,15 +75,16 @@ EntrySelectionResult<MaxSymbols> select_entry_candidates(
             return;
         }
 
-        fresh_candidates.push_back(idx);
+        if (fresh_count < MaxSymbols) fresh_candidates[fresh_count++] = idx;
     });
 
-    std::sort(fresh_candidates.begin(), fresh_candidates.end(),
+    std::sort(fresh_candidates.begin(), fresh_candidates.begin() + fresh_count,
               [&](std::size_t lhs, std::size_t rhs) {
                   return premium_at(lhs) < premium_at(rhs);
               });
 
-    for (std::size_t idx : fresh_candidates) {
+    for (std::size_t i = 0; i < fresh_count; ++i) {
+        const std::size_t idx = fresh_candidates[i];
         if (result.free_slots <= 0) {
             break;
         }

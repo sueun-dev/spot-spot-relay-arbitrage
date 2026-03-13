@@ -70,7 +70,7 @@ private:
     static constexpr size_t SHARD_COUNT = 64;  // Power-of-two for fast masking
     static_assert((SHARD_COUNT & (SHARD_COUNT - 1)) == 0, "SHARD_COUNT must be power-of-two");
 
-    struct alignas(64) PriceShard {
+    struct alignas(memory::CACHE_LINE_SIZE) PriceShard {
         mutable std::shared_mutex mutex;
         std::unordered_map<PriceKey, PriceEntry, PriceKeyHash> prices;
     };
@@ -149,13 +149,16 @@ public:
         }
 
         const auto& entry = it->second;
+        // Load timestamp with acquire first — pairs with release store in update(),
+        // guaranteeing all preceding relaxed stores are visible on ARM64.
+        auto ts = entry.timestamp.load(std::memory_order_acquire);
         return {
-            entry.bid.load(std::memory_order_acquire),
-            entry.ask.load(std::memory_order_acquire),
-            entry.bid_qty.load(std::memory_order_acquire),
-            entry.ask_qty.load(std::memory_order_acquire),
-            entry.last.load(std::memory_order_acquire),
-            entry.timestamp.load(std::memory_order_acquire),
+            entry.bid.load(std::memory_order_relaxed),
+            entry.ask.load(std::memory_order_relaxed),
+            entry.bid_qty.load(std::memory_order_relaxed),
+            entry.ask_qty.load(std::memory_order_relaxed),
+            entry.last.load(std::memory_order_relaxed),
+            ts,
             true  // valid
         };
     }
@@ -199,7 +202,7 @@ class PositionTracker {
 private:
     static constexpr size_t MAX_POSITIONS = 16;
 
-    struct alignas(64) PositionSlot {
+    struct alignas(memory::CACHE_LINE_SIZE) PositionSlot {
         std::atomic<bool> active{false};
         std::atomic<uint64_t> symbol_hash{0};
         Position position;
@@ -664,8 +667,8 @@ private:
     // Entry detection scans this cache-hot array instead of doing PriceCache
     // lookups + mutex + hash per symbol.  Zero-miss, zero-delay.
     // Keep this comfortably above live common-symbol counts to avoid cache index overflow.
-    static constexpr size_t MAX_CACHED_SYMBOLS = 1024;  // 1024 * 64B = 64KB
-    struct alignas(64) CachedEntryPremium {
+    static constexpr size_t MAX_CACHED_SYMBOLS = 1024;
+    struct alignas(memory::CACHE_LINE_SIZE) CachedEntryPremium {
         std::atomic<double> entry_premium{100.0};  // High default = no signal
         std::atomic<double> korean_ask{0.0};
         std::atomic<double> korean_ask_qty{0.0};
