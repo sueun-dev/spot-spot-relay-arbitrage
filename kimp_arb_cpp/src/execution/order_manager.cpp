@@ -538,6 +538,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
         auto split_start = std::chrono::steady_clock::now();
 
         if (relay_metrics.net_edge_pct > TradingConfig::MIN_NET_EDGE_PCT &&
+            relay_metrics.net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW &&
             korean_can_fill_required &&
             foreign_can_fill_required &&
             next_order_usd >= min_split_usd) {
