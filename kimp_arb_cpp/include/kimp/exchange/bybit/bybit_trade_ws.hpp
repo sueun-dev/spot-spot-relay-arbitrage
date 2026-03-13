@@ -46,7 +46,7 @@ private:
     // Heartbeat timer
     std::unique_ptr<net::steady_timer> heartbeat_timer_;
     static constexpr int HEARTBEAT_INTERVAL_S = 20;
-    static constexpr int ORDER_TIMEOUT_MS = 3000;
+    static constexpr int ORDER_TIMEOUT_MS = 1000;
 
 public:
     BybitTradeWS(net::io_context& ioc, ExchangeCredentials creds)
@@ -59,7 +59,7 @@ public:
 
     /**
      * Place order synchronously via WebSocket Trade API
-     * Blocks until ACK received or timeout (3s)
+     * Blocks until ACK received or timeout (1s)
      * Returns Order with status Filled (on ACK success) or Rejected (on failure/timeout)
      */
     Order place_order_sync(const std::string& symbol, Side side, double qty,
