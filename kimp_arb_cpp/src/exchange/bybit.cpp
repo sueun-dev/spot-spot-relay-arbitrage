@@ -1073,9 +1073,8 @@ void BybitExchange::authenticate_private_ws() {
 
 void BybitExchange::on_private_ws_message(std::string_view message) {
     try {
-        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(message);
-        auto doc = local_parser.iterate(padded);
+        auto doc = json_parser_.iterate(padded);
 
         // Auth response
         auto op = doc["op"];

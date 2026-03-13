@@ -900,9 +900,8 @@ void BithumbExchange::on_private_ws_message(std::string_view message) {
     }
 
     try {
-        simdjson::ondemand::parser local_parser;
         simdjson::padded_string padded(message);
-        auto doc = local_parser.iterate(padded);
+        auto doc = json_parser_.iterate(padded);
         simdjson::ondemand::object obj = doc.get_object();
 
         auto parse_number = [](simdjson::ondemand::value value) -> double {
@@ -914,20 +913,12 @@ void BithumbExchange::on_private_ws_message(std::string_view message) {
             if (!double_value.error()) {
                 return double_value.value();
             }
-            auto int_value = value.get_int64();
-            if (!int_value.error()) {
-                return static_cast<double>(int_value.value());
-            }
-            auto uint_value = value.get_uint64();
-            if (!uint_value.error()) {
-                return static_cast<double>(uint_value.value());
-            }
             return 0.0;
         };
 
-        std::string type;
-        std::string order_id;
-        std::string state;
+        std::string_view type;
+        std::string_view order_id_sv;
+        std::string_view state;
         double executed_volume = 0.0;
         double executed_funds = 0.0;
 
@@ -936,20 +927,14 @@ void BithumbExchange::on_private_ws_message(std::string_view message) {
             simdjson::ondemand::value value = field.value();
 
             if (key == "ty" || key == "type") {
-                auto string_value = value.get_string();
-                if (!string_value.error()) {
-                    type = std::string(string_value.value());
-                }
+                auto sv = value.get_string();
+                if (!sv.error()) type = sv.value();
             } else if (key == "uid" || key == "uuid") {
-                auto string_value = value.get_string();
-                if (!string_value.error()) {
-                    order_id = std::string(string_value.value());
-                }
+                auto sv = value.get_string();
+                if (!sv.error()) order_id_sv = sv.value();
             } else if (key == "s" || key == "state") {
-                auto string_value = value.get_string();
-                if (!string_value.error()) {
-                    state = std::string(string_value.value());
-                }
+                auto sv = value.get_string();
+                if (!sv.error()) state = sv.value();
             } else if (key == "ev" || key == "executed_volume") {
                 executed_volume = parse_number(value);
             } else if (key == "ef" || key == "executed_funds") {
@@ -961,7 +946,7 @@ void BithumbExchange::on_private_ws_message(std::string_view message) {
             return;
         }
 
-        if (order_id.empty() || state.empty()) {
+        if (order_id_sv.empty() || state.empty()) {
             return;
         }
 
@@ -979,7 +964,7 @@ void BithumbExchange::on_private_ws_message(std::string_view message) {
 
         {
             std::lock_guard lock(fill_cache_mutex_);
-            fill_cache_[order_id] = fill;
+            fill_cache_[std::string(order_id_sv)] = fill;
         }
         fill_cache_cv_.notify_all();
     } catch (const simdjson::simdjson_error&) {
