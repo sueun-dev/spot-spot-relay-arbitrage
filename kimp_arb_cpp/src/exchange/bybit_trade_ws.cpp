@@ -1,7 +1,6 @@
 #include "kimp/exchange/bybit/bybit_trade_ws.hpp"
 
-#include <sstream>
-#include <iomanip>
+#include <cstdio>
 
 namespace kimp::exchange::bybit {
 
@@ -64,11 +63,13 @@ void BybitTradeWS::authenticate() {
     std::string val = "GET/realtime" + std::to_string(expires);
     std::string signature = utils::Crypto::hmac_sha256(credentials_.secret_key, val);
 
-    std::ostringstream ss;
-    ss << R"({"op":"auth","args":[")" << credentials_.api_key << R"(",)";
-    ss << expires << R"(,")" << signature << R"("]})";
-
-    ws_->send(ss.str());
+    char buf[512];
+    int len = std::snprintf(buf, sizeof(buf),
+        "{\"op\":\"auth\",\"args\":[\"%s\",%lld,\"%s\"]}",
+        credentials_.api_key.c_str(),
+        static_cast<long long>(expires),
+        signature.c_str());
+    ws_->send(std::string(buf, static_cast<size_t>(len)));
 }
 
 Order BybitTradeWS::place_order_sync(const std::string& symbol, Side side, double qty,
@@ -96,26 +97,20 @@ Order BybitTradeWS::place_order_sync(const std::string& symbol, Side side, doubl
         pending_orders_.emplace(req_id, std::move(promise));
     }
 
-    // Build WS order message
-    std::ostringstream ss;
-    ss << R"({"reqId":")" << req_id << R"(",)";
-    ss << R"("header":{"X-BAPI-TIMESTAMP":")" << utils::Crypto::timestamp_ms() << R"("},)";
-    ss << R"("op":"order.create",)";
-    ss << R"("args":[{)";
-    ss << R"("category":"spot",)";
-    ss << R"("symbol":")" << symbol << R"(",)";
-    ss << R"("side":")" << (side == Side::Buy ? "Buy" : "Sell") << R"(",)";
-    ss << R"("orderType":"Market",)";
-    ss << R"("qty":")" << std::fixed << std::setprecision(8) << qty << R"(",)";
-    if (is_leverage) {
-        ss << R"("isLeverage":1,)";
-    }
-    ss << R"("orderFilter":"Order",)";
-    ss << R"("marketUnit":"baseCoin",)";
-    ss << R"("timeInForce":"GTC")";
-    ss << R"(}]})";
-
-    ws_->send(ss.str());
+    // Build WS order message — snprintf avoids ostringstream heap allocs on hot path
+    char buf[512];
+    int len = std::snprintf(buf, sizeof(buf),
+        "{\"reqId\":\"%s\",\"header\":{\"X-BAPI-TIMESTAMP\":\"%lld\"},\"op\":\"order.create\","
+        "\"args\":[{\"category\":\"spot\",\"symbol\":\"%s\",\"side\":\"%s\","
+        "\"orderType\":\"Market\",\"qty\":\"%.8f\",%s"
+        "\"orderFilter\":\"Order\",\"marketUnit\":\"baseCoin\",\"timeInForce\":\"GTC\"}]}",
+        req_id.c_str(),
+        static_cast<long long>(utils::Crypto::timestamp_ms()),
+        symbol.c_str(),
+        side == Side::Buy ? "Buy" : "Sell",
+        qty,
+        is_leverage ? "\"isLeverage\":1," : "");
+    ws_->send(std::string(buf, static_cast<size_t>(len)));
 
     // Wait for response with timeout
     auto status = future.wait_for(std::chrono::milliseconds(ORDER_TIMEOUT_MS));
