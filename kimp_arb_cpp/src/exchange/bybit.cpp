@@ -979,8 +979,8 @@ bool BybitExchange::query_order_fill(const std::string& order_id, Order& order) 
             return true;
         }
 
-        // Wait up to 500ms for fill event from Private WS
-        bool found = fill_cache_cv_.wait_for(lock, std::chrono::milliseconds(500), [&]() {
+        // Wait up to 200ms for fill event from Private WS (BBO fallback on miss)
+        bool found = fill_cache_cv_.wait_for(lock, std::chrono::milliseconds(200), [&]() {
             return fill_cache_.find(order_id) != fill_cache_.end();
         });
 
