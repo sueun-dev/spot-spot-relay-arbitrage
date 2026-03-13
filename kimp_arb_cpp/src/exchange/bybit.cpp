@@ -362,11 +362,9 @@ std::vector<Ticker> BybitExchange::fetch_all_tickers() {
             }
 
             // Extract base currency (remove USDT suffix)
-            std::string base(symbol_str.substr(0, symbol_str.size() - 4));
-
             Ticker ticker;
             ticker.exchange = Exchange::Bybit;
-            ticker.symbol = SymbolId(base, "USDT");
+            ticker.symbol = SymbolId(symbol_str.substr(0, symbol_str.size() - 4), "USDT");
 
             // Parse prices
             std::string_view last_str = item["lastPrice"].get_string().value();
@@ -870,8 +868,7 @@ bool BybitExchange::parse_ticker_message(std::string_view message, Ticker& ticke
             if (symbol_elem.error()) return false;
             std::string_view symbol_str = std::string_view(symbol_elem.get_c_str().value());
             if (symbol_str.size() > 4) {
-                std::string base(symbol_str.substr(0, symbol_str.size() - 4));
-                ticker.symbol = SymbolId(base, "USDT");
+                ticker.symbol = SymbolId(symbol_str.substr(0, symbol_str.size() - 4), "USDT");
             }
 
             auto last_elem = data["lastPrice"];

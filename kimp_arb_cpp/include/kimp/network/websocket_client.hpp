@@ -84,8 +84,8 @@ private:
     HandshakeHeadersCallback handshake_headers_callback_;
 
     // State - cache-line aligned to prevent false sharing
-    alignas(64) std::atomic<ConnectionState> state_{ConnectionState::Disconnected};
-    alignas(64) std::atomic<bool> should_reconnect_{true};
+    alignas(memory::CACHE_LINE_SIZE) std::atomic<ConnectionState> state_{ConnectionState::Disconnected};
+    alignas(memory::CACHE_LINE_SIZE) std::atomic<bool> should_reconnect_{true};
     std::atomic<int> reconnect_attempts_{0};  // Same cache line as should_reconnect_ (both infrequent)
     static constexpr int MAX_RECONNECT_ATTEMPTS = 0;  // 0 = unlimited (never give up)
     static constexpr int RECONNECT_DELAY_MS = 1000;
@@ -95,8 +95,8 @@ private:
     // Buffers - cache-line aligned for write path
     beast::flat_buffer read_buffer_;
     // Lock-free write queue: MPMC for thread-safe send() from any thread
-    alignas(64) memory::MPMCRingBuffer<std::string, 256> write_queue_;  // Power of 2 capacity
-    alignas(64) std::atomic<bool> is_writing_{false};
+    alignas(memory::CACHE_LINE_SIZE) memory::MPMCRingBuffer<std::string, 256> write_queue_;
+    alignas(memory::CACHE_LINE_SIZE) std::atomic<bool> is_writing_{false};
     // Must persist until async_write completion
     std::string current_write_message_;
 
@@ -115,6 +115,9 @@ public:
         , reconnect_timer_(ioc)
         , ping_timer_(ioc)
         , name_(std::move(name)) {
+
+        // Pre-allocate read buffer to avoid growth-triggered copies
+        read_buffer_.reserve(4096);
 
         // Configure SSL context
         configure_verify_paths();

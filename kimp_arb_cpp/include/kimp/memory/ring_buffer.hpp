@@ -19,8 +19,12 @@
 
 namespace kimp::memory {
 
-// Cache line size for padding
+// Cache line size for padding (Apple Silicon M-series uses 128-byte cache lines)
+#if defined(__APPLE__) && defined(__aarch64__)
+inline constexpr std::size_t CACHE_LINE_SIZE = 128;
+#else
 inline constexpr std::size_t CACHE_LINE_SIZE = 64;
+#endif
 
 /**
  * Lock-free Single-Producer Single-Consumer Ring Buffer
@@ -254,7 +258,7 @@ public:
 
             if (diff == 0) {
                 if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
                     break;
                 }
             } else if (diff < 0) {
@@ -281,7 +285,7 @@ public:
 
             if (diff == 0) {
                 if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
                     break;
                 }
             } else if (diff < 0) {
@@ -308,7 +312,7 @@ public:
 
             if (diff == 0) {
                 if (dequeue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
                     break;
                 }
             } else if (diff < 0) {

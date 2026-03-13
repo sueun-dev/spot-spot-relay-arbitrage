@@ -363,14 +363,16 @@ void LatencyProbe::record(uint64_t trace_id,
                           int64_t aux1,
                           double value0,
                           double value1) {
-    if (!enabled_.load(std::memory_order_acquire)) {
+    if (!enabled_.load(std::memory_order_relaxed)) {
         return;
     }
+    // Capture clock BEFORE format_symbol to exclude formatting overhead from timestamp
+    const uint64_t now = capture_now_ns();
     record_at_ns(trace_id,
                  format_symbol(symbol),
                  stage,
                  trace_start_ns,
-                 capture_now_ns(),
+                 now,
                  aux0,
                  aux1,
                  value0,
@@ -385,7 +387,7 @@ void LatencyProbe::record(uint64_t trace_id,
                           int64_t aux1,
                           double value0,
                           double value1) {
-    if (!enabled_.load(std::memory_order_acquire)) {
+    if (!enabled_.load(std::memory_order_relaxed)) {
         return;
     }
     record_at_ns(trace_id,
@@ -408,7 +410,7 @@ void LatencyProbe::record_at_ns(uint64_t trace_id,
                                 int64_t aux1,
                                 double value0,
                                 double value1) {
-    if (!enabled_.load(std::memory_order_acquire)) {
+    if (!enabled_.load(std::memory_order_relaxed)) {
         return;
     }
     record_at_ns(trace_id,
@@ -431,7 +433,7 @@ void LatencyProbe::record_at_ns(uint64_t trace_id,
                                 int64_t aux1,
                                 double value0,
                                 double value1) {
-    if (!enabled_.load(std::memory_order_acquire)) {
+    if (!enabled_.load(std::memory_order_relaxed)) {
         return;
     }
 

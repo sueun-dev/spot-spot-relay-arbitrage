@@ -25,9 +25,13 @@ public:
 
         const std::size_t word_idx = index / WORD_BITS;
         const uint64_t mask = uint64_t{1} << (index % WORD_BITS);
+        // Check-before-RMW: skip atomic RMW if bit already in desired state
+        uint64_t current = words_[word_idx].load(std::memory_order_relaxed);
         if (enabled) {
+            if (current & mask) return;  // Already set
             words_[word_idx].fetch_or(mask, std::memory_order_release);
         } else {
+            if (!(current & mask)) return;  // Already clear
             words_[word_idx].fetch_and(~mask, std::memory_order_release);
         }
     }

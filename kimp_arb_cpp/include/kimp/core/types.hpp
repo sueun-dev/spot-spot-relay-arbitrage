@@ -339,7 +339,7 @@ struct TradingConfig {
     // Entry threshold
     static constexpr double ENTRY_PREMIUM_THRESHOLD = 0.0;    // Legacy/monitor alias only
     static constexpr double MIN_NET_EDGE_PCT = 0.0;           // Enter only when net edge is positive
-    static constexpr double MIN_ENTRY_NET_PROFIT_KRW = 800.0; // Enter only when projected NetKRW for the executable entry size is >= 800
+    static constexpr double MIN_ENTRY_NET_PROFIT_KRW = 600.0; // Enter only when projected NetKRW for the executable entry size is >= 600
 
     // Fee structure for the relay model
     static constexpr int BITHUMB_FEE_EVENTS = 1;

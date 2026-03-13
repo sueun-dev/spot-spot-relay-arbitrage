@@ -127,7 +127,7 @@ public:
     void stop();
 
     [[nodiscard]] bool enabled() const noexcept {
-        return enabled_.load(std::memory_order_acquire);
+        return enabled_.load(std::memory_order_relaxed);
     }
 
     [[nodiscard]] uint64_t next_trace_id() noexcept {
