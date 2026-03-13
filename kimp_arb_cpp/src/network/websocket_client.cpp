@@ -293,7 +293,7 @@ void WebSocketClient::on_write(beast::error_code ec, std::size_t bytes_transferr
     if (ec) {
         handle_error("write", ec);
         current_write_message_.clear();
-        is_writing_ = false;
+        is_writing_.store(false, std::memory_order_release);
         reconnect();
         return;
     }
