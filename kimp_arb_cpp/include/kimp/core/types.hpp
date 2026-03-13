@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -137,10 +138,19 @@ struct SymbolId {
     }
 
     std::size_t hash() const noexcept {
-        std::size_t h = 0;
-        for (char c : base) h = h * 31 + static_cast<unsigned char>(c);
-        for (char c : quote) h = h * 31 + static_cast<unsigned char>(c);
-        return h;
+        // Load 20 bytes as integers for proper avalanche (no null-byte weakness)
+        uint64_t h1, h2;
+        uint32_t h3;
+        std::memcpy(&h1, base.data(), 8);
+        std::memcpy(&h3, base.data() + 8, 4);
+        std::memcpy(&h2, quote.data(), 8);
+        // Splitmix64-style finalizer for good distribution in power-of-2 tables
+        h1 ^= static_cast<uint64_t>(h3) * 0x9E3779B97F4A7C15ULL;
+        h1 ^= h2 * 0xBF58476D1CE4E5B9ULL;
+        h1 ^= h1 >> 31;
+        h1 *= 0xBF58476D1CE4E5B9ULL;
+        h1 ^= h1 >> 27;
+        return static_cast<std::size_t>(h1);
     }
 
     // Fast check for USDT/KRW (hot path optimization)
