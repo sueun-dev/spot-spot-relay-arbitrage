@@ -200,7 +200,7 @@ public:
                    const std::string& port = "443",
                    ConnectionPoolConfig config = {})
         : io_context_(ioc)
-        , ssl_context_(ssl::context::tlsv12_client)
+        , ssl_context_(ssl::context::tls_client)
         , host_(host)
         , port_(port)
         , config_(config) {
