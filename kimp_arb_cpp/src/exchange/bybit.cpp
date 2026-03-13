@@ -418,6 +418,11 @@ Order BybitExchange::place_market_order(const SymbolId& symbol, Side side, Quant
         symbol_to_bybit(symbol).c_str(),
         side == Side::Buy ? "Buy" : "Sell",
         quantity);
+    if (body_len <= 0 || static_cast<size_t>(body_len) >= sizeof(body_buf)) {
+        order.status = OrderStatus::Rejected;
+        Logger::error("[Bybit] Order body buffer overflow");
+        return order;
+    }
     std::string body_str(body_buf, static_cast<size_t>(body_len));
     auto headers = build_auth_headers(body_str);
     headers["Content-Type"] = "application/json";
@@ -477,6 +482,11 @@ Order BybitExchange::open_short(const SymbolId& symbol, Quantity quantity) {
         "\"orderType\":\"Market\",\"qty\":\"%.8f\",\"isLeverage\":1,"
         "\"orderFilter\":\"Order\",\"marketUnit\":\"baseCoin\"}",
         symbol_to_bybit(symbol).c_str(), adj_qty);
+    if (body_len <= 0 || static_cast<size_t>(body_len) >= sizeof(body_buf)) {
+        order.status = OrderStatus::Rejected;
+        Logger::error("[Bybit] Short open body buffer overflow");
+        return order;
+    }
     std::string body_str(body_buf, static_cast<size_t>(body_len));
     auto headers = build_auth_headers(body_str);
     headers["Content-Type"] = "application/json";
@@ -539,6 +549,11 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
         "\"orderType\":\"Market\",\"qty\":\"%.8f\",\"isLeverage\":1,"
         "\"orderFilter\":\"Order\",\"marketUnit\":\"baseCoin\"}",
         symbol_to_bybit(symbol).c_str(), adj_qty);
+    if (body_len <= 0 || static_cast<size_t>(body_len) >= sizeof(body_buf)) {
+        order.status = OrderStatus::Rejected;
+        Logger::error("[Bybit] Short close body buffer overflow");
+        return order;
+    }
     std::string body_str(body_buf, static_cast<size_t>(body_len));
     auto headers = build_auth_headers(body_str);
     headers["Content-Type"] = "application/json";

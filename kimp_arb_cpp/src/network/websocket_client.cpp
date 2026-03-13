@@ -115,7 +115,7 @@ void WebSocketClient::send(std::string message) {
     }
 
     if (!is_writing_.exchange(true)) {
-        net::post(ws_->get_executor(), [self = shared_from_this()] {
+        net::post(strand_, [self = shared_from_this()] {
             self->do_write();
         });
     }
@@ -138,8 +138,7 @@ void WebSocketClient::on_resolve(beast::error_code ec, tcp::resolver::results_ty
     }
 
     // Create new WebSocket stream
-    ws_ = std::make_unique<WebSocketStream>(
-        net::make_strand(io_context_), ssl_context_);
+    ws_ = std::make_unique<WebSocketStream>(strand_, ssl_context_);
 
     // Set TCP options
     beast::get_lowest_layer(*ws_).expires_after(std::chrono::seconds(30));

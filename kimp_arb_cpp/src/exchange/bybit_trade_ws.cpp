@@ -114,6 +114,10 @@ Order BybitTradeWS::place_order_sync(const std::string& symbol, Side side, doubl
         is_leverage ? "\"isLeverage\":1," : "");
     if (len <= 0 || static_cast<size_t>(len) >= sizeof(buf)) {
         order.status = OrderStatus::Rejected;
+        {
+            std::lock_guard lock(pending_mutex_);
+            pending_orders_.erase(req_id);
+        }
         return order;
     }
     ws_->send(std::string(buf, static_cast<size_t>(len)));

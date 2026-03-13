@@ -683,8 +683,8 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                 snap.position_size_usd = position_size_usd;
                 snap.korean_amount = held_amount;
                 snap.foreign_amount = held_amount;
-                snap.korean_entry_price = total_korean_cost / held_amount;
-                snap.foreign_entry_price = total_foreign_value / held_amount;
+                snap.korean_entry_price = held_amount > 0 ? total_korean_cost / held_amount : 0.0;
+                snap.foreign_entry_price = held_amount > 0 ? total_foreign_value / held_amount : 0.0;
                 snap.realized_pnl_krw = realized_pnl_krw;
                 snap.is_active = true;
                 persist_snapshot(snap);
@@ -810,8 +810,8 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                 }
 
                 // P&L using average entry prices
-                double avg_korean_entry = total_korean_cost / held_amount;
-                double avg_foreign_entry = total_foreign_value / held_amount;
+                double avg_korean_entry = held_amount > 0 ? total_korean_cost / held_amount : 0.0;
+                double avg_foreign_entry = held_amount > 0 ? total_foreign_value / held_amount : 0.0;
                 double korean_pnl_krw = (sell_price - avg_korean_entry) * actual_covered;
                 double foreign_pnl_usd = (avg_foreign_entry - cover_price) * actual_covered;
                 double foreign_pnl_krw = foreign_pnl_usd * usdt_rate;
@@ -819,7 +819,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                 realized_pnl_krw += split_pnl_krw;
 
                 // Reduce costs proportionally
-                double exit_ratio = actual_covered / held_amount;
+                double exit_ratio = held_amount > 0 ? actual_covered / held_amount : 1.0;
                 total_korean_cost *= (1.0 - exit_ratio);
                 total_foreign_value *= (1.0 - exit_ratio);
                 held_amount -= actual_covered;
@@ -849,8 +849,8 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                         snap.position_size_usd = position_size_usd;
                         snap.korean_amount = held_amount;
                         snap.foreign_amount = held_amount;
-                        snap.korean_entry_price = total_korean_cost / held_amount;
-                        snap.foreign_entry_price = total_foreign_value / held_amount;
+                        snap.korean_entry_price = held_amount > 0 ? total_korean_cost / held_amount : 0.0;
+                        snap.foreign_entry_price = held_amount > 0 ? total_foreign_value / held_amount : 0.0;
                         snap.realized_pnl_krw = realized_pnl_krw;
                         snap.is_active = true;
                         on_position_update_(&snap);
@@ -909,15 +909,15 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                         double sell_price = korean_order.average_price;
                         if (sell_price <= 0) sell_price = current_korean_bid;
 
-                        double avg_korean_entry = total_korean_cost / held_amount;
-                        double avg_foreign_entry = total_foreign_value / held_amount;
+                        double avg_korean_entry = held_amount > 0 ? total_korean_cost / held_amount : 0.0;
+                        double avg_foreign_entry = held_amount > 0 ? total_foreign_value / held_amount : 0.0;
                         double korean_pnl_krw = (sell_price - avg_korean_entry) * actual_covered;
                         double foreign_pnl_usd = (avg_foreign_entry - cover_price) * actual_covered;
                         double foreign_pnl_krw = foreign_pnl_usd * usdt_rate;
                         double split_pnl_krw = korean_pnl_krw + foreign_pnl_krw;
                         realized_pnl_krw += split_pnl_krw;
 
-                        double exit_ratio = actual_covered / held_amount;
+                        double exit_ratio = held_amount > 0 ? actual_covered / held_amount : 1.0;
                         total_korean_cost *= (1.0 - exit_ratio);
                         total_foreign_value *= (1.0 - exit_ratio);
                         held_amount -= actual_covered;
@@ -978,8 +978,8 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
         result.success = true;
         result.position.korean_amount = held_amount;
         result.position.foreign_amount = held_amount;
-        result.position.korean_entry_price = total_korean_cost / held_amount;
-        result.position.foreign_entry_price = total_foreign_value / held_amount;
+        result.position.korean_entry_price = held_amount > 0 ? total_korean_cost / held_amount : 0.0;
+        result.position.foreign_entry_price = held_amount > 0 ? total_foreign_value / held_amount : 0.0;
         result.position.entry_premium = calculate_effective_entry_pm(last_usdt_rate);
         result.position.is_active = true;
         result.position.realized_pnl_krw = realized_pnl_krw;
