@@ -640,23 +640,25 @@ Order BithumbExchange::place_market_order(const SymbolId& symbol, Side side, Qua
     order.client_order_id = generate_order_id();
     order.create_time = std::chrono::system_clock::now();
 
-    std::string endpoint = "/trade/market_" + std::string(side == Side::Buy ? "buy" : "sell");
+    const char* endpoint = (side == Side::Buy) ? "/trade/market_buy" : "/trade/market_sell";
 
-    std::ostringstream params;
-    params << "order_currency=" << symbol.get_base();
-    params << "&payment_currency=KRW";
-
+    char params_buf[256];
+    int params_len;
     if (side == Side::Sell) {
-        params << "&units=" << std::fixed << std::setprecision(8) << quantity;
+        params_len = std::snprintf(params_buf, sizeof(params_buf),
+            "order_currency=%s&payment_currency=KRW&units=%.8f",
+            std::string(symbol.get_base()).c_str(), quantity);
     } else {
-        // For buy, quantity is KRW amount
-        params << "&units=" << std::fixed << std::setprecision(0) << quantity;
+        params_len = std::snprintf(params_buf, sizeof(params_buf),
+            "order_currency=%s&payment_currency=KRW&units=%.0f",
+            std::string(symbol.get_base()).c_str(), quantity);
     }
+    std::string params_str(params_buf, static_cast<size_t>(params_len));
 
-    auto headers = build_auth_headers(endpoint, params.str());
+    auto headers = build_auth_headers(endpoint, params_str);
     headers["Content-Type"] = "application/x-www-form-urlencoded";
 
-    auto response = rest_client_->post(endpoint, params.str(), headers);
+    auto response = rest_client_->post(endpoint, params_str, headers);
     if (!response.success) {
         order.status = OrderStatus::Rejected;
         Logger::error("[Bithumb] Order failed: {}", response.body);
@@ -715,17 +717,18 @@ Order BithumbExchange::place_market_buy_quantity(const SymbolId& symbol, Quantit
     order.client_order_id = generate_order_id();
     order.create_time = std::chrono::system_clock::now();
 
-    std::string endpoint = "/trade/market_buy";
+    const char* endpoint = "/trade/market_buy";
 
-    std::ostringstream params;
-    params << "order_currency=" << symbol.get_base();
-    params << "&payment_currency=KRW";
-    params << "&units=" << std::fixed << std::setprecision(8) << quantity;
+    char params_buf[256];
+    int params_len = std::snprintf(params_buf, sizeof(params_buf),
+        "order_currency=%s&payment_currency=KRW&units=%.8f",
+        std::string(symbol.get_base()).c_str(), quantity);
+    std::string params_str(params_buf, static_cast<size_t>(params_len));
 
-    auto headers = build_auth_headers(endpoint, params.str());
+    auto headers = build_auth_headers(endpoint, params_str);
     headers["Content-Type"] = "application/x-www-form-urlencoded";
 
-    auto response = rest_client_->post(endpoint, params.str(), headers);
+    auto response = rest_client_->post(endpoint, params_str, headers);
     if (!response.success) {
         order.status = OrderStatus::Rejected;
         Logger::error("[Bithumb] Order failed: {}", response.body);

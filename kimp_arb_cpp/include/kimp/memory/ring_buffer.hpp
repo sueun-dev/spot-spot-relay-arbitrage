@@ -254,7 +254,7 @@ public:
 
             if (diff == 0) {
                 if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_relaxed)) {
+                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
                     break;
                 }
             } else if (diff < 0) {
@@ -281,7 +281,7 @@ public:
 
             if (diff == 0) {
                 if (enqueue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_relaxed)) {
+                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
                     break;
                 }
             } else if (diff < 0) {
@@ -308,7 +308,7 @@ public:
 
             if (diff == 0) {
                 if (dequeue_pos_.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_relaxed)) {
+                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
                     break;
                 }
             } else if (diff < 0) {
