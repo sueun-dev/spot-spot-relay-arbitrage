@@ -108,7 +108,7 @@ private:
 public:
     explicit WebSocketClient(net::io_context& ioc, std::string name = "WebSocket")
         : io_context_(ioc)
-        , ssl_context_(ssl::context::tlsv12_client)
+        , ssl_context_(ssl::context::tls_client)
         , resolver_(net::make_strand(ioc))
         , reconnect_timer_(ioc)
         , ping_timer_(ioc)

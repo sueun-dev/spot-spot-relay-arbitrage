@@ -37,7 +37,7 @@ void WebSocketClient::configure_verify_paths() {
 
 bool WebSocketClient::parse_url(const std::string& url) {
     // Parse wss://host:port/path or wss://host/path
-    std::regex url_regex(R"(wss?://([^:/]+)(?::(\d+))?(/.*)?)", std::regex::icase);
+    static const std::regex url_regex(R"(wss?://([^:/]+)(?::(\d+))?(/.*)?)", std::regex::icase);
     std::smatch match;
 
     if (!std::regex_match(url, match, url_regex)) {
@@ -158,6 +158,9 @@ void WebSocketClient::on_connect(beast::error_code ec, tcp::resolver::results_ty
 
     Logger::debug("[{}] TCP connected to {}:{}", name_, host_, ep.port());
 
+    // Disable Nagle's algorithm for minimum latency
+    beast::get_lowest_layer(*ws_).socket().set_option(tcp::no_delay(true));
+
     // Set SNI hostname for SSL
     if (!SSL_set_tlsext_host_name(ws_->next_layer().native_handle(), host_.c_str())) {
         ec = beast::error_code(static_cast<int>(::ERR_get_error()),
@@ -241,10 +244,11 @@ void WebSocketClient::on_read(beast::error_code ec, std::size_t bytes_transferre
             if (on_disconnect_) {
                 on_disconnect_("Server closed connection");
             }
+            reconnect();
         } else {
+            // handle_error("read", ...) already calls reconnect() for non-write ops
             handle_error("read", ec);
         }
-        reconnect();
         return;
     }
 
@@ -264,18 +268,24 @@ void WebSocketClient::on_read(beast::error_code ec, std::size_t bytes_transferre
 }
 
 void WebSocketClient::do_write() {
-    // Lock-free pop from write queue
-    auto message = write_queue_.try_pop();
-    if (!message) {
-        is_writing_ = false;
+    for (;;) {
+        auto message = write_queue_.try_pop();
+        if (!message) {
+            is_writing_.store(false, std::memory_order_release);
+            // Re-check: a producer may have pushed between try_pop and store
+            if (write_queue_.empty()) return;
+            // Something arrived; try to re-acquire writer role
+            if (is_writing_.exchange(true, std::memory_order_acquire)) return;
+            continue;  // Re-acquired, loop back to pop
+        }
+
+        current_write_message_ = std::move(*message);
+        ws_->text(true);
+        ws_->async_write(
+            net::buffer(current_write_message_),
+            beast::bind_front_handler(&WebSocketClient::on_write, shared_from_this()));
         return;
     }
-
-    current_write_message_ = std::move(*message);
-    ws_->text(true);
-    ws_->async_write(
-        net::buffer(current_write_message_),
-        beast::bind_front_handler(&WebSocketClient::on_write, shared_from_this()));
 }
 
 void WebSocketClient::on_write(beast::error_code ec, std::size_t bytes_transferred) {

@@ -7,8 +7,6 @@
 #include <array>
 #include <random>
 #include <chrono>
-#include <sstream>
-#include <iomanip>
 
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
@@ -78,8 +76,9 @@ public:
         return to_hex(hash, SHA512_DIGEST_LENGTH);
     }
 
-    // Generate UUID v4
+    // Generate UUID v4 — zero-alloc lookup-table hex conversion
     static std::string generate_uuid() {
+        static constexpr char h[] = "0123456789abcdef";
         std::array<uint8_t, 16> bytes;
         RAND_bytes(bytes.data(), bytes.size());
 
@@ -88,13 +87,15 @@ public:
         // Set variant to 1
         bytes[8] = (bytes[8] & 0x3F) | 0x80;
 
-        std::ostringstream ss;
-        ss << std::hex << std::setfill('0');
+        // UUID: 8-4-4-4-12 = 36 chars
+        char buf[36];
+        int pos = 0;
         for (int i = 0; i < 16; ++i) {
-            if (i == 4 || i == 6 || i == 8 || i == 10) ss << '-';
-            ss << std::setw(2) << static_cast<int>(bytes[i]);
+            if (i == 4 || i == 6 || i == 8 || i == 10) buf[pos++] = '-';
+            buf[pos++] = h[bytes[i] >> 4];
+            buf[pos++] = h[bytes[i] & 0x0F];
         }
-        return ss.str();
+        return std::string(buf, 36);
     }
 
     // Generate random nonce
@@ -179,32 +180,34 @@ public:
         return result;
     }
 
-    // URL encode
+    // URL encode — lookup-table, no ostringstream
     static std::string url_encode(std::string_view str) {
-        std::ostringstream ss;
-        ss << std::hex << std::uppercase << std::setfill('0');
-
-        for (char c : str) {
-            if (std::isalnum(static_cast<unsigned char>(c)) ||
-                c == '-' || c == '_' || c == '.' || c == '~') {
-                ss << c;
+        static constexpr char h[] = "0123456789ABCDEF";
+        std::string result;
+        result.reserve(str.size());
+        for (unsigned char c : str) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                result.push_back(static_cast<char>(c));
             } else {
-                ss << '%' << std::setw(2) << static_cast<int>(static_cast<unsigned char>(c));
+                result.push_back('%');
+                result.push_back(h[c >> 4]);
+                result.push_back(h[c & 0x0F]);
             }
         }
-
-        return ss.str();
+        return result;
     }
 
 private:
-    // Convert bytes to hex string
+    // Convert bytes to hex string — lookup-table, zero-alloc
     static std::string to_hex(const unsigned char* data, std::size_t len) {
-        std::ostringstream ss;
-        ss << std::hex << std::setfill('0');
+        static constexpr char h[] = "0123456789abcdef";
+        std::string result;
+        result.resize(len * 2);
         for (std::size_t i = 0; i < len; ++i) {
-            ss << std::setw(2) << static_cast<int>(data[i]);
+            result[i * 2]     = h[data[i] >> 4];
+            result[i * 2 + 1] = h[data[i] & 0x0F];
         }
-        return ss.str();
+        return result;
     }
 };
 
