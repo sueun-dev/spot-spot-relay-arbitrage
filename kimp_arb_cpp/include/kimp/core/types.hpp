@@ -112,6 +112,17 @@ struct SymbolId {
         return std::string(get_base()) + "_" + std::string(get_quote());
     }
 
+    // Parse "BTC_KRW" → SymbolId (zero-heap-alloc)
+    static SymbolId from_bithumb_format(std::string_view sv) noexcept {
+        SymbolId id;
+        auto pos = sv.find('_');
+        if (pos != std::string_view::npos) {
+            id.set_base(sv.substr(0, pos));
+            id.set_quote(sv.substr(pos + 1));
+        }
+        return id;
+    }
+
     // Foreign format: "BTCUSDT" for Bybit spot margin
     std::string to_bybit_format() const {
         return std::string(get_base()) + std::string(get_quote());

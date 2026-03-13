@@ -52,8 +52,8 @@ private:
         bool initialized{false};
     };
 
-    // Per-symbol orderbook levels (keyed by "BTC_KRW" format)
-    std::unordered_map<std::string, OrderbookState> orderbook_state_;
+    // Per-symbol orderbook levels (keyed by SymbolId — zero-alloc lookup)
+    std::unordered_map<SymbolId, OrderbookState> orderbook_state_;
     std::mutex orderbook_mutex_;
 
     // Lock-free BBO cache for hot ticker path
@@ -63,13 +63,13 @@ private:
         std::atomic<double> best_bid_qty{0.0};
         std::atomic<double> best_ask_qty{0.0};
     };
-    std::unordered_map<std::string, BBO> orderbook_bbo_;
+    std::unordered_map<SymbolId, BBO> orderbook_bbo_;
     std::atomic<bool> orderbook_ready_{false};
     std::atomic<bool> orderbook_resync_running_{false};
     std::thread orderbook_resync_thread_;
 
     // Cache last known ticker price per symbol for orderbookdepth-driven dispatch
-    std::unordered_map<std::string, double> last_price_cache_;
+    std::unordered_map<SymbolId, double> last_price_cache_;
 
 public:
     BithumbExchange(net::io_context& ioc, ExchangeCredentials creds)
@@ -122,10 +122,10 @@ private:
                                    Order& order);
     bool query_order_detail_ws(const std::string& order_id, Order& order);
 
-    std::optional<Ticker> make_bbo_ticker(const std::string& symbol_key);
+    std::optional<Ticker> make_bbo_ticker(const SymbolId& symbol);
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
-    std::vector<std::string> parse_orderbookdepth_message(std::string_view message);
-    void update_bbo(const std::string& symbol_key);
+    std::vector<SymbolId> parse_orderbookdepth_message(std::string_view message);
+    void update_bbo(const SymbolId& symbol);
     void start_orderbook_resync_loop();
     void stop_orderbook_resync_loop();
     std::string resolve_private_ws_endpoint() const;

@@ -10,7 +10,7 @@
 namespace {
 
 struct FastBithumbDepthUpdate {
-    std::string symbol;
+    kimp::SymbolId symbol;
     bool is_bid;
     double price;
     double quantity;
@@ -126,7 +126,7 @@ bool parse_orderbookdepth_fast(std::string_view message,
         }
 
         FastBithumbDepthUpdate update;
-        update.symbol = std::string(symbol_sv);
+        update.symbol = kimp::SymbolId::from_bithumb_format(symbol_sv);
         update.is_bid = (order_type_sv == "bid");
         update.price = kimp::opt::fast_stod(price_sv);
         update.quantity = kimp::opt::fast_stod(quantity_sv);
@@ -463,10 +463,9 @@ std::vector<Ticker> BithumbExchange::fetch_all_tickers() {
 
                 // Overlay real bid/ask from orderbook BBO
                 if (orderbook_ready_.load(std::memory_order_acquire)) {
-                    std::string symbol_key = std::string(key) + "_KRW";
                     {
                         std::lock_guard lock(orderbook_mutex_);
-                        auto bbo_it = orderbook_bbo_.find(symbol_key);
+                        auto bbo_it = orderbook_bbo_.find(ticker.symbol);
                         if (bbo_it != orderbook_bbo_.end()) {
                             double real_bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
                             double real_ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
@@ -523,15 +522,15 @@ void BithumbExchange::fetch_all_orderbook_snapshots(const std::vector<SymbolId>&
             return;
         }
 
-        std::unordered_set<std::string> requested_symbols;
+        std::unordered_set<SymbolId> requested_symbols;
         requested_symbols.reserve(symbols.size());
         for (const auto& symbol : symbols) {
-            requested_symbols.insert(symbol.to_bithumb_format());
+            requested_symbols.insert(symbol);
         }
 
         auto data = doc["data"].get_object();
         int count = 0;
-        std::vector<std::string> seeded_symbols;
+        std::vector<SymbolId> seeded_symbols;
         seeded_symbols.reserve(symbols.size());
 
         {
@@ -541,13 +540,13 @@ void BithumbExchange::fetch_all_orderbook_snapshots(const std::vector<SymbolId>&
                 std::string_view key = field.unescaped_key().value();
                 if (key == "timestamp" || key == "payment_currency") continue;
 
-                std::string symbol_key = std::string(key) + "_KRW";
+                SymbolId sym(key, "KRW");
                 if (!requested_symbols.empty() &&
-                    requested_symbols.find(symbol_key) == requested_symbols.end()) {
+                    requested_symbols.find(sym) == requested_symbols.end()) {
                     continue;
                 }
 
-                auto& state = orderbook_state_[symbol_key];
+                auto& state = orderbook_state_[sym];
                 state.bids.clear();
                 state.asks.clear();
 
@@ -580,8 +579,8 @@ void BithumbExchange::fetch_all_orderbook_snapshots(const std::vector<SymbolId>&
                 }
 
                 state.initialized = true;
-                update_bbo(symbol_key);
-                seeded_symbols.push_back(symbol_key);
+                update_bbo(sym);
+                seeded_symbols.push_back(sym);
                 ++count;
             }
         }
@@ -591,8 +590,8 @@ void BithumbExchange::fetch_all_orderbook_snapshots(const std::vector<SymbolId>&
                      count, requested_depth);
 
         int dispatched = 0;
-        for (const auto& symbol_key : seeded_symbols) {
-            auto ticker = make_bbo_ticker(symbol_key);
+        for (const auto& sym : seeded_symbols) {
+            auto ticker = make_bbo_ticker(sym);
             if (!ticker) continue;
             if (ticker->symbol.get_base() == "USDT") {
                 usdt_krw_price_.store(ticker->last, std::memory_order_release);
@@ -802,8 +801,8 @@ void BithumbExchange::on_ws_message(std::string_view message) {
 
         // Dispatch synthetic tickers for BBO-changed symbols (0ms propagation)
         if (orderbook_ready_.load(std::memory_order_acquire)) {
-            for (const auto& symbol_key : updated_symbols) {
-                auto ticker = make_bbo_ticker(symbol_key);
+            for (const auto& sym : updated_symbols) {
+                auto ticker = make_bbo_ticker(sym);
                 if (!ticker) continue;
                 if (ticker->symbol.get_base() == "USDT") {
                     usdt_krw_price_.store(ticker->last, std::memory_order_release);
@@ -822,9 +821,8 @@ void BithumbExchange::on_ws_message(std::string_view message) {
 
         // Overlay real bid/ask from orderbook BBO
         if (orderbook_ready_.load(std::memory_order_acquire)) {
-            std::string symbol_key = ticker.symbol.to_bithumb_format();
             std::lock_guard lock(orderbook_mutex_);
-            auto bbo_it = orderbook_bbo_.find(symbol_key);
+            auto bbo_it = orderbook_bbo_.find(ticker.symbol);
             if (bbo_it != orderbook_bbo_.end()) {
                 double real_bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
                 double real_ask = bbo_it->second.best_ask.load(std::memory_order_acquire);
@@ -1062,7 +1060,7 @@ void BithumbExchange::subscribe_private_myorder() {
 bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
     if (parse_ticker_fast(message, ticker)) {
         std::lock_guard lock(orderbook_mutex_);
-        last_price_cache_[ticker.symbol.to_bithumb_format()] = ticker.last;
+        last_price_cache_[ticker.symbol] = ticker.last;
         return true;
     }
 
@@ -1096,7 +1094,7 @@ bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& tic
         // Cache last price for orderbookdepth-driven dispatch
         {
             std::lock_guard lock(orderbook_mutex_);
-            last_price_cache_[std::string(symbol_str)] = ticker.last;
+            last_price_cache_[ticker.symbol] = ticker.last;
         }
 
         return true;
@@ -1106,10 +1104,10 @@ bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& tic
     }
 }
 
-std::optional<Ticker> BithumbExchange::make_bbo_ticker(const std::string& symbol_key) {
+std::optional<Ticker> BithumbExchange::make_bbo_ticker(const SymbolId& symbol) {
     std::lock_guard lock(orderbook_mutex_);
 
-    auto bbo_it = orderbook_bbo_.find(symbol_key);
+    auto bbo_it = orderbook_bbo_.find(symbol);
     if (bbo_it == orderbook_bbo_.end()) {
         return std::nullopt;
     }
@@ -1123,7 +1121,7 @@ std::optional<Ticker> BithumbExchange::make_bbo_ticker(const std::string& symbol
     }
 
     double last = 0.0;
-    auto last_it = last_price_cache_.find(symbol_key);
+    auto last_it = last_price_cache_.find(symbol);
     if (last_it != last_price_cache_.end() && last_it->second > 0.0) {
         last = last_it->second;
     } else {
@@ -1133,12 +1131,7 @@ std::optional<Ticker> BithumbExchange::make_bbo_ticker(const std::string& symbol
     Ticker ticker;
     ticker.exchange = Exchange::Bithumb;
     ticker.timestamp = std::chrono::steady_clock::now();
-    auto pos = symbol_key.find('_');
-    if (pos == std::string::npos) {
-        return std::nullopt;
-    }
-    ticker.symbol.set_base(symbol_key.substr(0, pos));
-    ticker.symbol.set_quote(symbol_key.substr(pos + 1));
+    ticker.symbol = symbol;
     ticker.last = last;
     ticker.bid = bid;
     ticker.ask = ask;
@@ -1147,13 +1140,14 @@ std::optional<Ticker> BithumbExchange::make_bbo_ticker(const std::string& symbol
     return ticker;
 }
 
-std::vector<std::string> BithumbExchange::parse_orderbookdepth_message(std::string_view message) {
-    std::vector<std::string> updated_symbols;
+std::vector<SymbolId> BithumbExchange::parse_orderbookdepth_message(std::string_view message) {
+    std::vector<SymbolId> updated_symbols;
     std::vector<FastBithumbDepthUpdate> fast_updates;
     if (parse_orderbookdepth_fast(message, fast_updates)) {
         std::lock_guard lock(orderbook_mutex_);
 
-        std::string last_updated_symbol;
+        SymbolId last_updated_symbol;
+        bool has_last = false;
         updated_symbols.reserve(fast_updates.size());
 
         for (const auto& item : fast_updates) {
@@ -1175,16 +1169,17 @@ std::vector<std::string> BithumbExchange::parse_orderbookdepth_message(std::stri
                 }
             }
 
-            if (item.symbol != last_updated_symbol) {
-                if (!last_updated_symbol.empty()) {
+            if (!has_last || item.symbol != last_updated_symbol) {
+                if (has_last) {
                     update_bbo(last_updated_symbol);
                     updated_symbols.push_back(last_updated_symbol);
                 }
                 last_updated_symbol = item.symbol;
+                has_last = true;
             }
         }
 
-        if (!last_updated_symbol.empty()) {
+        if (has_last) {
             update_bbo(last_updated_symbol);
             updated_symbols.push_back(last_updated_symbol);
         }
@@ -1205,13 +1200,14 @@ std::vector<std::string> BithumbExchange::parse_orderbookdepth_message(std::stri
 
         std::lock_guard lock(orderbook_mutex_);
 
-        std::string last_updated_symbol;
+        SymbolId last_updated_symbol;
+        bool has_last = false;
 
         for (auto item : list) {
             std::string_view symbol_sv = item["symbol"].get_string().value();
-            std::string symbol_key(symbol_sv);
+            SymbolId sym = SymbolId::from_bithumb_format(symbol_sv);
 
-            auto it = orderbook_state_.find(symbol_key);
+            auto it = orderbook_state_.find(sym);
             if (it == orderbook_state_.end() || !it->second.initialized) continue;
 
             auto& state = it->second;
@@ -1237,16 +1233,17 @@ std::vector<std::string> BithumbExchange::parse_orderbookdepth_message(std::stri
                 }
             }
 
-            if (symbol_key != last_updated_symbol) {
-                if (!last_updated_symbol.empty()) {
+            if (!has_last || sym != last_updated_symbol) {
+                if (has_last) {
                     update_bbo(last_updated_symbol);
                     updated_symbols.push_back(last_updated_symbol);
                 }
-                last_updated_symbol = symbol_key;
+                last_updated_symbol = sym;
+                has_last = true;
             }
         }
 
-        if (!last_updated_symbol.empty()) {
+        if (has_last) {
             update_bbo(last_updated_symbol);
             updated_symbols.push_back(last_updated_symbol);
         }
@@ -1257,13 +1254,13 @@ std::vector<std::string> BithumbExchange::parse_orderbookdepth_message(std::stri
     return updated_symbols;
 }
 
-void BithumbExchange::update_bbo(const std::string& symbol_key) {
+void BithumbExchange::update_bbo(const SymbolId& symbol) {
     // Called with orderbook_mutex_ held
-    auto state_it = orderbook_state_.find(symbol_key);
+    auto state_it = orderbook_state_.find(symbol);
     if (state_it == orderbook_state_.end() || !state_it->second.initialized) return;
 
     const auto& state = state_it->second;
-    auto& bbo = orderbook_bbo_[symbol_key];
+    auto& bbo = orderbook_bbo_[symbol];
 
     if (!state.bids.empty()) {
         bbo.best_bid.store(state.bids.begin()->first, std::memory_order_release);
