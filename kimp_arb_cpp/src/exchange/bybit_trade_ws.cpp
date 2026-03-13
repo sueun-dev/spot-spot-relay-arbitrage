@@ -69,7 +69,9 @@ void BybitTradeWS::authenticate() {
         credentials_.api_key.c_str(),
         static_cast<long long>(expires),
         signature.c_str());
-    ws_->send(std::string(buf, static_cast<size_t>(len)));
+    if (len > 0 && static_cast<size_t>(len) < sizeof(buf)) {
+        ws_->send(std::string(buf, static_cast<size_t>(len)));
+    }
 }
 
 Order BybitTradeWS::place_order_sync(const std::string& symbol, Side side, double qty,
@@ -110,6 +112,10 @@ Order BybitTradeWS::place_order_sync(const std::string& symbol, Side side, doubl
         side == Side::Buy ? "Buy" : "Sell",
         qty,
         is_leverage ? "\"isLeverage\":1," : "");
+    if (len <= 0 || static_cast<size_t>(len) >= sizeof(buf)) {
+        order.status = OrderStatus::Rejected;
+        return order;
+    }
     ws_->send(std::string(buf, static_cast<size_t>(len)));
 
     // Wait for response with timeout

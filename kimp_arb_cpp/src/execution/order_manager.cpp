@@ -288,7 +288,7 @@ OrderManager::OrderManager()
       }) {}
 
 OrderManager::~OrderManager() {
-    running_ = false;
+    running_.store(false, std::memory_order_release);
     fill_query_executor_.stop();
 }
 
