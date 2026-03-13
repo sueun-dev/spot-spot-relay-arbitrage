@@ -8,6 +8,15 @@
 #include <type_traits>
 #include <utility>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define KIMP_CPU_PAUSE() _mm_pause()
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define KIMP_CPU_PAUSE() __asm__ volatile("yield")
+#else
+#define KIMP_CPU_PAUSE() ((void)0)
+#endif
+
 namespace kimp::memory {
 
 // Cache line size for padding
@@ -251,6 +260,7 @@ public:
             } else if (diff < 0) {
                 return false;  // Buffer full
             } else {
+                KIMP_CPU_PAUSE();
                 pos = enqueue_pos_.load(std::memory_order_relaxed);
             }
         }
@@ -277,6 +287,7 @@ public:
             } else if (diff < 0) {
                 return false;  // Buffer full
             } else {
+                KIMP_CPU_PAUSE();
                 pos = enqueue_pos_.load(std::memory_order_relaxed);
             }
         }
@@ -303,6 +314,7 @@ public:
             } else if (diff < 0) {
                 return std::nullopt;  // Buffer empty
             } else {
+                KIMP_CPU_PAUSE();
                 pos = dequeue_pos_.load(std::memory_order_relaxed);
             }
         }

@@ -417,8 +417,7 @@ Order BybitExchange::place_market_order(const SymbolId& symbol, Side side, Quant
     body << R"("orderType":"Market",)";
     body << R"("qty":")" << std::fixed << std::setprecision(8) << quantity << R"(",)";
     body << R"("orderFilter":"Order",)";
-    body << R"("marketUnit":"baseCoin",)";
-    body << R"("timeInForce":"GTC"})";
+    body << R"("marketUnit":"baseCoin"})";
 
     std::string body_str = body.str();
     auto headers = build_auth_headers(body_str);

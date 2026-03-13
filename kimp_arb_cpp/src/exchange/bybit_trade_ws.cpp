@@ -103,7 +103,7 @@ Order BybitTradeWS::place_order_sync(const std::string& symbol, Side side, doubl
         "{\"reqId\":\"%s\",\"header\":{\"X-BAPI-TIMESTAMP\":\"%lld\"},\"op\":\"order.create\","
         "\"args\":[{\"category\":\"spot\",\"symbol\":\"%s\",\"side\":\"%s\","
         "\"orderType\":\"Market\",\"qty\":\"%.8f\",%s"
-        "\"orderFilter\":\"Order\",\"marketUnit\":\"baseCoin\",\"timeInForce\":\"GTC\"}]}",
+        "\"orderFilter\":\"Order\",\"marketUnit\":\"baseCoin\"}]}",
         req_id.c_str(),
         static_cast<long long>(utils::Crypto::timestamp_ms()),
         symbol.c_str(),

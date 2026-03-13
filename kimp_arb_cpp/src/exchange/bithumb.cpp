@@ -1373,6 +1373,8 @@ bool BithumbExchange::query_order_detail_v1(const std::string& order_id, Order& 
         order.filled_quantity = total_units > 0.0 ? total_units : executed_volume;
         if (total_units > 0.0 && total_funds > 0.0) {
             order.average_price = total_funds / total_units;
+        } else {
+            order.average_price = 0.0;
         }
 
         Logger::info("[Bithumb] Fill(v1): orderId={}, avgPrice={:.2f}, filledQty={:.8f}",
