@@ -23,13 +23,15 @@ using Quantity = double;
 enum class Exchange : uint8_t {
     Bithumb = 0,
     Bybit = 1,
-    Count = 2
+    OKX = 2,
+    Count = 3
 };
 
 inline constexpr const char* exchange_name(Exchange ex) noexcept {
     switch (ex) {
         case Exchange::Bithumb: return "Bithumb";
         case Exchange::Bybit: return "Bybit";
+        case Exchange::OKX: return "OKX";
         default: return "Unknown";
     }
 }
@@ -39,7 +41,7 @@ inline constexpr bool is_korean_exchange(Exchange ex) noexcept {
 }
 
 inline constexpr bool is_foreign_exchange(Exchange ex) noexcept {
-    return ex == Exchange::Bybit;
+    return ex == Exchange::Bybit || ex == Exchange::OKX;
 }
 
 // Market type

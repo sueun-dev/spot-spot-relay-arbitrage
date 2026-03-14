@@ -5,6 +5,7 @@
 #include "kimp/exchange/exchange_base.hpp"
 #include "kimp/exchange/bithumb/bithumb.hpp"
 #include "kimp/exchange/bybit/bybit.hpp"
+#include "kimp/exchange/okx/okx.hpp"
 #include "kimp/execution/lifecycle_executor.hpp"
 #include "kimp/strategy/arbitrage_engine.hpp"
 
@@ -42,6 +43,7 @@ public:
     using ExchangePtr = std::shared_ptr<exchange::IExchange>;
     using KoreanExchangePtr = std::shared_ptr<exchange::KoreanExchangeBase>;
     using BybitExchangePtr = std::shared_ptr<exchange::bybit::BybitExchange>;
+    using OkxExchangePtr = std::shared_ptr<exchange::okx::OkxExchange>;
 
     OrderManager();
 
@@ -69,6 +71,7 @@ private:
     std::array<ExchangePtr, static_cast<size_t>(Exchange::Count)> exchanges_{};
     std::shared_ptr<exchange::bithumb::BithumbExchange> bithumb_exchange_;
     std::shared_ptr<exchange::bybit::BybitExchange> bybit_exchange_;
+    std::shared_ptr<exchange::okx::OkxExchange> okx_exchange_;
 
     // Strategy engine for position tracking
     strategy::ArbitrageEngine* engine_{nullptr};
@@ -97,8 +100,9 @@ public:
     // 2. SELL on Bithumb (same amount)
     ExecutionResult execute_spot_relay_exit(const ExitSignal& signal, const Position& position);
 
-    // Prepare Bybit spot margin account before live trading
+    // Prepare foreign spot margin accounts before live trading
     bool prepare_bybit_shorting(const std::vector<SymbolId>& symbols);
+    bool prepare_okx_shorting(const std::vector<SymbolId>& symbols);
 
     // Request graceful shutdown of any running adaptive loops
     void request_shutdown() { running_.store(false, std::memory_order_release); }
@@ -134,6 +138,8 @@ private:
     // Get typed exchange
     KoreanExchangePtr get_korean_exchange(Exchange ex);
     BybitExchangePtr get_bybit_exchange();
+    OkxExchangePtr get_okx_exchange();
+    std::shared_ptr<exchange::ForeignShortExchangeBase> get_foreign_exchange(Exchange ex);
 
     // Single order execution helpers
     Order execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount);

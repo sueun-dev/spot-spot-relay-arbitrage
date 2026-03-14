@@ -298,6 +298,8 @@ void OrderManager::set_exchange(Exchange ex, ExchangePtr exchange) {
         bithumb_exchange_ = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(exchange);
     } else if (ex == Exchange::Bybit) {
         bybit_exchange_ = std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(exchange);
+    } else if (ex == Exchange::OKX) {
+        okx_exchange_ = std::dynamic_pointer_cast<exchange::okx::OkxExchange>(exchange);
     }
 }
 
@@ -310,6 +312,15 @@ OrderManager::KoreanExchangePtr OrderManager::get_korean_exchange(Exchange ex) {
 
 OrderManager::BybitExchangePtr OrderManager::get_bybit_exchange() {
     return bybit_exchange_;
+}
+
+OrderManager::OkxExchangePtr OrderManager::get_okx_exchange() {
+    return okx_exchange_;
+}
+
+std::shared_ptr<exchange::ForeignShortExchangeBase> OrderManager::get_foreign_exchange(Exchange ex) {
+    if (ex == Exchange::OKX) return okx_exchange_;
+    return bybit_exchange_;  // Default to Bybit
 }
 
 ExecutionResult OrderManager::execute_spot_relay_entry(
@@ -1557,6 +1568,30 @@ bool OrderManager::prepare_bybit_shorting(const std::vector<SymbolId>& symbols) 
     return ready;
 }
 
+bool OrderManager::prepare_okx_shorting(const std::vector<SymbolId>& symbols) {
+    auto okx = get_okx_exchange();
+    if (!okx) {
+        Logger::warn("OKX preparation skipped: exchange not available");
+        return false;
+    }
+
+    std::optional<SymbolId> sample_symbol;
+    if (!symbols.empty()) {
+        sample_symbol = SymbolId(symbols.front().get_base(), "USDT");
+    }
+    if (!sample_symbol) {
+        sample_symbol = SymbolId("BTC", "USDT");
+    }
+
+    const bool ready = okx->prepare_shorting(*sample_symbol);
+    if (ready) {
+        Logger::info("Prepared OKX spot-margin shorting for {} symbols", symbols.size());
+    } else {
+        Logger::error("Failed to prepare OKX spot-margin shorting");
+    }
+    return ready;
+}
+
 Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount) {
     auto korean_ex = get_korean_exchange(ex);
     if (!korean_ex) {
@@ -1574,8 +1609,8 @@ Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, doub
     return korean_ex->place_market_buy_cost(symbol, krw_amount);
 }
 
-Order OrderManager::execute_foreign_short(Exchange /*ex*/, const SymbolId& symbol, double quantity) {
-    auto short_ex = get_bybit_exchange();
+Order OrderManager::execute_foreign_short(Exchange ex, const SymbolId& symbol, double quantity) {
+    auto short_ex = get_foreign_exchange(ex);
     if (!short_ex) {
         Order order;
         order.status = OrderStatus::Rejected;
@@ -1596,8 +1631,8 @@ Order OrderManager::execute_korean_sell(Exchange ex, const SymbolId& symbol, dou
     return korean_ex->place_market_order(symbol, Side::Sell, quantity);
 }
 
-Order OrderManager::execute_foreign_cover(Exchange /*ex*/, const SymbolId& symbol, double quantity) {
-    auto short_ex = get_bybit_exchange();
+Order OrderManager::execute_foreign_cover(Exchange ex, const SymbolId& symbol, double quantity) {
+    auto short_ex = get_foreign_exchange(ex);
     if (!short_ex) {
         Order order;
         order.status = OrderStatus::Rejected;
@@ -1611,6 +1646,8 @@ void OrderManager::query_foreign_fill(Exchange ex, Order& order) {
     if (order.order_id_str.empty() || order.status != OrderStatus::Filled) return;
     if (ex == Exchange::Bybit && bybit_exchange_) {
         bybit_exchange_->query_order_fill(order.order_id_str, order);
+    } else if (ex == Exchange::OKX && okx_exchange_) {
+        okx_exchange_->query_order_fill(order.order_id_str, order.symbol, order);
     }
 }
 

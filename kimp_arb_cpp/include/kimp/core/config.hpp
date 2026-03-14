@@ -11,6 +11,7 @@ namespace kimp {
 struct ExchangeCredentials {
     std::string api_key;
     std::string secret_key;
+    std::string passphrase;             // OKX requires passphrase for authentication
     std::string ws_endpoint;
     std::string ws_private_endpoint;
     std::string ws_trade_endpoint;
@@ -82,6 +83,11 @@ constexpr const char* BYBIT_WS_PUBLIC = "wss://stream.bybit.com/v5/public/spot";
 constexpr const char* BYBIT_WS_PRIVATE = "wss://stream.bybit.com/v5/private";
 constexpr const char* BYBIT_WS_TRADE = "wss://stream.bybit.com/v5/trade";
 constexpr const char* BYBIT_REST = "https://api.bybit.com";
+
+// OKX
+constexpr const char* OKX_WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public";
+constexpr const char* OKX_WS_PRIVATE = "wss://ws.okx.com:8443/ws/v5/private";
+constexpr const char* OKX_REST = "https://www.okx.com";
 
 } // namespace endpoints
 

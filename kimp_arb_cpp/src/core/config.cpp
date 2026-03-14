@@ -57,6 +57,7 @@ RuntimeConfig ConfigLoader::load(const std::string& path) {
                 if (e["rest_endpoint"]) creds.rest_endpoint = e["rest_endpoint"].as<std::string>();
                 if (e["api_key"]) creds.api_key = expand_env_vars(e["api_key"].as<std::string>());
                 if (e["secret_key"]) creds.secret_key = expand_env_vars(e["secret_key"].as<std::string>());
+                if (e["passphrase"]) creds.passphrase = expand_env_vars(e["passphrase"].as<std::string>());
 
                 config.exchanges[ex] = std::move(creds);
             }
@@ -64,6 +65,7 @@ RuntimeConfig ConfigLoader::load(const std::string& path) {
 
         load_exchange("bithumb", Exchange::Bithumb);
         load_exchange("bybit", Exchange::Bybit);
+        load_exchange("okx", Exchange::OKX);
         // Threading config
         if (yaml["threading"]) {
             auto th = yaml["threading"];
@@ -106,6 +108,7 @@ RuntimeConfig ConfigLoader::load_from_env() {
     config.exchanges[Exchange::Bithumb] = {
         get_env("BITHUMB_API_KEY"),
         get_env("BITHUMB_SECRET_KEY"),
+        "",  // passphrase
         endpoints::BITHUMB_WS,
         "",
         "",
@@ -116,10 +119,22 @@ RuntimeConfig ConfigLoader::load_from_env() {
     config.exchanges[Exchange::Bybit] = {
         get_env("BYBIT_API_KEY"),
         get_env("BYBIT_SECRET_KEY"),
+        "",  // passphrase
         endpoints::BYBIT_WS_PUBLIC,
         endpoints::BYBIT_WS_PRIVATE,
         endpoints::BYBIT_WS_TRADE,
         endpoints::BYBIT_REST,
+        true
+    };
+
+    config.exchanges[Exchange::OKX] = {
+        get_env("OKX_API_KEY"),
+        get_env("OKX_SECRET_KEY"),
+        get_env("OKX_PASSPHRASE"),
+        endpoints::OKX_WS_PUBLIC,
+        endpoints::OKX_WS_PRIVATE,
+        "",  // ws_trade_endpoint (OKX uses private WS for trades)
+        endpoints::OKX_REST,
         true
     };
 
@@ -131,10 +146,13 @@ RuntimeConfig ConfigLoader::get_default() {
 
     // Default exchange endpoints
     config.exchanges[Exchange::Bithumb] = {
-        "", "", endpoints::BITHUMB_WS, "", "", endpoints::BITHUMB_REST, false
+        "", "", "", endpoints::BITHUMB_WS, "", "", endpoints::BITHUMB_REST, false
     };
     config.exchanges[Exchange::Bybit] = {
-        "", "", endpoints::BYBIT_WS_PUBLIC, endpoints::BYBIT_WS_PRIVATE, endpoints::BYBIT_WS_TRADE, endpoints::BYBIT_REST, false
+        "", "", "", endpoints::BYBIT_WS_PUBLIC, endpoints::BYBIT_WS_PRIVATE, endpoints::BYBIT_WS_TRADE, endpoints::BYBIT_REST, false
+    };
+    config.exchanges[Exchange::OKX] = {
+        "", "", "", endpoints::OKX_WS_PUBLIC, endpoints::OKX_WS_PRIVATE, "", endpoints::OKX_REST, false
     };
     return config;
 }

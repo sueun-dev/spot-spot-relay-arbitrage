@@ -570,6 +570,7 @@ public:
         uint64_t age_ms{0};
         bool entry_signal{false};
         bool exit_signal{false};
+        Exchange best_foreign_exchange{Exchange::Bybit};
     };
 
     ArbitrageEngine() = default;
@@ -682,6 +683,7 @@ private:
         std::atomic<double> net_profit_krw{0.0};
         std::atomic<double> usdt_rate{0.0};
         std::atomic<bool> both_can_fill_target{false};
+        std::atomic<uint8_t> best_foreign_exchange{0}; // Exchange enum of best foreign venue
         std::atomic<bool> qualified{false};         // All entry filters passed
         std::atomic<bool> signal_fired{false};      // Dedup: reset when disqualified
     };

@@ -7,6 +7,7 @@
 #include "kimp/core/simd_premium.hpp"
 #include "kimp/exchange/bithumb/bithumb.hpp"
 #include "kimp/exchange/bybit/bybit.hpp"
+#include "kimp/exchange/okx/okx.hpp"
 #include "kimp/strategy/arbitrage_engine.hpp"
 #include "kimp/strategy/spot_relay_scanner.hpp"
 #include "kimp/execution/lifecycle_executor.hpp"
@@ -404,6 +405,34 @@ std::optional<kimp::RuntimeConfig> load_config(const std::string& path,
         if (!load_exchange("bithumb", kimp::Exchange::Bithumb)) return std::nullopt;
         if (!load_exchange("bybit", kimp::Exchange::Bybit)) return std::nullopt;
 
+        // OKX is optional — load if present in config, skip silently if not
+        if (yaml["exchanges"]["okx"]) {
+            auto okx_node = yaml["exchanges"]["okx"];
+            kimp::ExchangeCredentials okx_creds;
+            okx_creds.enabled = okx_node["enabled"] ? okx_node["enabled"].as<bool>() : true;
+
+            if (okx_creds.enabled) {
+                if (okx_node["ws_endpoint"]) okx_creds.ws_endpoint = okx_node["ws_endpoint"].as<std::string>();
+                if (okx_node["ws_private_endpoint"]) okx_creds.ws_private_endpoint = okx_node["ws_private_endpoint"].as<std::string>();
+                if (okx_node["ws_trade_endpoint"]) okx_creds.ws_trade_endpoint = okx_node["ws_trade_endpoint"].as<std::string>();
+                if (okx_node["rest_endpoint"]) okx_creds.rest_endpoint = okx_node["rest_endpoint"].as<std::string>();
+                if (okx_node["api_key"]) okx_creds.api_key = expand_env(okx_node["api_key"].as<std::string>());
+                if (okx_node["secret_key"]) okx_creds.secret_key = expand_env(okx_node["secret_key"].as<std::string>());
+                if (okx_node["passphrase"]) okx_creds.passphrase = expand_env(okx_node["passphrase"].as<std::string>());
+
+                if (!require_private_keys ||
+                    (!okx_creds.api_key.empty() && !okx_creds.secret_key.empty() && !okx_creds.passphrase.empty())) {
+                    config.exchanges[kimp::Exchange::OKX] = std::move(okx_creds);
+                } else {
+                    std::cerr << "OKX credentials incomplete (api_key, secret_key, passphrase required). Skipping OKX." << std::endl;
+                    okx_creds.enabled = false;
+                    config.exchanges[kimp::Exchange::OKX] = std::move(okx_creds);
+                }
+            } else {
+                config.exchanges[kimp::Exchange::OKX] = std::move(okx_creds);
+            }
+        }
+
     } catch (const YAML::Exception& e) {
         std::cerr << "Failed to parse config '" << path << "': "
                   << e.what() << std::endl;
@@ -587,8 +616,8 @@ int main(int argc, char* argv[]) {
     net::io_context io_context;
     auto work_guard = net::make_work_guard(io_context);
 
-    // Create exchanges (Bithumb: Korean spot, Bybit: spot margin short venue)
-    // load_config guarantees both entries exist; check enabled flag only
+    // Create exchanges (Bithumb: Korean spot, Bybit + OKX: spot margin short venues)
+    // load_config guarantees Bithumb + Bybit entries exist; check enabled flag only
     auto& bithumb_creds = config.exchanges[kimp::Exchange::Bithumb];
     auto& bybit_creds = config.exchanges[kimp::Exchange::Bybit];
 
@@ -602,17 +631,39 @@ int main(int argc, char* argv[]) {
     auto bybit = std::make_shared<kimp::exchange::bybit::BybitExchange>(
         io_context, std::move(bybit_creds));
 
+    // OKX: optional foreign exchange (enabled only when credentials are configured)
+    std::shared_ptr<kimp::exchange::okx::OkxExchange> okx;
+    bool okx_enabled = false;
+    {
+        auto it = config.exchanges.find(kimp::Exchange::OKX);
+        if (it != config.exchanges.end() && it->second.enabled) {
+            okx = std::make_shared<kimp::exchange::okx::OkxExchange>(
+                io_context, std::move(it->second));
+            okx_enabled = true;
+            spdlog::info("OKX exchange enabled as additional foreign venue");
+        } else {
+            spdlog::info("OKX exchange not configured or disabled — running with Bybit only");
+        }
+    }
+
     // Strategy engine
     kimp::strategy::ArbitrageEngine engine;
     engine.set_exchange(kimp::Exchange::Bithumb, bithumb);
     engine.set_exchange(kimp::Exchange::Bybit, bybit);
     engine.add_exchange_pair(kimp::Exchange::Bithumb, kimp::Exchange::Bybit);
+    if (okx_enabled) {
+        engine.set_exchange(kimp::Exchange::OKX, okx);
+        engine.add_exchange_pair(kimp::Exchange::Bithumb, kimp::Exchange::OKX);
+    }
 
     // Order manager for auto-trading
     kimp::execution::OrderManager order_manager;
     order_manager.set_engine(&engine);
     order_manager.set_exchange(kimp::Exchange::Bithumb, bithumb);
     order_manager.set_exchange(kimp::Exchange::Bybit, bybit);
+    if (okx_enabled) {
+        order_manager.set_exchange(kimp::Exchange::OKX, okx);
+    }
 
     // Position persistence callback (crash recovery)
     order_manager.set_position_update_callback([](const kimp::Position* pos) {
@@ -786,18 +837,28 @@ int main(int argc, char* argv[]) {
     bybit->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
         engine.on_ticker_update(ticker);
     });
+    if (okx_enabled) {
+        okx->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
+            engine.on_ticker_update(ticker);
+        });
+    }
 
     // Connect
     spdlog::info("Connecting to exchanges...");
     bithumb->connect();
     bybit->connect();
+    if (okx_enabled) {
+        okx->connect();
+    }
 
     // Wait for connections (poll instead of fixed sleep, max 10 seconds)
     spdlog::info("Waiting for connections...");
     int wait_count = 0;
     while (!g_shutdown && wait_count < 50) {
-        if (bithumb->is_connected() && bybit->is_connected()) {
-            spdlog::info("Both exchanges connected");
+        bool all_connected = bithumb->is_connected() && bybit->is_connected();
+        if (okx_enabled) all_connected = all_connected && okx->is_connected();
+        if (all_connected) {
+            spdlog::info("All exchanges connected");
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -805,18 +866,41 @@ int main(int argc, char* argv[]) {
     }
 
     if (!bithumb->is_connected() || !bybit->is_connected()) {
-        spdlog::error("Failed to connect to exchanges");
+        spdlog::error("Failed to connect to required exchanges (Bithumb/Bybit)");
         bithumb->disconnect();
         bybit->disconnect();
+        if (okx_enabled) okx->disconnect();
         stop_io_threads();
         kimp::Logger::shutdown();
         return 1;
     }
+    if (okx_enabled && !okx->is_connected()) {
+        spdlog::warn("OKX connection failed — continuing with Bybit only");
+        okx_enabled = false;
+        okx.reset();
+    }
 
-    // Find common symbols using set intersection (O(n+m) instead of O(n*m))
+    // Find common symbols: Bithumb ∩ (Bybit ∪ OKX)
+    // A coin is tradeable if it's on Bithumb AND on at least one foreign exchange with margin short.
     auto bithumb_symbols = bithumb->get_available_symbols();
     auto bybit_symbols = bybit->get_available_symbols();
 
+    std::unordered_set<std::string> foreign_bases;
+    for (const auto& s : bybit_symbols) {
+        foreign_bases.insert(std::string(s.get_base()));
+    }
+
+    std::unordered_set<std::string> okx_bases;
+    if (okx_enabled) {
+        auto okx_symbols = okx->get_available_symbols();
+        for (const auto& s : okx_symbols) {
+            foreign_bases.insert(std::string(s.get_base()));
+            okx_bases.insert(std::string(s.get_base()));
+        }
+        spdlog::info("OKX margin-shortable symbols: {}", okx_bases.size());
+    }
+
+    // Also track which bases are Bybit-only for logging
     std::unordered_set<std::string> bybit_bases;
     for (const auto& s : bybit_symbols) {
         bybit_bases.insert(std::string(s.get_base()));
@@ -824,18 +908,31 @@ int main(int argc, char* argv[]) {
 
     std::vector<kimp::SymbolId> common_symbols;
     for (const auto& s : bithumb_symbols) {
-        if (bybit_bases.count(std::string(s.get_base()))) {
+        if (foreign_bases.count(std::string(s.get_base()))) {
             common_symbols.emplace_back(std::string(s.get_base()), "KRW");
             engine.add_symbol(common_symbols.back());
         }
     }
 
-    spdlog::info("Found {} common symbols", common_symbols.size());
+    spdlog::info("Found {} common symbols (Bithumb ∩ (Bybit ∪ OKX))", common_symbols.size());
+    if (okx_enabled) {
+        size_t bybit_only = 0, okx_only = 0, both_foreign = 0;
+        for (const auto& s : common_symbols) {
+            std::string base(s.get_base());
+            bool on_bybit = bybit_bases.count(base) > 0;
+            bool on_okx = okx_bases.count(base) > 0;
+            if (on_bybit && on_okx) ++both_foreign;
+            else if (on_bybit) ++bybit_only;
+            else if (on_okx) ++okx_only;
+        }
+        spdlog::info("  Bybit-only: {}, OKX-only: {}, Both: {}", bybit_only, okx_only, both_foreign);
+    }
 
     if (common_symbols.empty()) {
-        spdlog::error("No common symbols found between Bithumb and Bybit");
+        spdlog::error("No common symbols found between Bithumb and foreign exchanges");
         bithumb->disconnect();
         bybit->disconnect();
+        if (okx_enabled) okx->disconnect();
         stop_io_threads();
         kimp::Logger::shutdown();
         return 1;
@@ -853,9 +950,18 @@ int main(int argc, char* argv[]) {
             spdlog::error("Bybit spot margin setup failed");
             bithumb->disconnect();
             bybit->disconnect();
+            if (okx_enabled) okx->disconnect();
             stop_io_threads();
             kimp::Logger::shutdown();
             return 1;
+        }
+
+        // Prepare OKX spot margin account (optional — non-fatal if it fails)
+        if (okx_enabled) {
+            if (!order_manager.prepare_okx_shorting(common_symbols)) {
+                spdlog::warn("OKX spot margin setup failed — OKX will not be used for entries");
+                // Don't disable OKX entirely: it can still provide price comparison
+            }
         }
 
         // Build external position blacklist (prevents trading coins with existing manual positions)
@@ -968,10 +1074,25 @@ int main(int argc, char* argv[]) {
 
     std::vector<kimp::SymbolId> bybit_subs;
     for (const auto& s : common_symbols) {
-        bybit_subs.emplace_back(std::string(s.get_base()), "USDT");
+        std::string base(s.get_base());
+        if (bybit_bases.count(base)) {
+            bybit_subs.emplace_back(base, "USDT");
+        }
     }
     bybit->subscribe_orderbook(bybit_subs);
     spdlog::info("Subscribed to {} Bybit spot symbols (orderbook-only BBO path)", bybit_subs.size());
+
+    if (okx_enabled) {
+        std::vector<kimp::SymbolId> okx_subs;
+        for (const auto& s : common_symbols) {
+            std::string base(s.get_base());
+            if (okx_bases.count(base)) {
+                okx_subs.emplace_back(base, "USDT");
+            }
+        }
+        okx->subscribe_orderbook(okx_subs);
+        spdlog::info("Subscribed to {} OKX spot symbols (bbo-tbt 10ms path)", okx_subs.size());
+    }
 
     // =========================================================================
     // STEP 13: Warm-up
@@ -979,7 +1100,7 @@ int main(int argc, char* argv[]) {
     // =========================================================================
     spdlog::info("Market data path: WebSocket-only after startup subscriptions");
 
-    std::thread warmup_thread([&engine, common_symbols]() {
+    std::thread warmup_thread([&engine, common_symbols, okx_enabled]() {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         if (g_shutdown) {
             return;
@@ -987,11 +1108,12 @@ int main(int argc, char* argv[]) {
 
         size_t bithumb_ready = 0;
         size_t bybit_ready = 0;
-        size_t both_ready = 0;
+        size_t okx_ready = 0;
+        size_t any_foreign_ready = 0;
         std::vector<std::string> missing_bithumb;
-        std::vector<std::string> missing_bybit;
+        std::vector<std::string> missing_foreign;
         missing_bithumb.reserve(5);
-        missing_bybit.reserve(5);
+        missing_foreign.reserve(5);
         auto join_samples = [](const std::vector<std::string>& samples) {
             std::string joined;
             for (size_t i = 0; i < samples.size(); ++i) {
@@ -1005,11 +1127,17 @@ int main(int argc, char* argv[]) {
 
         for (const auto& symbol : common_symbols) {
             const auto korean_price = engine.get_price_cache().get_price(kimp::Exchange::Bithumb, symbol);
-            const kimp::SymbolId bybit_symbol(symbol.get_base(), "USDT");
-            const auto foreign_price = engine.get_price_cache().get_price(kimp::Exchange::Bybit, bybit_symbol);
+            const kimp::SymbolId foreign_symbol(symbol.get_base(), "USDT");
+            const auto bybit_price = engine.get_price_cache().get_price(kimp::Exchange::Bybit, foreign_symbol);
 
             const bool korean_ok = korean_price.valid && korean_price.ask > 0.0;
-            const bool foreign_ok = foreign_price.valid && foreign_price.bid > 0.0;
+            const bool bybit_ok = bybit_price.valid && bybit_price.bid > 0.0;
+            bool okx_ok = false;
+            if (okx_enabled) {
+                const auto okx_price = engine.get_price_cache().get_price(kimp::Exchange::OKX, foreign_symbol);
+                okx_ok = okx_price.valid && okx_price.bid > 0.0;
+                if (okx_ok) ++okx_ready;
+            }
 
             if (korean_ok) {
                 ++bithumb_ready;
@@ -1017,29 +1145,35 @@ int main(int argc, char* argv[]) {
                 missing_bithumb.push_back(symbol.to_string());
             }
 
-            if (foreign_ok) {
-                ++bybit_ready;
-            } else if (missing_bybit.size() < 5) {
-                missing_bybit.push_back(bybit_symbol.to_string());
-            }
-
-            if (korean_ok && foreign_ok) {
-                ++both_ready;
+            if (bybit_ok) ++bybit_ready;
+            if (bybit_ok || okx_ok) {
+                ++any_foreign_ready;
+            } else if (missing_foreign.size() < 5) {
+                missing_foreign.push_back(foreign_symbol.to_string());
             }
         }
 
         const double usdt_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Bithumb);
-        spdlog::info("[MarketData] 5s snapshot: bithumb {}/{} | bybit {}/{} | both {}/{} | usdt {:.2f} | cache entries {}",
-                     bithumb_ready, common_symbols.size(),
-                     bybit_ready, common_symbols.size(),
-                     both_ready, common_symbols.size(),
-                     usdt_rate,
-                     engine.get_price_cache().size());
+        if (okx_enabled) {
+            spdlog::info("[MarketData] 5s snapshot: bithumb {}/{} | bybit {}/{} | okx {}/{} | any_foreign {}/{} | usdt {:.2f} | cache {}",
+                         bithumb_ready, common_symbols.size(),
+                         bybit_ready, common_symbols.size(),
+                         okx_ready, common_symbols.size(),
+                         any_foreign_ready, common_symbols.size(),
+                         usdt_rate,
+                         engine.get_price_cache().size());
+        } else {
+            spdlog::info("[MarketData] 5s snapshot: bithumb {}/{} | bybit {}/{} | usdt {:.2f} | cache {}",
+                         bithumb_ready, common_symbols.size(),
+                         bybit_ready, common_symbols.size(),
+                         usdt_rate,
+                         engine.get_price_cache().size());
+        }
 
-        if (bithumb_ready != common_symbols.size() || bybit_ready != common_symbols.size() || usdt_rate <= 0.0) {
-            spdlog::warn("[MarketData] sample missing bithumb=[{}] bybit=[{}]",
+        if (bithumb_ready != common_symbols.size() || any_foreign_ready != common_symbols.size() || usdt_rate <= 0.0) {
+            spdlog::warn("[MarketData] sample missing bithumb=[{}] foreign=[{}]",
                          join_samples(missing_bithumb),
-                         join_samples(missing_bybit));
+                         join_samples(missing_foreign));
         }
     });
 
@@ -1102,64 +1236,89 @@ int main(int argc, char* argv[]) {
                     std::cout << fmt::format("\n복구 스캔 시작: Bybit 숏 {}개 코인 확인\n", bybit_short_by_coin.size());
                 }
 
-                for (const auto& [coin, bybit_pos] : bybit_short_by_coin) {
-                    kimp::SymbolId krw_symbol(coin, "KRW");
-                    kimp::SymbolId usdt_symbol(coin, "USDT");
+                // Helper: scan short positions from a foreign exchange and add recovery candidates
+                auto scan_foreign_shorts = [&](const std::unordered_map<std::string, kimp::Position>& short_by_coin,
+                                               kimp::Exchange foreign_ex) {
+                    for (const auto& [coin, short_pos] : short_by_coin) {
+                        kimp::SymbolId krw_symbol(coin, "KRW");
+                        kimp::SymbolId usdt_symbol(coin, "USDT");
 
-                    double spot_balance = bithumb->get_balance(coin);
-                    double short_amount = bybit_pos.foreign_amount;
-                    if (spot_balance <= 0.0001 || short_amount <= 0.0001) continue;
+                        double spot_balance = bithumb->get_balance(coin);
+                        double short_amount = short_pos.foreign_amount;
+                        if (spot_balance <= 0.0001 || short_amount <= 0.0001) continue;
 
-                    double amount = std::min(spot_balance, short_amount);
+                        double amount = std::min(spot_balance, short_amount);
 
-                    auto korean_price = engine.get_price_cache().get_price(
-                        kimp::Exchange::Bithumb, krw_symbol);
-                    double korean_entry = 0.0;
-                    if (korean_price.valid) {
-                        if (korean_price.ask > 0) korean_entry = korean_price.ask;
-                        else if (korean_price.last > 0) korean_entry = korean_price.last;
+                        auto korean_price = engine.get_price_cache().get_price(
+                            kimp::Exchange::Bithumb, krw_symbol);
+                        double korean_entry = 0.0;
+                        if (korean_price.valid) {
+                            if (korean_price.ask > 0) korean_entry = korean_price.ask;
+                            else if (korean_price.last > 0) korean_entry = korean_price.last;
+                        }
+
+                        auto foreign_price = engine.get_price_cache().get_price(foreign_ex, usdt_symbol);
+                        double foreign_fallback = 0.0;
+                        if (foreign_price.valid) {
+                            if (foreign_price.bid > 0) foreign_fallback = foreign_price.bid;
+                            else if (foreign_price.last > 0) foreign_fallback = foreign_price.last;
+                        }
+                        double effective_foreign_entry =
+                            (short_pos.foreign_entry_price > 0.0) ? short_pos.foreign_entry_price : foreign_fallback;
+
+                        double usdt_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Bithumb);
+                        double recovered_entry_pm = 0.0;
+                        if (korean_entry > 0.0 && effective_foreign_entry > 0.0 && usdt_rate > 0.0) {
+                            double foreign_krw = effective_foreign_entry * usdt_rate;
+                            recovered_entry_pm = ((korean_entry - foreign_krw) / foreign_krw) * 100.0;
+                        }
+
+                        kimp::Position pos;
+                        pos.symbol = krw_symbol;
+                        pos.korean_exchange = kimp::Exchange::Bithumb;
+                        pos.foreign_exchange = foreign_ex;
+                        pos.entry_time = std::chrono::system_clock::now();
+                        pos.entry_premium = recovered_entry_pm;
+                        pos.position_size_usd = amount * (effective_foreign_entry > 0.0 ? effective_foreign_entry : 0.0);
+                        pos.korean_amount = amount;
+                        pos.foreign_amount = amount;
+                        pos.korean_entry_price = korean_entry;
+                        pos.foreign_entry_price = effective_foreign_entry;
+                        pos.is_active = true;
+
+                        RecoveryCandidate c;
+                        c.pos = pos;
+                        c.spot_balance = spot_balance;
+                        c.short_amount = short_amount;
+                        c.matched_amount = amount;
+                        c.matched_usd = pos.position_size_usd;
+                        if (c.matched_usd <= 0.0 && foreign_fallback > 0.0) {
+                            c.matched_usd = amount * foreign_fallback;
+                        }
+                        candidates.push_back(c);
                     }
+                };
 
-                    auto foreign_price = engine.get_price_cache().get_price(
-                        kimp::Exchange::Bybit, usdt_symbol);
-                    double foreign_fallback = 0.0;
-                    if (foreign_price.valid) {
-                        if (foreign_price.bid > 0) foreign_fallback = foreign_price.bid;
-                        else if (foreign_price.last > 0) foreign_fallback = foreign_price.last;
+                scan_foreign_shorts(bybit_short_by_coin, kimp::Exchange::Bybit);
+
+                // Also scan OKX short positions
+                if (okx_enabled) {
+                    std::unordered_map<std::string, kimp::Position> okx_short_by_coin;
+                    auto okx_positions = okx->get_short_positions();
+                    for (const auto& p : okx_positions) {
+                        std::string coin = std::string(p.symbol.get_base());
+                        if (coin.empty()) continue;
+                        if (!common_bases.count(coin)) continue;
+                        if (p.foreign_amount <= 0.0001) continue;
+                        auto it = okx_short_by_coin.find(coin);
+                        if (it == okx_short_by_coin.end() || p.foreign_amount > it->second.foreign_amount) {
+                            okx_short_by_coin[coin] = p;
+                        }
                     }
-                    double effective_foreign_entry =
-                        (bybit_pos.foreign_entry_price > 0.0) ? bybit_pos.foreign_entry_price : foreign_fallback;
-
-                    double usdt_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Bithumb);
-                    double recovered_entry_pm = 0.0;
-                    if (korean_entry > 0.0 && effective_foreign_entry > 0.0 && usdt_rate > 0.0) {
-                        double foreign_krw = effective_foreign_entry * usdt_rate;
-                        recovered_entry_pm = ((korean_entry - foreign_krw) / foreign_krw) * 100.0;
+                    if (!okx_short_by_coin.empty()) {
+                        std::cout << fmt::format("OKX 숏 {}개 코인 확인\n", okx_short_by_coin.size());
                     }
-
-                    kimp::Position pos;
-                    pos.symbol = krw_symbol;
-                    pos.korean_exchange = kimp::Exchange::Bithumb;
-                    pos.foreign_exchange = kimp::Exchange::Bybit;
-                    pos.entry_time = std::chrono::system_clock::now();
-                    pos.entry_premium = recovered_entry_pm;
-                    pos.position_size_usd = amount * (effective_foreign_entry > 0.0 ? effective_foreign_entry : 0.0);
-                    pos.korean_amount = amount;
-                    pos.foreign_amount = amount;
-                    pos.korean_entry_price = korean_entry;
-                    pos.foreign_entry_price = effective_foreign_entry;
-                    pos.is_active = true;
-
-                    RecoveryCandidate c;
-                    c.pos = pos;
-                    c.spot_balance = spot_balance;
-                    c.short_amount = short_amount;
-                    c.matched_amount = amount;
-                    c.matched_usd = pos.position_size_usd;
-                    if (c.matched_usd <= 0.0 && foreign_fallback > 0.0) {
-                        c.matched_usd = amount * foreign_fallback;
-                    }
-                    candidates.push_back(c);
+                    scan_foreign_shorts(okx_short_by_coin, kimp::Exchange::OKX);
                 }
 
                 // Include saved position as fallback candidate if it wasn't discovered via live scan.
@@ -1424,10 +1583,10 @@ int main(int argc, char* argv[]) {
                         "Columns: NetKRW {:.0f}원 이상 코인만 표시 | 실제 진입 가능 여부는 Age/1Tick 의 YES/NO 로 확인\n",
                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
                     std::cout << fmt::format(
-                        "{:<10} {:>14} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12}\n",
-                        "Symbol", "B_ask", "B_qty", "B_KRW", "By_bid", "By_qty", "MatchQty",
-                        "Gross%", "Net%", "BFeeKRW", "ByFeeU", "NetKRW", "Age/1Tick");
-                    std::cout << std::string(180, '-') << "\n";
+                        "{:<10} {:<3} {:>14} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12}\n",
+                        "Symbol", "Exh", "B_ask", "B_qty", "B_KRW", "F_bid", "F_qty", "MatchQty",
+                        "Gross%", "Net%", "BFeeKRW", "FFeeU", "NetKRW", "Age/1Tick");
+                    std::cout << std::string(190, '-') << "\n";
 
                     if (visible_premiums.empty()) {
                         std::cout << fmt::format("현재 NetKRW {:.0f}원 이상 코인이 없습니다.\n",
@@ -1437,9 +1596,11 @@ int main(int argc, char* argv[]) {
                     for (const auto& p : visible_premiums) {
                         const char* one_tick = p.both_can_fill_target ? "YES" : "NO";
                         const std::string korean_ask = kimp::format::format_decimal_trimmed(p.korean_ask);
+                        const char* venue = (p.best_foreign_exchange == kimp::Exchange::OKX) ? "Ok" : "By";
                         std::cout << fmt::format(
-                            "{:<10} {:>14} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>11.2f} {:>12}\n",
+                            "{:<10} {:<3} {:>14} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>11.2f} {:>12}\n",
                             p.symbol.get_base(),
+                            venue,
                             korean_ask, p.korean_ask_qty,
                             p.bithumb_top_krw,
                             p.foreign_bid, p.foreign_bid_qty,
@@ -1451,7 +1612,7 @@ int main(int argc, char* argv[]) {
                             fmt::format("{}ms/{}", p.age_ms, one_tick));
                     }
 
-                    std::cout << std::string(180, '-') << "\n";
+                    std::cout << std::string(190, '-') << "\n";
 
                     auto enterable_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
                         return kimp::TradingConfig::entry_gate_passes(
@@ -1463,17 +1624,34 @@ int main(int argc, char* argv[]) {
                     const auto bithumb_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
                         return p.korean_ask_qty > 0.0;
                     });
-                    const auto bybit_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
+                    const auto foreign_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
                         return p.foreign_bid_qty > 0.0;
                     });
                     const auto both_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
                         return p.korean_ask_qty > 0.0 && p.foreign_bid_qty > 0.0;
                     });
+                    // Count per foreign exchange
+                    size_t bybit_winning = 0, okx_winning = 0;
+                    for (const auto& p : premiums) {
+                        if (p.foreign_bid_qty > 0.0) {
+                            if (p.best_foreign_exchange == kimp::Exchange::OKX) ++okx_winning;
+                            else ++bybit_winning;
+                        }
+                    }
+                    std::string foreign_detail;
+                    if (okx_winning > 0) {
+                        foreign_detail = fmt::format("foreign {}/{} (By:{} Ok:{}) | both {}/{}",
+                            foreign_ready, premiums.size(), bybit_winning, okx_winning,
+                            both_ready, premiums.size());
+                    } else {
+                        foreign_detail = fmt::format("bybit {}/{} | both {}/{}",
+                            foreign_ready, premiums.size(),
+                            both_ready, premiums.size());
+                    }
                     std::cout << fmt::format(
-                        "ready: bithumb {}/{} | bybit {}/{} | both {}/{} | net>={:.0f} {} | enterable {} | fee model: 빗썸 {}회 + 바이비트 {}회\n",
+                        "ready: bithumb {}/{} | {} | net>={:.0f} {} | enterable {} | fee: 빗썸 {}회 + 해외 {}회\n",
                         bithumb_ready, premiums.size(),
-                        bybit_ready, premiums.size(),
-                        both_ready, premiums.size(),
+                        foreign_detail,
                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
                         visible_premiums.size(),
                         enterable_count,
@@ -1537,6 +1715,7 @@ int main(int argc, char* argv[]) {
     engine.stop();
     bithumb->disconnect();
     bybit->disconnect();
+    if (okx) okx->disconnect();
 
     stop_io_threads();
 

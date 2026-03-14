@@ -29,6 +29,16 @@ exchanges:
     api_key: "${BYBIT_API_KEY}"
     secret_key: "${BYBIT_SECRET_KEY}"
 
+  okx:
+    enabled: true
+    ws_endpoint: "wss://ws.okx.com:8443/ws/v5/public"
+    ws_private_endpoint: "wss://ws.okx.com:8443/ws/v5/private"
+    ws_trade_endpoint: "wss://ws.okx.com:8443/ws/v5/private"
+    rest_endpoint: "https://www.okx.com"
+    api_key: "${OKX_API_KEY}"
+    secret_key: "${OKX_SECRET_KEY}"
+    passphrase: "${OKX_PASSPHRASE}"
+
 threading:
   io_threads: 4
   market_data_threads: 1
