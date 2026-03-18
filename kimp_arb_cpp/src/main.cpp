@@ -1802,7 +1802,7 @@ int main(int argc, char* argv[]) {
             spdlog::info("=== Bot Running (Auto-Trading ENABLED) ===");
             spdlog::info("Mode: relay gate (70 USDT, 1-tick only) | Max positions: {}",
                          kimp::TradingConfig::MAX_POSITIONS);
-            spdlog::info("Entry: positive net edge + projected NetKRW >= {:.0f} + both venues can fill {:.2f} USDT at top-of-book",
+            spdlog::info("Entry: negative EntryPM (KR ask < Foreign bid*FX) + projected NetKRW >= {:.0f} + both venues can fill {:.2f} USDT at top-of-book",
                          kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
                          kimp::TradingConfig::TARGET_ENTRY_USDT);
             spdlog::info("Entry fee model: Bithumb {}x + Bybit {}x = {:.2f}%",
@@ -1874,6 +1874,7 @@ int main(int argc, char* argv[]) {
                     visible_premiums.reserve(premiums.size());
                     for (const auto& p : premiums) {
                         const bool displayable =
+                            p.entry_premium < 0.0 &&
                             p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
                             kimp::TradingConfig::meets_entry_profit_floor(p.net_profit_krw);
                         if (displayable) {
@@ -1886,90 +1887,158 @@ int main(int argc, char* argv[]) {
                     } else if (::isatty(STDOUT_FILENO) == 1) {
                         std::cout << "\033[2J\033[H";
                     }
-                    std::cout << fmt::format("=== Spot Relay Monitor | enterable {} / tracked {} | 환율: {:.2f} KRW/USDT | target: {:.2f} USDT | every {}s ===\n",
+                    double bi_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Bithumb);
+                    double up_rate = engine.get_price_cache().get_usdt_krw(kimp::Exchange::Upbit);
+                    std::string rate_str;
+                    if (up_rate > 0.0) {
+                        rate_str = fmt::format("Bi:{:.2f} Up:{:.2f}", bi_rate, up_rate);
+                    } else {
+                        rate_str = fmt::format("{:.2f}", bi_rate);
+                    }
+                    std::cout << fmt::format("=== Spot Relay Monitor | negative-entry carry enterable {} / tracked {} | 환율: {} KRW/USDT | target: {:.2f} USDT | every {}s ===\n",
                         std::count_if(visible_premiums.begin(), visible_premiums.end(), [](const auto& p) {
-                            return p.both_can_fill_target && p.match_qty > 0.0;
+                            return p.entry_premium < 0.0 && p.both_can_fill_target && p.match_qty > 0.0;
                         }),
-                        premiums.size(), premiums[0].usdt_rate,
+                        premiums.size(), rate_str,
                         kimp::TradingConfig::TARGET_ENTRY_USDT, monitor_interval_sec);
                     std::cout << fmt::format(
-                        "Columns: NetKRW {:.0f}원 이상 코인만 표시 | 실제 진입 가능 여부는 Age/1Tick 의 YES/NO 로 확인\n",
+                        "Columns: EntryPM 음수 + NetKRW {:.0f}원 이상 코인만 표시 | 전략: KR 현물 매수 -> Foreign 현물숏/차후 릴레이\n",
                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
                     std::cout << fmt::format(
-                        "{:<10} {:<3} {:>14} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>11} {:>12}\n",
-                        "Symbol", "Exh", "B_ask", "B_qty", "B_KRW", "F_bid", "F_qty", "MatchQty",
-                        "Gross%", "Net%", "BFeeKRW", "FFeeU", "NetKRW", "Age/1Tick");
-                    std::cout << std::string(190, '-') << "\n";
+                        "{:<10} {:<6} {:>14} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>24} {:>11} {:>12}\n",
+                        "Symbol", "Pair", "K_ask", "K_qty", "K_KRW", "F_bid", "F_qty", "MatchQty",
+                        "EntryPM", "Net%", "KFeeKRW", "FFeeU", "Commission", "NetKRW", "Age/1Tick");
+                    std::cout << std::string(230, '-') << "\n";
 
                     if (visible_premiums.empty()) {
-                        std::cout << fmt::format("현재 NetKRW {:.0f}원 이상 코인이 없습니다.\n",
+                        std::cout << fmt::format("현재 EntryPM 음수이면서 NetKRW {:.0f}원 이상인 코인이 없습니다.\n",
                                                  kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
                     }
 
                     for (const auto& p : visible_premiums) {
                         const char* one_tick = p.both_can_fill_target ? "YES" : "NO";
                         const std::string korean_ask = kimp::format::format_decimal_trimmed(p.korean_ask);
-                        const char* venue = (p.best_foreign_exchange == kimp::Exchange::OKX) ? "Ok" : "By";
+                        const std::string commission = fmt::format(
+                            "{} / {:.0f}krw",
+                            kimp::format::format_decimal_trimmed(p.withdraw_fee_coins),
+                            p.withdraw_fee_krw);
+                        const char* k_venue = (p.best_korean_exchange == kimp::Exchange::Upbit) ? "Up" : "Bi";
+                        const char* f_venue = (p.best_foreign_exchange == kimp::Exchange::OKX) ? "Ok" : "By";
+                        std::string pair = fmt::format("{}-{}", k_venue, f_venue);
                         std::cout << fmt::format(
-                            "{:<10} {:<3} {:>14} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>11.2f} {:>12}\n",
+                            "{:<10} {:<6} {:>14} {:>12.6f} {:>12.0f} {:>12.6f} {:>12.6f} {:>12.6f} {:>10.4f}% {:>10.4f}% {:>11.2f} {:>11.4f} {:>24} {:>11.2f} {:>12}\n",
                             p.symbol.get_base(),
-                            venue,
+                            pair,
                             korean_ask, p.korean_ask_qty,
                             p.bithumb_top_krw,
                             p.foreign_bid, p.foreign_bid_qty,
                             p.match_qty,
-                            p.gross_edge_pct, p.net_edge_pct,
+                            p.entry_premium, p.net_edge_pct,
                             p.bithumb_total_fee_krw,
                             p.bybit_total_fee_usdt,
+                            commission,
                             p.net_profit_krw,
                             fmt::format("{}ms/{}", p.age_ms, one_tick));
                     }
 
-                    std::cout << std::string(190, '-') << "\n";
+                    std::cout << std::string(215, '-') << "\n";
+
+                    // ===== TOP 5 NEGATIVE-ENTRY CARRY CANDIDATES =====
+                    {
+                        // Surface the intended carry setup explicitly:
+                        // buy cheap on Korea, hedge/short rich on foreign, so EntryPM must be negative.
+                        std::vector<const kimp::strategy::ArbitrageEngine::PremiumInfo*> top_candidates;
+                        top_candidates.reserve(premiums.size());
+                        for (const auto& p : premiums) {
+                            if (p.korean_ask_qty > 0.0 &&
+                                p.foreign_bid_qty > 0.0 &&
+                                p.match_qty > 0.0 &&
+                                p.entry_premium < 0.0 &&
+                                p.net_profit_krw > 0.0) {
+                                top_candidates.push_back(&p);
+                            }
+                        }
+                        std::sort(top_candidates.begin(), top_candidates.end(),
+                            [](const auto* a, const auto* b) {
+                                if (a->net_profit_krw != b->net_profit_krw) {
+                                    return a->net_profit_krw > b->net_profit_krw;
+                                }
+                                return a->entry_premium < b->entry_premium;
+                            });
+                        size_t top_n = std::min<size_t>(top_candidates.size(), 5);
+
+                        std::cout << fmt::format("\n\033[1m=== Top {} Negative-Entry Carry Candidates (EntryPM < 0, NetKRW > 0) ===\033[0m\n", top_n);
+                        std::cout << fmt::format(
+                            "{:<10} {:<6} {:>14} {:>12} {:>12} {:>10} {:>10} {:>24} {:>11} {:>11}\n",
+                            "Symbol", "Pair", "K_ask", "F_bid", "MatchQty",
+                            "EntryPM", "Net%", "Commission", "NetKRW", "Age/1Tick");
+                        std::cout << std::string(136, '-') << "\n";
+                        for (size_t i = 0; i < top_n; ++i) {
+                            const auto& p = *top_candidates[i];
+                            const char* one_tick = p.both_can_fill_target ? "YES" : "NO";
+                            const std::string korean_ask = kimp::format::format_decimal_trimmed(p.korean_ask);
+                            const std::string commission = fmt::format(
+                                "{} / {:.0f}krw",
+                                kimp::format::format_decimal_trimmed(p.withdraw_fee_coins),
+                                p.withdraw_fee_krw);
+                            const char* k_venue = (p.best_korean_exchange == kimp::Exchange::Upbit) ? "Up" : "Bi";
+                            const char* f_venue = (p.best_foreign_exchange == kimp::Exchange::OKX) ? "Ok" : "By";
+                            std::string pair = fmt::format("{}-{}", k_venue, f_venue);
+                            std::cout << fmt::format(
+                                "{:<10} {:<6} {:>14} {:>12.6f} {:>12.6f} {:>9.4f}% {:>9.4f}% {:>24} {:>11.2f} {:>11}\n",
+                                p.symbol.get_base(),
+                                pair,
+                                korean_ask, p.foreign_bid, p.match_qty,
+                                p.entry_premium, p.net_edge_pct,
+                                commission,
+                                p.net_profit_krw,
+                                fmt::format("{}ms/{}", p.age_ms, one_tick));
+                        }
+                        if (top_n == 0) {
+                            std::cout << "EntryPM 음수이면서 NetKRW가 양수인 코인이 없습니다.\n";
+                        }
+                        std::cout << std::string(136, '-') << "\n";
+                    }
 
                     auto enterable_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
-                        return kimp::TradingConfig::entry_gate_passes(
+                        return p.entry_premium < 0.0 &&
+                            kimp::TradingConfig::entry_gate_passes(
                             p.both_can_fill_target,
                             p.match_qty,
                             p.net_edge_pct,
                             p.net_profit_krw);
                     });
-                    const auto bithumb_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
-                        return p.korean_ask_qty > 0.0;
-                    });
-                    const auto foreign_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
-                        return p.foreign_bid_qty > 0.0;
-                    });
-                    const auto both_ready = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
-                        return p.korean_ask_qty > 0.0 && p.foreign_bid_qty > 0.0;
-                    });
-                    // Count per foreign exchange
+                    // Count per Korean/foreign exchange winning
+                    size_t bithumb_winning = 0, upbit_winning = 0;
                     size_t bybit_winning = 0, okx_winning = 0;
+                    size_t korean_ready = 0, foreign_ready = 0, both_ready = 0;
                     for (const auto& p : premiums) {
-                        if (p.foreign_bid_qty > 0.0) {
+                        bool k_ok = p.korean_ask_qty > 0.0;
+                        bool f_ok = p.foreign_bid_qty > 0.0;
+                        if (k_ok) {
+                            ++korean_ready;
+                            if (p.best_korean_exchange == kimp::Exchange::Upbit) ++upbit_winning;
+                            else ++bithumb_winning;
+                        }
+                        if (f_ok) {
+                            ++foreign_ready;
                             if (p.best_foreign_exchange == kimp::Exchange::OKX) ++okx_winning;
                             else ++bybit_winning;
                         }
-                    }
-                    std::string foreign_detail;
-                    if (okx_winning > 0) {
-                        foreign_detail = fmt::format("foreign {}/{} (By:{} Ok:{}) | both {}/{}",
-                            foreign_ready, premiums.size(), bybit_winning, okx_winning,
-                            both_ready, premiums.size());
-                    } else {
-                        foreign_detail = fmt::format("bybit {}/{} | both {}/{}",
-                            foreign_ready, premiums.size(),
-                            both_ready, premiums.size());
+                        if (k_ok && f_ok) ++both_ready;
                     }
                     std::cout << fmt::format(
-                        "ready: bithumb {}/{} | {} | net>={:.0f} {} | enterable {} | fee: 빗썸 {}회 + 해외 {}회\n",
-                        bithumb_ready, premiums.size(),
-                        foreign_detail,
+                        "ready: korean {}/{} (Bi:{} Up:{}) | foreign {}/{} (By:{} Ok:{}) | both {}/{} | net>={:.0f} {} | enterable {} | fee: 국내 {}회 + 해외 {}회 | wdFee: Bi:{} Up:{}\n",
+                        korean_ready, premiums.size(), bithumb_winning, upbit_winning,
+                        foreign_ready, premiums.size(), bybit_winning, okx_winning,
+                        both_ready, premiums.size(),
                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
                         visible_premiums.size(),
                         enterable_count,
                         kimp::TradingConfig::BITHUMB_FEE_EVENTS,
-                        kimp::TradingConfig::BYBIT_FEE_EVENTS);
+                        kimp::TradingConfig::BYBIT_FEE_EVENTS,
+                        engine.get_price_cache().withdraw_fee_count(kimp::Exchange::Bithumb),
+                        engine.get_price_cache().withdraw_fee_count(kimp::Exchange::Upbit));
 
                     // ===== SELECTED (active positions) section =====
                     auto& pos_tracker = engine.get_position_tracker();
@@ -1996,7 +2065,7 @@ int main(int argc, char* argv[]) {
                         std::cout << std::string(94, '-') << "\n";
                     }
 
-                    std::cout << fmt::format("Entry: NetKRW>={:.0f} + both fill {:.2f} USDT\n",
+                    std::cout << fmt::format("Entry: EntryPM<0 + NetKRW>={:.0f} + both fill {:.2f} USDT\n",
                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
                         kimp::TradingConfig::TARGET_ENTRY_USDT);
                     std::cout << "Ctrl+C to stop\n";
@@ -2029,6 +2098,7 @@ int main(int argc, char* argv[]) {
     bithumb->disconnect();
     bybit->disconnect();
     if (okx) okx->disconnect();
+    if (upbit) upbit->disconnect();
 
     stop_io_threads();
 
