@@ -24,7 +24,8 @@ enum class Exchange : uint8_t {
     Bithumb = 0,
     Bybit = 1,
     OKX = 2,
-    Count = 3
+    Upbit = 3,
+    Count = 4
 };
 
 inline constexpr const char* exchange_name(Exchange ex) noexcept {
@@ -32,12 +33,13 @@ inline constexpr const char* exchange_name(Exchange ex) noexcept {
         case Exchange::Bithumb: return "Bithumb";
         case Exchange::Bybit: return "Bybit";
         case Exchange::OKX: return "OKX";
+        case Exchange::Upbit: return "Upbit";
         default: return "Unknown";
     }
 }
 
 inline constexpr bool is_korean_exchange(Exchange ex) noexcept {
-    return ex == Exchange::Bithumb;
+    return ex == Exchange::Bithumb || ex == Exchange::Upbit;
 }
 
 inline constexpr bool is_foreign_exchange(Exchange ex) noexcept {
@@ -122,6 +124,22 @@ struct SymbolId {
         if (pos != std::string_view::npos) {
             id.set_base(sv.substr(0, pos));
             id.set_quote(sv.substr(pos + 1));
+        }
+        return id;
+    }
+
+    // Upbit format: "KRW-BTC" (quote-base)
+    std::string to_upbit_format() const {
+        return std::string(get_quote()) + "-" + std::string(get_base());
+    }
+
+    // Parse "KRW-BTC" → SymbolId (zero-heap-alloc)
+    static SymbolId from_upbit_format(std::string_view sv) noexcept {
+        SymbolId id;
+        auto pos = sv.find('-');
+        if (pos != std::string_view::npos) {
+            id.set_quote(sv.substr(0, pos));   // KRW
+            id.set_base(sv.substr(pos + 1));   // BTC
         }
         return id;
     }
@@ -332,26 +350,38 @@ struct TradingConfig {
     static inline int MAX_POSITIONS = 1;                       // 최대 동시 포지션 수 (런타임 설정, 1~4)
     static constexpr double CAPITAL_PER_EXCHANGE_USD = 3000.0; // Risk budget per venue (Bithumb $3000, Bybit $3000)
     static constexpr double TOTAL_CAPITAL_USD = CAPITAL_PER_EXCHANGE_USD * 2.0;
-    static constexpr double TARGET_ENTRY_USDT = 70.0;         // Per-check entry unit: exact 70 USDT notional per add
+    static constexpr double TARGET_ENTRY_USDT = 35.0;         // Per-check entry unit: exact 35 USDT notional per add
     static constexpr double POSITION_SIZE_USD = CAPITAL_PER_EXCHANGE_USD; // Max side exposure per symbol / per venue
-    static constexpr double ORDER_SIZE_USD = TARGET_ENTRY_USDT;           // Each submit adds 70 USDT
-    static constexpr int SPLIT_ORDERS = 1;                    // Each cycle submits one 70 USDT order, then re-checks
+    static constexpr double ORDER_SIZE_USD = TARGET_ENTRY_USDT;           // Each submit adds 35 USDT
+    static constexpr int SPLIT_ORDERS = 1;                    // Each cycle submits one 35 USDT order, then re-checks
     static constexpr int ORDER_INTERVAL_MS = 100;             // Re-check quickly on next market update / retry
 
     // Entry threshold
     static constexpr double ENTRY_PREMIUM_THRESHOLD = 0.0;    // Legacy/monitor alias only
     static constexpr double MIN_NET_EDGE_PCT = 0.0;           // Enter only when net edge is positive
-    static constexpr double MIN_ENTRY_NET_PROFIT_KRW = 600.0; // Enter only when projected NetKRW for the executable entry size is >= 600
+    static constexpr double MIN_ENTRY_NET_PROFIT_KRW = 300.0; // Enter only when projected NetKRW for the executable entry size is >= 300
 
-    // Fee structure for the relay model
-    static constexpr int BITHUMB_FEE_EVENTS = 1;
-    static constexpr int BYBIT_FEE_EVENTS = 3;
-    static constexpr double BITHUMB_FEE_RATE = 0.0004;        // 0.0400%
-    static constexpr double BYBIT_FEE_RATE = 0.0010;          // 0.1000% fallback
+    // Fee structure for the relay model (per-exchange taker rates)
+    static constexpr int KOREAN_FEE_EVENTS = 1;               // Korean side: 1 trade (buy or sell)
+    static constexpr int FOREIGN_FEE_EVENTS = 3;              // Foreign side: 3 trades (short + cover + transfer)
+    static constexpr int BITHUMB_FEE_EVENTS = KOREAN_FEE_EVENTS;   // Legacy alias
+    static constexpr int BYBIT_FEE_EVENTS = FOREIGN_FEE_EVENTS;    // Legacy alias
+    static constexpr double BITHUMB_FEE_RATE = 0.0004;        // 0.04% (쿠폰 적용 taker)
+    static constexpr double UPBIT_FEE_RATE   = 0.0005;        // 0.05% (KRW마켓 taker)
+    static constexpr double BYBIT_FEE_RATE   = 0.0010;        // 0.10% (VIP0 taker)
+    static constexpr double OKX_FEE_RATE     = 0.0010;        // 0.10% (Regular taker)
+
+    static constexpr double get_korean_fee_rate(Exchange ex) noexcept {
+        return (ex == Exchange::Upbit) ? UPBIT_FEE_RATE : BITHUMB_FEE_RATE;
+    }
+    static constexpr double get_foreign_fee_rate(Exchange ex) noexcept {
+        return (ex == Exchange::OKX) ? OKX_FEE_RATE : BYBIT_FEE_RATE;
+    }
+
     static constexpr double BITHUMB_FEE_PCT = BITHUMB_FEE_RATE * 100.0;
     static constexpr double BYBIT_FEE_PCT = BYBIT_FEE_RATE * 100.0;
     static constexpr double ENTRY_TOTAL_FEE_PCT =
-        (BITHUMB_FEE_PCT * BITHUMB_FEE_EVENTS) + (BYBIT_FEE_PCT * BYBIT_FEE_EVENTS);  // 0.34%
+        (BITHUMB_FEE_PCT * KOREAN_FEE_EVENTS) + (BYBIT_FEE_PCT * FOREIGN_FEE_EVENTS);  // 0.34% (Bi-By worst case)
     static constexpr double ROUND_TRIP_FEE_PCT = ENTRY_TOTAL_FEE_PCT;  // Legacy alias for older diagnostics/tests
     static constexpr double MIN_NET_PROFIT_PCT = 0.00;
     static constexpr double DYNAMIC_EXIT_SPREAD = ENTRY_TOTAL_FEE_PCT + MIN_NET_PROFIT_PCT;

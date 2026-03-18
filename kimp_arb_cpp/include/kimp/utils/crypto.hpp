@@ -63,6 +63,21 @@ public:
         return to_hex(result, result_len);
     }
 
+    // HMAC-SHA512 raw bytes
+    static std::vector<uint8_t> hmac_sha512_raw(std::string_view key, std::string_view data) {
+        std::vector<uint8_t> result(EVP_MAX_MD_SIZE);
+        unsigned int result_len = 0;
+
+        auto* ret = HMAC(EVP_sha512(),
+             key.data(), static_cast<int>(key.size()),
+             reinterpret_cast<const unsigned char*>(data.data()), data.size(),
+             result.data(), &result_len);
+        if (!ret) return {};
+
+        result.resize(result_len);
+        return result;
+    }
+
     // SHA256
     static std::string sha256(std::string_view data) {
         unsigned char hash[SHA256_DIGEST_LENGTH];
