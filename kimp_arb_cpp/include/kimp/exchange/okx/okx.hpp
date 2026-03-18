@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <memory>
 #include <condition_variable>
+#include <unordered_set>
 
 namespace kimp::exchange::okx {
 
@@ -84,6 +85,11 @@ public:
 
     // Public fill query for async/parallel execution from OrderManager
     bool query_order_fill(const std::string& order_id, const SymbolId& symbol, Order& order);
+
+    // Fetch deposit-enabled networks per coin.
+    // Returns {coin → {normalized_network_set}}.
+    // Calls GET /api/v5/asset/currencies (requires auth).
+    std::unordered_map<std::string, std::unordered_set<std::string>> fetch_deposit_networks();
 
 protected:
     void on_ws_message(std::string_view message) override;
