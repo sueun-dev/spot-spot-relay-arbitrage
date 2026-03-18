@@ -407,8 +407,8 @@ struct TradingConfig {
     static constexpr double MIN_ORDER_KRW = 5000.0;           // Minimum order in KRW
 
     // Quote quality guards — ENTRY (strict: avoid bad fills on new positions)
-    static constexpr uint64_t MAX_QUOTE_AGE_MS = 2500;        // Reject quotes older than 2.5s
-    static constexpr uint64_t MAX_QUOTE_DESYNC_MS = 1200;     // Reject if KR/Foreign quote times differ too much
+    static constexpr uint64_t MAX_QUOTE_AGE_MS = 700;         // Require sub-second-ish quote freshness on entry
+    static constexpr uint64_t MAX_QUOTE_DESYNC_MS = 350;      // Reject KR/Foreign quotes that are materially out of sync
     static constexpr double MAX_KOREAN_SPREAD_PCT = 1.20;     // Skip illiquid KRW books
     static constexpr double MAX_FOREIGN_SPREAD_PCT = 0.40;    // Skip illiquid Bybit spot books
 
@@ -418,8 +418,8 @@ struct TradingConfig {
     static constexpr double MAX_KOREAN_SPREAD_PCT_EXIT = 3.50;    // 3.5% (spread already in bid/ask premium)
     static constexpr double MAX_FOREIGN_SPREAD_PCT_EXIT = 1.50;   // 1.5%
     static constexpr double MAX_USDT_JUMP_PCT = 1.50;         // Filter abnormal USDT/KRW jumps
-    static constexpr uint64_t USDT_FULL_SCAN_DEBOUNCE_MS = 120;  // Coalesce bursty USDT updates with lower latency
-    static constexpr uint64_t ENTRY_FAST_SCAN_COOLDOWN_MS = 80;  // Throttle event-driven full entry scans
+    static constexpr uint64_t USDT_FULL_SCAN_DEBOUNCE_MS = 40;   // Keep FX refresh reactive without excessive rescans
+    static constexpr uint64_t ENTRY_FAST_SCAN_COOLDOWN_MS = 20;  // Faster event-driven entry rescans on fresh ticks
     static constexpr uint64_t ENTRY_STALL_TIMEOUT_MS = 120000;   // 2min: finalize partial position if no split progress
 };
 

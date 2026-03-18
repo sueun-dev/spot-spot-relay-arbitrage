@@ -570,7 +570,7 @@ int main(int argc, char* argv[]) {
     std::optional<bool> latency_probe_override;
     std::optional<bool> latency_summary_override;
     kimp::LatencyOutputMode latency_output_mode = kimp::LatencyOutputMode::MmapBinary;
-    int monitor_interval_sec = 2;
+    int monitor_interval_sec = 1;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1303,8 +1303,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Upbit: subscribe only symbols that exist on Upbit
+    std::vector<kimp::SymbolId> upbit_subs;
     if (upbit_enabled) {
-        std::vector<kimp::SymbolId> upbit_subs;
         for (const auto& s : common_symbols) {
             if (upbit_bases.count(std::string(s.get_base()))) {
                 upbit_subs.push_back(s);
@@ -1314,31 +1314,6 @@ int main(int argc, char* argv[]) {
         upbit->subscribe_ticker(upbit_subs);
         upbit->subscribe_orderbook(upbit_subs);
         spdlog::info("Subscribed to {} Upbit symbols (orderbook + ticker)", upbit_subs.size());
-
-        // Fetch per-coin per-network withdrawal fees from Upbit (authenticated API)
-        {
-            std::vector<std::string> upbit_coin_list;
-            upbit_coin_list.reserve(upbit_subs.size());
-            for (const auto& s : upbit_subs) {
-                std::string base(s.get_base());
-                if (base != "USDT") upbit_coin_list.push_back(base);
-            }
-            auto upbit_fees = upbit->fetch_withdrawal_fees(upbit_coin_list);
-            if (!upbit_fees.empty()) {
-                auto& pc = engine.get_price_cache();
-                for (auto& [coin, net_fees] : upbit_fees) {
-                    std::vector<kimp::strategy::PriceCache::NetworkFee> converted;
-                    converted.reserve(net_fees.size());
-                    for (auto& nf : net_fees) {
-                        converted.push_back({std::move(nf.network), nf.fee_coins});
-                    }
-                    pc.set_withdraw_network_fees(kimp::Exchange::Upbit, coin, std::move(converted));
-                }
-                spdlog::info("Loaded {} Upbit withdrawal fees (per-network) into price cache", upbit_fees.size());
-            } else {
-                spdlog::warn("Failed to load Upbit withdrawal fees — will use Bithumb as fallback");
-            }
-        }
     }
 
     std::vector<kimp::SymbolId> bybit_subs;
@@ -1363,37 +1338,98 @@ int main(int argc, char* argv[]) {
         spdlog::info("Subscribed to {} OKX spot symbols (bbo-tbt 10ms path)", okx_subs.size());
     }
 
-    // Fetch foreign exchange deposit-enabled networks for withdrawal fee intersection
-    {
+    std::mutex transfer_refresh_mutex;
+    auto refresh_transfer_routes = [&](std::string_view reason) {
+        std::lock_guard guard(transfer_refresh_mutex);
+        auto& pc = engine.get_price_cache();
+        bool updated_any = false;
+
+        auto bithumb_fees = bithumb->fetch_withdrawal_fees();
+        if (!bithumb_fees.empty()) {
+            pc.clear_withdraw_network_fees(kimp::Exchange::Bithumb);
+            for (auto& [coin, net_fees] : bithumb_fees) {
+                std::vector<kimp::strategy::PriceCache::NetworkFee> converted;
+                converted.reserve(net_fees.size());
+                for (auto& nf : net_fees) {
+                    converted.push_back({std::move(nf.network), nf.fee_coins});
+                }
+                pc.set_withdraw_network_fees(kimp::Exchange::Bithumb, coin, std::move(converted));
+            }
+            updated_any = true;
+        } else {
+            spdlog::warn("[TransferRoutes:{}] Failed to refresh Bithumb withdrawal fees", reason);
+        }
+
+        auto bithumb_statuses = bithumb->fetch_asset_statuses();
+        if (!bithumb_statuses.empty()) {
+            pc.clear_korean_withdraw_status(kimp::Exchange::Bithumb);
+            for (const auto& [coin, status] : bithumb_statuses) {
+                pc.set_korean_withdraw_enabled(kimp::Exchange::Bithumb, coin, status.withdraw_enabled);
+            }
+            updated_any = true;
+        } else {
+            spdlog::warn("[TransferRoutes:{}] Failed to refresh Bithumb asset statuses", reason);
+        }
+
+        if (upbit_enabled) {
+            std::vector<std::string> upbit_coin_list;
+            upbit_coin_list.reserve(upbit_subs.size());
+            for (const auto& s : upbit_subs) {
+                std::string base(s.get_base());
+                if (base != "USDT") upbit_coin_list.push_back(base);
+            }
+            auto upbit_fees = upbit->fetch_withdrawal_fees(upbit_coin_list);
+            if (!upbit_fees.empty()) {
+                pc.clear_withdraw_network_fees(kimp::Exchange::Upbit);
+                for (auto& [coin, net_fees] : upbit_fees) {
+                    std::vector<kimp::strategy::PriceCache::NetworkFee> converted;
+                    converted.reserve(net_fees.size());
+                    for (auto& nf : net_fees) {
+                        converted.push_back({std::move(nf.network), nf.fee_coins});
+                    }
+                    pc.set_withdraw_network_fees(kimp::Exchange::Upbit, coin, std::move(converted));
+                }
+                updated_any = true;
+            } else {
+                spdlog::warn("[TransferRoutes:{}] Failed to refresh Upbit withdrawal fees", reason);
+            }
+        }
+
         auto bybit_nets = bybit->fetch_deposit_networks();
         if (!bybit_nets.empty()) {
-            auto& pc = engine.get_price_cache();
+            pc.clear_foreign_deposit_networks(kimp::Exchange::Bybit);
             for (auto& [coin, nets] : bybit_nets) {
                 pc.set_foreign_deposit_networks(kimp::Exchange::Bybit, coin, std::move(nets));
             }
-            spdlog::info("Loaded Bybit deposit networks for {} coins", bybit_nets.size());
+            updated_any = true;
         } else {
-            spdlog::warn("Failed to load Bybit deposit networks — withdrawal fee intersection disabled");
+            spdlog::warn("[TransferRoutes:{}] Failed to refresh Bybit deposit networks", reason);
         }
-    }
-    if (okx_enabled) {
-        auto okx_nets = okx->fetch_deposit_networks();
-        if (!okx_nets.empty()) {
-            auto& pc = engine.get_price_cache();
-            for (auto& [coin, nets] : okx_nets) {
-                pc.set_foreign_deposit_networks(kimp::Exchange::OKX, coin, std::move(nets));
-            }
-            spdlog::info("Loaded OKX deposit networks for {} coins", okx_nets.size());
-        } else {
-            spdlog::warn("Failed to load OKX deposit networks — withdrawal fee intersection disabled");
-        }
-    }
 
-    // Precompute all (korean_ex × foreign_ex × coin) withdrawal fees into
-    // a flat lock-free map — eliminates shared_mutex from the hot path.
-    engine.get_price_cache().finalize_withdraw_fees();
-    spdlog::info("Precomputed {} withdrawal fee entries (lock-free hot path)",
-                 engine.get_price_cache().precomputed_fee_count());
+        if (okx_enabled) {
+            auto okx_nets = okx->fetch_deposit_networks();
+            if (!okx_nets.empty()) {
+                pc.clear_foreign_deposit_networks(kimp::Exchange::OKX);
+                for (auto& [coin, nets] : okx_nets) {
+                    pc.set_foreign_deposit_networks(kimp::Exchange::OKX, coin, std::move(nets));
+                }
+                updated_any = true;
+            } else {
+                spdlog::warn("[TransferRoutes:{}] Failed to refresh OKX deposit networks", reason);
+            }
+        }
+
+        if (updated_any) {
+            pc.finalize_withdraw_fees();
+            engine.refresh_entry_filters();
+            spdlog::info("[TransferRoutes:{}] available routes={} fee entries={}",
+                         reason,
+                         pc.available_transfer_route_count(),
+                         pc.precomputed_fee_count());
+        }
+    };
+
+    refresh_transfer_routes("startup");
 
     // =========================================================================
     // STEP 13: Warm-up
@@ -1765,6 +1801,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    std::thread transfer_refresh_thread;
     if (!g_shutdown) {
         if (!monitor_only) {
             kimp::execution::LifecycleExecutorOptions executor_options;
@@ -1793,6 +1830,21 @@ int main(int argc, char* argv[]) {
 
         // Start engine
         engine.start();
+
+        transfer_refresh_thread = std::thread([&]() {
+            constexpr auto refresh_interval = std::chrono::minutes(30);
+            while (!g_shutdown) {
+                const auto started = std::chrono::steady_clock::now();
+                while (!g_shutdown &&
+                       (std::chrono::steady_clock::now() - started) < refresh_interval) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+                if (g_shutdown) {
+                    break;
+                }
+                refresh_transfer_routes("periodic");
+            }
+        });
 
         if (monitor_only) {
             spdlog::info("=== Bot Running (MONITOR-ONLY, Auto-Trading DISABLED) ===");
@@ -1859,28 +1911,29 @@ int main(int argc, char* argv[]) {
 
         // Main loop with console output
         LiveMonitorGuard live_monitor_guard(monitor_mode);
-        int tick = 0;
+        const auto monitor_interval = std::chrono::seconds(monitor_interval_sec);
+        auto next_monitor_due = std::chrono::steady_clock::now();
         while (!g_shutdown) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            ++tick;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
             // Full monitor: all symbols + both-side prices + entry/exit premiums
-            if (monitor_mode && tick % monitor_interval_sec == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (monitor_mode && now >= next_monitor_due) {
+                next_monitor_due = now + monitor_interval;
                 auto premiums = engine.get_all_premiums();
-                if (!premiums.empty()) {
-                    std::sort(premiums.begin(), premiums.end(),
-                        [](const auto& a, const auto& b) { return a.net_edge_pct > b.net_edge_pct; });
-                    std::vector<kimp::strategy::ArbitrageEngine::PremiumInfo> visible_premiums;
-                    visible_premiums.reserve(premiums.size());
-                    for (const auto& p : premiums) {
-                        const bool displayable =
-                            p.entry_premium < 0.0 &&
-                            p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
-                            kimp::TradingConfig::meets_entry_profit_floor(p.net_profit_krw);
-                        if (displayable) {
-                            visible_premiums.push_back(p);
-                        }
+                std::sort(premiums.begin(), premiums.end(),
+                    [](const auto& a, const auto& b) { return a.net_edge_pct > b.net_edge_pct; });
+                std::vector<kimp::strategy::ArbitrageEngine::PremiumInfo> visible_premiums;
+                visible_premiums.reserve(premiums.size());
+                for (const auto& p : premiums) {
+                    const bool displayable =
+                        p.entry_premium < 0.0 &&
+                        p.net_edge_pct > kimp::TradingConfig::MIN_NET_EDGE_PCT &&
+                        kimp::TradingConfig::meets_entry_profit_floor(p.net_profit_krw);
+                    if (displayable) {
+                        visible_premiums.push_back(p);
                     }
+                }
 
                     if (live_monitor_guard.active()) {
                         live_monitor_guard.clear_frame();
@@ -1895,11 +1948,58 @@ int main(int argc, char* argv[]) {
                     } else {
                         rate_str = fmt::format("{:.2f}", bi_rate);
                     }
-                    std::cout << fmt::format("=== Spot Relay Monitor | negative-entry carry enterable {} / tracked {} | 환율: {} KRW/USDT | target: {:.2f} USDT | every {}s ===\n",
+                    const size_t universe_count = common_symbols.size();
+                    size_t bithumb_quote_ready = 0, upbit_quote_ready = 0;
+                    size_t bybit_quote_ready = 0, okx_quote_ready = 0;
+                    size_t any_korean_quote_ready = 0, any_foreign_quote_ready = 0;
+                    for (const auto& symbol : common_symbols) {
+                        const std::string base(symbol.get_base());
+                        const kimp::SymbolId foreign_symbol(base, "USDT");
+
+                        bool bi_quote_ok = false;
+                        if (bithumb_bases.count(base)) {
+                            const auto p = engine.get_price_cache().get_price(kimp::Exchange::Bithumb, symbol);
+                            bi_quote_ok = p.valid && p.ask > 0.0;
+                            if (bi_quote_ok) ++bithumb_quote_ready;
+                        }
+
+                        bool up_quote_ok = false;
+                        if (upbit_enabled && upbit_bases.count(base)) {
+                            const auto p = engine.get_price_cache().get_price(kimp::Exchange::Upbit, symbol);
+                            up_quote_ok = p.valid && p.ask > 0.0;
+                            if (up_quote_ok) ++upbit_quote_ready;
+                        }
+
+                        if (bi_quote_ok || up_quote_ok) {
+                            ++any_korean_quote_ready;
+                        }
+
+                        bool by_quote_ok = false;
+                        if (bybit_bases.count(base)) {
+                            const auto p = engine.get_price_cache().get_price(kimp::Exchange::Bybit, foreign_symbol);
+                            by_quote_ok = p.valid && p.bid > 0.0;
+                            if (by_quote_ok) ++bybit_quote_ready;
+                        }
+
+                        bool ok_quote_ok = false;
+                        if (okx_enabled && okx_bases.count(base)) {
+                            const auto p = engine.get_price_cache().get_price(kimp::Exchange::OKX, foreign_symbol);
+                            ok_quote_ok = p.valid && p.bid > 0.0;
+                            if (ok_quote_ok) ++okx_quote_ready;
+                        }
+
+                        if (by_quote_ok || ok_quote_ok) {
+                            ++any_foreign_quote_ready;
+                        }
+                    }
+
+                    std::cout << fmt::format("=== Spot Relay Monitor | negative-entry carry enterable {} / usable {} / common {} | 환율: {} KRW/USDT | target: {:.2f} USDT | every {}s ===\n",
                         std::count_if(visible_premiums.begin(), visible_premiums.end(), [](const auto& p) {
                             return p.entry_premium < 0.0 && p.both_can_fill_target && p.match_qty > 0.0;
                         }),
-                        premiums.size(), rate_str,
+                        premiums.size(),
+                        universe_count,
+                        rate_str,
                         kimp::TradingConfig::TARGET_ENTRY_USDT, monitor_interval_sec);
                     std::cout << fmt::format(
                         "Columns: EntryPM 음수 + NetKRW {:.0f}원 이상 코인만 표시 | 전략: KR 현물 매수 -> Foreign 현물숏/차후 릴레이\n",
@@ -2011,27 +2111,19 @@ int main(int argc, char* argv[]) {
                     // Count per Korean/foreign exchange winning
                     size_t bithumb_winning = 0, upbit_winning = 0;
                     size_t bybit_winning = 0, okx_winning = 0;
-                    size_t korean_ready = 0, foreign_ready = 0, both_ready = 0;
                     for (const auto& p : premiums) {
-                        bool k_ok = p.korean_ask_qty > 0.0;
-                        bool f_ok = p.foreign_bid_qty > 0.0;
-                        if (k_ok) {
-                            ++korean_ready;
-                            if (p.best_korean_exchange == kimp::Exchange::Upbit) ++upbit_winning;
-                            else ++bithumb_winning;
-                        }
-                        if (f_ok) {
-                            ++foreign_ready;
-                            if (p.best_foreign_exchange == kimp::Exchange::OKX) ++okx_winning;
-                            else ++bybit_winning;
-                        }
-                        if (k_ok && f_ok) ++both_ready;
+                        if (p.best_korean_exchange == kimp::Exchange::Upbit) ++upbit_winning;
+                        else ++bithumb_winning;
+                        if (p.best_foreign_exchange == kimp::Exchange::OKX) ++okx_winning;
+                        else ++bybit_winning;
                     }
                     std::cout << fmt::format(
-                        "ready: korean {}/{} (Bi:{} Up:{}) | foreign {}/{} (By:{} Ok:{}) | both {}/{} | net>={:.0f} {} | enterable {} | fee: 국내 {}회 + 해외 {}회 | wdFee: Bi:{} Up:{}\n",
-                        korean_ready, premiums.size(), bithumb_winning, upbit_winning,
-                        foreign_ready, premiums.size(), bybit_winning, okx_winning,
-                        both_ready, premiums.size(),
+                        "quotes: korean {}/{} (Bi:{} Up:{}) | foreign {}/{} (By:{} Ok:{}) | usable {}/{} | bestKR(Bi:{} Up:{}) | bestFR(By:{} Ok:{}) | net>={:.0f} {} | enterable {} | fee: 국내 {}회 + 해외 {}회 | wdFee: Bi:{} Up:{}\n",
+                        any_korean_quote_ready, universe_count, bithumb_quote_ready, upbit_quote_ready,
+                        any_foreign_quote_ready, universe_count, bybit_quote_ready, okx_quote_ready,
+                        premiums.size(), universe_count,
+                        bithumb_winning, upbit_winning,
+                        bybit_winning, okx_winning,
                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
                         visible_premiums.size(),
                         enterable_count,
@@ -2039,6 +2131,43 @@ int main(int argc, char* argv[]) {
                         kimp::TradingConfig::BYBIT_FEE_EVENTS,
                         engine.get_price_cache().withdraw_fee_count(kimp::Exchange::Bithumb),
                         engine.get_price_cache().withdraw_fee_count(kimp::Exchange::Upbit));
+
+                    const auto blocked_routes = engine.get_transfer_blocked_symbols();
+                    size_t kr_withdraw_blocked = 0;
+                    size_t foreign_deposit_blocked = 0;
+                    size_t no_shared_network = 0;
+                    size_t route_data_missing = 0;
+                    for (const auto& blocked : blocked_routes) {
+                        if (blocked.reason.find("KR withdraw") != std::string::npos) {
+                            ++kr_withdraw_blocked;
+                        } else if (blocked.reason.find("Foreign deposit") != std::string::npos) {
+                            ++foreign_deposit_blocked;
+                        } else if (blocked.reason.find("shared") != std::string::npos) {
+                            ++no_shared_network;
+                        } else {
+                            ++route_data_missing;
+                        }
+                    }
+                    std::cout << fmt::format(
+                        "transfer blacklist: {} | KR withdraw off {} | foreign deposit off {} | no shared net {} | route data missing {}\n",
+                        blocked_routes.size(),
+                        kr_withdraw_blocked,
+                        foreign_deposit_blocked,
+                        no_shared_network,
+                        route_data_missing);
+                    if (!blocked_routes.empty()) {
+                        std::string blocked_sample;
+                        const size_t sample_n = std::min<size_t>(blocked_routes.size(), 6);
+                        for (size_t i = 0; i < sample_n; ++i) {
+                            const auto& blocked = blocked_routes[i];
+                            if (!blocked_sample.empty()) blocked_sample += " | ";
+                            const char* k_venue = (blocked.korean_exchange == kimp::Exchange::Upbit) ? "Up" : "Bi";
+                            const char* f_venue = (blocked.foreign_exchange == kimp::Exchange::OKX) ? "Ok" : "By";
+                            blocked_sample += fmt::format("{}({}-{}:{})",
+                                blocked.symbol.get_base(), k_venue, f_venue, blocked.reason);
+                        }
+                        std::cout << fmt::format("blocked sample: {}\n", blocked_sample);
+                    }
 
                     // ===== SELECTED (active positions) section =====
                     auto& pos_tracker = engine.get_position_tracker();
@@ -2065,12 +2194,11 @@ int main(int argc, char* argv[]) {
                         std::cout << std::string(94, '-') << "\n";
                     }
 
-                    std::cout << fmt::format("Entry: EntryPM<0 + NetKRW>={:.0f} + both fill {:.2f} USDT\n",
-                        kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
-                        kimp::TradingConfig::TARGET_ENTRY_USDT);
-                    std::cout << "Ctrl+C to stop\n";
-                    std::cout.flush();
-                }
+                std::cout << fmt::format("Entry: EntryPM<0 + NetKRW>={:.0f} + both fill {:.2f} USDT\n",
+                    kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
+                    kimp::TradingConfig::TARGET_ENTRY_USDT);
+                std::cout << "Ctrl+C to stop\n";
+                std::cout.flush();
             }
 
         }
@@ -2088,12 +2216,15 @@ int main(int argc, char* argv[]) {
     if (ws_server) {
         ws_server->stop();  // Stop WebSocket server
     }
-    if (warmup_thread.joinable()) {
-        warmup_thread.join();
-    }
-    order_manager.request_shutdown();  // Break adaptive loops before stopping engine
-    lifecycle_executor.stop();
-    engine.stop_async_exporter();
+        if (warmup_thread.joinable()) {
+            warmup_thread.join();
+        }
+        if (transfer_refresh_thread.joinable()) {
+            transfer_refresh_thread.join();
+        }
+        order_manager.request_shutdown();  // Break adaptive loops before stopping engine
+        lifecycle_executor.stop();
+        engine.stop_async_exporter();
     engine.stop();
     bithumb->disconnect();
     bybit->disconnect();

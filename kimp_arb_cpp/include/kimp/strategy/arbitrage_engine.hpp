@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <memory>
 
 namespace kimp::strategy {
 
@@ -32,6 +33,15 @@ public:
     struct NetworkFee {
         std::string network;   // normalized: "BTC", "ERC20", "TRC20", etc.
         double fee_coins{0.0};
+    };
+
+    struct TransferRoute {
+        bool available{false};
+        bool withdraw_open{false};
+        bool deposit_open{false};
+        double fee_coins{0.0};
+        std::string network;
+        uint64_t refreshed_at_ms{0};
     };
 
     struct PriceData {
@@ -110,10 +120,17 @@ private:
     std::unordered_map<Exchange, std::unordered_map<std::string, std::vector<NetworkFee>>> withdraw_network_fees_;
     // foreign_deposit_nets_[Bybit]["BTC"] = {"BTC"}
     std::unordered_map<Exchange, std::unordered_map<std::string, std::unordered_set<std::string>>> foreign_deposit_nets_;
+    // Per-coin withdrawal availability from Korean exchanges.
+    std::unordered_map<Exchange, std::unordered_map<std::string, bool>> korean_withdraw_enabled_;
 
-    // Precomputed flat cache: (korean_ex, foreign_ex, coin) → fee.
-    // Populated by finalize_withdraw_fees(), read lock-free after that.
-    std::unordered_map<std::string, double> precomputed_fees_;
+    struct TransferSnapshot {
+        std::unordered_map<std::string, double> fees;
+        std::unordered_map<std::string, TransferRoute> routes;
+        uint64_t refreshed_at_ms{0};
+    };
+    std::shared_ptr<const TransferSnapshot> transfer_snapshot_{
+        std::make_shared<const TransferSnapshot>()
+    };
 
     static std::string make_fee_key(Exchange k, Exchange f, const std::string& coin) {
         // "K:F:COIN" — short, unique, no allocation for small coins
@@ -271,15 +288,52 @@ public:
         foreign_deposit_nets_[ex][base] = std::move(canonical);
     }
 
+    void set_korean_withdraw_enabled(Exchange ex, const std::string& base, bool enabled) {
+        std::unique_lock lock(withdraw_fee_mutex_);
+        korean_withdraw_enabled_[ex][base] = enabled;
+    }
+
+    void clear_withdraw_network_fees(Exchange ex) {
+        std::unique_lock lock(withdraw_fee_mutex_);
+        withdraw_network_fees_.erase(ex);
+    }
+
+    void clear_foreign_deposit_networks(Exchange ex) {
+        std::unique_lock lock(withdraw_fee_mutex_);
+        foreign_deposit_nets_.erase(ex);
+    }
+
+    void clear_korean_withdraw_status(Exchange ex) {
+        std::unique_lock lock(withdraw_fee_mutex_);
+        korean_withdraw_enabled_.erase(ex);
+    }
+
     // Hot-path lookup: lock-free read from precomputed flat cache.
     // Call finalize_withdraw_fees() after all data is loaded.
     double get_withdraw_fee(Exchange korean_ex, Exchange foreign_ex,
                             const std::string& base) const {
-        // Fast path: precomputed cache (lock-free after finalize)
         auto key = make_fee_key(korean_ex, foreign_ex, base);
-        auto it = precomputed_fees_.find(key);
-        if (it != precomputed_fees_.end()) return it->second;
+        auto snapshot = std::atomic_load_explicit(&transfer_snapshot_, std::memory_order_acquire);
+        auto it = snapshot->fees.find(key);
+        if (it != snapshot->fees.end()) return it->second;
         return 0.0;
+    }
+
+    bool is_transfer_route_available(Exchange korean_ex, Exchange foreign_ex,
+                                     const std::string& base) const {
+        auto key = make_fee_key(korean_ex, foreign_ex, base);
+        auto snapshot = std::atomic_load_explicit(&transfer_snapshot_, std::memory_order_acquire);
+        auto it = snapshot->routes.find(key);
+        return it != snapshot->routes.end() && it->second.available;
+    }
+
+    std::optional<TransferRoute> get_transfer_route(Exchange korean_ex, Exchange foreign_ex,
+                                                    const std::string& base) const {
+        auto key = make_fee_key(korean_ex, foreign_ex, base);
+        auto snapshot = std::atomic_load_explicit(&transfer_snapshot_, std::memory_order_acquire);
+        auto it = snapshot->routes.find(key);
+        if (it == snapshot->routes.end()) return std::nullopt;
+        return it->second;
     }
 
     // Call once after all set_withdraw_network_fees / set_foreign_deposit_networks
@@ -287,17 +341,31 @@ public:
     // combination into a flat lock-free map for zero-overhead hot-path reads.
     void finalize_withdraw_fees() {
         std::shared_lock lock(withdraw_fee_mutex_);
-        precomputed_fees_.clear();
+        auto snapshot = std::make_shared<TransferSnapshot>();
+        snapshot->refreshed_at_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
 
         // Collect all coin names
         std::unordered_set<std::string> all_coins;
         for (const auto& [ex, coin_map] : withdraw_network_fees_) {
             for (const auto& [coin, _] : coin_map) all_coins.insert(coin);
         }
+        for (const auto& [ex, coin_map] : foreign_deposit_nets_) {
+            for (const auto& [coin, _] : coin_map) all_coins.insert(coin);
+        }
+        for (const auto& [ex, coin_map] : korean_withdraw_enabled_) {
+            for (const auto& [coin, _] : coin_map) all_coins.insert(coin);
+        }
 
         // Collect all exchange pairs
         std::vector<Exchange> korean_exs, foreign_exs;
         for (const auto& [ex, _] : withdraw_network_fees_) korean_exs.push_back(ex);
+        for (const auto& [ex, _] : korean_withdraw_enabled_) {
+            if (std::find(korean_exs.begin(), korean_exs.end(), ex) == korean_exs.end()) {
+                korean_exs.push_back(ex);
+            }
+        }
         for (const auto& [ex, _] : foreign_deposit_nets_) foreign_exs.push_back(ex);
         // Also add exchanges that might not have deposit data yet
         if (foreign_exs.empty()) {
@@ -307,17 +375,31 @@ public:
         for (const auto& coin : all_coins) {
             for (auto k_ex : korean_exs) {
                 for (auto f_ex : foreign_exs) {
-                    double fee = get_withdraw_fee_locked(k_ex, f_ex, coin);
-                    if (fee > 0.0) {
-                        precomputed_fees_[make_fee_key(k_ex, f_ex, coin)] = fee;
+                    auto route = get_withdraw_fee_locked(k_ex, f_ex, coin, snapshot->refreshed_at_ms);
+                    snapshot->routes[make_fee_key(k_ex, f_ex, coin)] = route;
+                    if (route.available) {
+                        snapshot->fees[make_fee_key(k_ex, f_ex, coin)] = route.fee_coins;
                     }
                 }
             }
         }
-
+        std::shared_ptr<const TransferSnapshot> published = snapshot;
+        std::atomic_store_explicit(&transfer_snapshot_, std::move(published), std::memory_order_release);
     }
 
-    size_t precomputed_fee_count() const { return precomputed_fees_.size(); }
+    size_t precomputed_fee_count() const {
+        auto snapshot = std::atomic_load_explicit(&transfer_snapshot_, std::memory_order_acquire);
+        return snapshot->fees.size();
+    }
+
+    size_t available_transfer_route_count() const {
+        auto snapshot = std::atomic_load_explicit(&transfer_snapshot_, std::memory_order_acquire);
+        size_t total = 0;
+        for (const auto& [_, route] : snapshot->routes) {
+            if (route.available) ++total;
+        }
+        return total;
+    }
 
     size_t withdraw_fee_count() const {
         std::shared_lock lock(withdraw_fee_mutex_);
@@ -334,8 +416,12 @@ public:
 
 private:
     // Must be called with withdraw_fee_mutex_ held (shared or exclusive).
-    double get_withdraw_fee_locked(Exchange korean_ex, Exchange foreign_ex,
-                                   const std::string& base) const {
+    TransferRoute get_withdraw_fee_locked(Exchange korean_ex, Exchange foreign_ex,
+                                          const std::string& base,
+                                          uint64_t refreshed_at_ms) const {
+        TransferRoute route;
+        route.refreshed_at_ms = refreshed_at_ms;
+
         // Get foreign deposit networks for this coin
         const std::unordered_set<std::string>* deposit_nets = nullptr;
         auto fd_it = foreign_deposit_nets_.find(foreign_ex);
@@ -346,39 +432,44 @@ private:
             }
         }
 
-        // Try requested Korean exchange first, then others
-        auto try_korean = [&](Exchange ex) -> double {
-            auto wf_it = withdraw_network_fees_.find(ex);
-            if (wf_it == withdraw_network_fees_.end()) return -1.0;
+        route.deposit_open = deposit_nets != nullptr && !deposit_nets->empty();
+
+        const std::vector<NetworkFee>* withdraw_fees = nullptr;
+        auto wf_it = withdraw_network_fees_.find(korean_ex);
+        if (wf_it != withdraw_network_fees_.end()) {
             auto coin_it = wf_it->second.find(base);
-            if (coin_it == wf_it->second.end() || coin_it->second.empty()) return -1.0;
-
-            double min_fee = std::numeric_limits<double>::max();
-            for (const auto& nf : coin_it->second) {
-                if (deposit_nets) {
-                    // Only consider networks the foreign exchange can receive
-                    if (deposit_nets->count(nf.network) && nf.fee_coins < min_fee) {
-                        min_fee = nf.fee_coins;
-                    }
-                } else {
-                    // No foreign deposit data → fall back to raw minimum
-                    if (nf.fee_coins < min_fee) min_fee = nf.fee_coins;
-                }
+            if (coin_it != wf_it->second.end() && !coin_it->second.empty()) {
+                withdraw_fees = &coin_it->second;
             }
-            return (min_fee < std::numeric_limits<double>::max()) ? min_fee : -1.0;
-        };
-
-        double fee = try_korean(korean_ex);
-        if (fee >= 0.0) return fee;
-
-        // Fallback: try other Korean exchanges
-        for (const auto& [other_ex, _] : withdraw_network_fees_) {
-            if (other_ex == korean_ex) continue;
-            fee = try_korean(other_ex);
-            if (fee >= 0.0) return fee;
         }
 
-        return 0.0;
+        bool withdraw_enabled = withdraw_fees != nullptr && !withdraw_fees->empty();
+        auto kw_it = korean_withdraw_enabled_.find(korean_ex);
+        if (kw_it != korean_withdraw_enabled_.end()) {
+            auto coin_it = kw_it->second.find(base);
+            if (coin_it != kw_it->second.end()) {
+                withdraw_enabled = withdraw_enabled && coin_it->second;
+            }
+        }
+        route.withdraw_open = withdraw_enabled;
+
+        if (!route.withdraw_open || !route.deposit_open || !withdraw_fees) {
+            return route;
+        }
+
+        double min_fee = std::numeric_limits<double>::max();
+        for (const auto& nf : *withdraw_fees) {
+            if (deposit_nets->count(nf.network) && nf.fee_coins < min_fee) {
+                min_fee = nf.fee_coins;
+                route.network = nf.network;
+            }
+        }
+
+        if (min_fee < std::numeric_limits<double>::max()) {
+            route.available = true;
+            route.fee_coins = min_fee;
+        }
+        return route;
     }
 
 public:
@@ -796,6 +887,13 @@ public:
         Exchange best_foreign_exchange{Exchange::Bybit};
     };
 
+    struct TransferBlockInfo {
+        SymbolId symbol;
+        Exchange korean_exchange{Exchange::Bithumb};
+        Exchange foreign_exchange{Exchange::Bybit};
+        std::string reason;
+    };
+
     ArbitrageEngine() = default;
     ~ArbitrageEngine();
 
@@ -847,12 +945,14 @@ public:
     // Analysis
     double calculate_premium(const SymbolId& symbol, Exchange korean_ex, Exchange foreign_ex) const;
     std::vector<PremiumInfo> get_all_premiums() const;
+    std::vector<TransferBlockInfo> get_transfer_blocked_symbols() const;
     const PriceCache& get_price_cache() const { return price_cache_; }
     PriceCache& get_price_cache() { return price_cache_; }
 
     // Market data update signaling (for event-driven waits)
     uint64_t get_update_seq() const { return update_seq_.load(std::memory_order_acquire); }
     void wait_for_update(uint64_t last_seq, std::chrono::milliseconds timeout) const;
+    void refresh_entry_filters();
 
     // Callbacks (병렬 포지션 - 각 코인별 진입/청산)
     using EntryCallback = std::function<void(const ArbitrageSignal&)>;

@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <thread>
 #include <unordered_set>
+#include <cctype>
 
 namespace kimp::exchange::upbit {
 
@@ -93,6 +94,23 @@ std::string parse_dom_string(simdjson::dom::element elem) {
         return std::string(str.value());
     }
     return {};
+}
+
+std::string url_encode_component(std::string_view raw) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(raw.size() * 3);
+    for (unsigned char c : raw) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(hex[(c >> 4) & 0x0F]);
+            out.push_back(hex[c & 0x0F]);
+        }
+    }
+    return out;
 }
 
 OrderStatus parse_upbit_order_status(std::string_view state,
@@ -789,10 +807,9 @@ bool parse_upbit_withdraw_fee(const std::string& body, double& fee) {
     try {
         simdjson::dom::parser parser;
         auto doc = parser.parse(body);
-        auto currency_obj = doc["currency"].get_object();
-        std::string_view fee_str = currency_obj["withdraw_fee"].get_string().value();
-        auto [ptr, ec] = std::from_chars(fee_str.data(), fee_str.data() + fee_str.size(), fee);
-        return (ec == std::errc{} && fee >= 0.0);
+        auto currency_obj = doc["currency"];
+        fee = parse_dom_double(currency_obj["withdraw_fee"], -1.0);
+        return std::isfinite(fee) && fee >= 0.0;
     } catch (...) {
         return false;
     }
@@ -819,8 +836,20 @@ UpbitExchange::fetch_withdrawal_fees(const std::vector<std::string>& coins) {
         return out;
     };
 
+    std::vector<std::string> unique_coins;
+    unique_coins.reserve(coins.size());
+    {
+        std::unordered_set<std::string> seen;
+        seen.reserve(coins.size());
+        for (const auto& coin : coins) {
+            if (!coin.empty() && seen.insert(coin).second) {
+                unique_coins.push_back(coin);
+            }
+        }
+    }
+
     // ── Step 1: Fetch /v1/status/wallet to discover net_type for every coin ──
-    std::unordered_map<std::string, std::vector<std::string>> coin_net_types;
+    std::unordered_map<std::string, std::unordered_set<std::string>> coin_net_types;
     {
         std::string token = generate_jwt_token();
         std::unordered_map<std::string, std::string> headers = {
@@ -836,9 +865,20 @@ UpbitExchange::fetch_withdrawal_fees(const std::vector<std::string>& coins) {
                 simdjson::dom::parser parser;
                 auto doc = parser.parse(response.body);
                 for (auto item : doc.get_array()) {
-                    std::string_view currency = item["currency"].get_string().value();
-                    std::string_view net_type = item["net_type"].get_string().value();
-                    coin_net_types[std::string(currency)].emplace_back(net_type);
+                    std::string currency = parse_dom_string(item["currency"]);
+                    std::string net_type = parse_dom_string(item["net_type"]);
+                    std::string wallet_state = parse_dom_string(item["wallet_state"]);
+                    if (currency.empty() || net_type.empty()) {
+                        continue;
+                    }
+
+                    bool withdraw_open = wallet_state.empty() ||
+                        wallet_state == "working" ||
+                        wallet_state == "withdraw_only";
+                    if (!withdraw_open) {
+                        continue;
+                    }
+                    coin_net_types[std::move(currency)].insert(std::move(net_type));
                 }
                 Logger::info("[Upbit] Wallet status: {} currency-network entries", coin_net_types.size());
             } catch (const simdjson::simdjson_error& e) {
@@ -851,21 +891,24 @@ UpbitExchange::fetch_withdrawal_fees(const std::vector<std::string>& coins) {
     // ── Step 2: For each coin, query /v1/withdraws/chance per net_type ──
     std::vector<std::string> failed_coins;
 
-    for (const auto& coin : coins) {
+    for (const auto& coin : unique_coins) {
         std::vector<std::string> net_types_to_try;
         auto it = coin_net_types.find(coin);
         if (it != coin_net_types.end() && !it->second.empty()) {
-            net_types_to_try = it->second;
+            net_types_to_try.assign(it->second.begin(), it->second.end());
         } else {
-            net_types_to_try = {"", coin};
+            // Don't guess net_type from the coin symbol; use the default
+            // endpoint only when wallet status metadata is unavailable.
+            net_types_to_try = {""};
         }
 
         std::vector<NetworkFee> coin_fees;
+        std::unordered_set<std::string> seen_networks;
 
         for (const auto& nt : net_types_to_try) {
-            std::string query = "currency=" + coin;
+            std::string query = "currency=" + url_encode_component(coin);
             if (!nt.empty()) {
-                query += "&net_type=" + nt;
+                query += "&net_type=" + url_encode_component(nt);
             }
 
             std::string token = generate_jwt_token_with_query(query);
@@ -879,7 +922,9 @@ UpbitExchange::fetch_withdrawal_fees(const std::vector<std::string>& coins) {
             double fee = 0.0;
             if (response.success && parse_upbit_withdraw_fee(response.body, fee)) {
                 std::string net_name = nt.empty() ? coin : normalize(nt);
-                coin_fees.push_back({std::move(net_name), fee});
+                if (seen_networks.insert(net_name).second) {
+                    coin_fees.push_back({std::move(net_name), fee});
+                }
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(120));
@@ -901,7 +946,7 @@ UpbitExchange::fetch_withdrawal_fees(const std::vector<std::string>& coins) {
         Logger::warn("[Upbit] Failed to fetch withdrawal fees for {} coins: {}",
                      failed_coins.size(), missed);
     }
-    Logger::info("[Upbit] Loaded withdrawal fees for {} / {} coins", fees.size(), coins.size());
+    Logger::info("[Upbit] Loaded withdrawal fees for {} / {} coins", fees.size(), unique_coins.size());
     return fees;
 }
 

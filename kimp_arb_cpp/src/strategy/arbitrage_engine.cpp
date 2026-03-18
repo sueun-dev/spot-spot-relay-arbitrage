@@ -423,8 +423,10 @@ double ArbitrageEngine::calculate_premium(const SymbolId& symbol,
     double best_foreign_bid = 0.0;
     double usdt_rate = 0.0;
     double best_spread = -1e18;
+    const std::string base(symbol.get_base());
     for (const auto& pair : exchange_pairs_) {
         if (pair.korean != korean_ex) continue;
+        if (!price_cache_.is_transfer_route_available(pair.korean, pair.foreign, base)) continue;
         auto fp = price_cache_.get_price(pair.foreign, foreign_symbol);
         if (!fp.valid || fp.bid <= 0) continue;
         if (!quote_pair_is_usable(pair.korean, pair.foreign, korean_price, fp)) continue;
@@ -440,6 +442,7 @@ double ArbitrageEngine::calculate_premium(const SymbolId& symbol,
 
     // Fallback: try the explicitly requested exchange
     if (best_foreign_bid <= 0.0) {
+        if (!price_cache_.is_transfer_route_available(korean_ex, foreign_ex, base)) return 0.0;
         auto foreign_price = price_cache_.get_price(foreign_ex, foreign_symbol);
         if (!foreign_price.valid || foreign_price.bid <= 0) return 0.0;
         if (!quote_pair_is_usable(korean_ex, foreign_ex, korean_price, foreign_price)) return 0.0;
@@ -452,6 +455,12 @@ double ArbitrageEngine::calculate_premium(const SymbolId& symbol,
 
     return PremiumCalculator::calculate_entry_premium(
         korean_price.ask, best_foreign_bid, usdt_rate);
+}
+
+void ArbitrageEngine::refresh_entry_filters() {
+    update_all_entries();
+    update_seq_.fetch_add(1, std::memory_order_release);
+    update_cv_.notify_all();
 }
 
 void ArbitrageEngine::monitor_loop() {
@@ -527,6 +536,7 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
 
     const auto& symbol = monitored_symbols_[idx];
     const auto& foreign_symbol = foreign_symbols_[idx];
+    const std::string base(symbol.get_base());
 
     // ── Multi-exchange selection: pick the pair with the best gross spread ──
     // Iterate all exchange pairs (Korean × Foreign) and select the one with the
@@ -540,6 +550,7 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
 
     for (const auto& pair : exchange_pairs_) {
         if (!pair.entry_enabled) continue;
+        if (!price_cache_.is_transfer_route_available(pair.korean, pair.foreign, base)) continue;
 
         auto korean_price = price_cache_.get_price(pair.korean, symbol);
         if (!korean_price.valid || korean_price.ask <= 0) continue;
@@ -867,6 +878,7 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
     for (size_t i = 0; i < n; ++i) {
         const auto& symbol = monitored_symbols_[i];
         const auto& foreign_symbol = foreign_symbols_[i];
+        const std::string base(symbol.get_base());
 
         PriceCache::PriceData best_kr{};
         PriceCache::PriceData best_fr{};
@@ -876,6 +888,7 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
         Exchange best_f_ex = Exchange::Bybit;
 
         for (const auto& pair : exchange_pairs_) {
+            if (!price_cache_.is_transfer_route_available(pair.korean, pair.foreign, base)) continue;
             auto korean_price = price_cache_.get_price(pair.korean, symbol);
             if (!korean_price.valid || korean_price.ask <= 0) continue;
 
@@ -1002,6 +1015,101 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
         result.push_back(info);
     }
 
+    return result;
+}
+
+std::vector<ArbitrageEngine::TransferBlockInfo> ArbitrageEngine::get_transfer_blocked_symbols() const {
+    std::vector<TransferBlockInfo> result;
+    result.reserve(monitored_symbols_.size());
+
+    for (const auto& symbol : monitored_symbols_) {
+        const std::string base(symbol.get_base());
+        bool any_available = false;
+
+        size_t missing_count = 0;
+        size_t withdraw_blocked_count = 0;
+        size_t deposit_blocked_count = 0;
+        size_t no_shared_count = 0;
+
+        std::optional<TransferBlockInfo> missing_info;
+        std::optional<TransferBlockInfo> withdraw_info;
+        std::optional<TransferBlockInfo> deposit_info;
+        std::optional<TransferBlockInfo> no_shared_info;
+
+        for (const auto& pair : exchange_pairs_) {
+            auto route = price_cache_.get_transfer_route(pair.korean, pair.foreign, base);
+            if (!route.has_value()) {
+                ++missing_count;
+                if (!missing_info.has_value()) {
+                    missing_info = TransferBlockInfo{symbol, pair.korean, pair.foreign, "route data missing"};
+                }
+                continue;
+            }
+
+            if (route->available) {
+                any_available = true;
+                break;
+            }
+
+            if (!route->withdraw_open) {
+                ++withdraw_blocked_count;
+                if (!withdraw_info.has_value()) {
+                    withdraw_info = TransferBlockInfo{symbol, pair.korean, pair.foreign, "KR withdraw off"};
+                }
+                continue;
+            }
+
+            if (!route->deposit_open) {
+                ++deposit_blocked_count;
+                if (!deposit_info.has_value()) {
+                    deposit_info = TransferBlockInfo{symbol, pair.korean, pair.foreign, "Foreign deposit off"};
+                }
+                continue;
+            }
+
+            ++no_shared_count;
+            if (!no_shared_info.has_value()) {
+                no_shared_info = TransferBlockInfo{symbol, pair.korean, pair.foreign, "no shared network"};
+            }
+        }
+
+        if (any_available) {
+            continue;
+        }
+
+        const size_t pair_count = exchange_pairs_.size();
+        if (pair_count == 0) {
+            continue;
+        }
+
+        if (withdraw_blocked_count == pair_count && withdraw_info.has_value()) {
+            result.push_back(*withdraw_info);
+        } else if (deposit_blocked_count == pair_count && deposit_info.has_value()) {
+            result.push_back(*deposit_info);
+        } else if (no_shared_count == pair_count && no_shared_info.has_value()) {
+            result.push_back(*no_shared_info);
+        } else if (missing_count == pair_count && missing_info.has_value()) {
+            result.push_back(*missing_info);
+        } else if (withdraw_info.has_value()) {
+            TransferBlockInfo info = *withdraw_info;
+            info.reason = "no live route (KR withdraw off mixed)";
+            result.push_back(std::move(info));
+        } else if (deposit_info.has_value()) {
+            TransferBlockInfo info = *deposit_info;
+            info.reason = "no live route (Foreign deposit off mixed)";
+            result.push_back(std::move(info));
+        } else if (no_shared_info.has_value()) {
+            TransferBlockInfo info = *no_shared_info;
+            info.reason = "no live route (shared net none)";
+            result.push_back(std::move(info));
+        } else if (missing_info.has_value()) {
+            result.push_back(*missing_info);
+        }
+    }
+
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+        return a.symbol.to_string() < b.symbol.to_string();
+    });
     return result;
 }
 

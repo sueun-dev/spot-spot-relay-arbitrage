@@ -2163,13 +2163,20 @@ void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbo
                  external_position_blacklist_.size());
 }
 
-bool OrderManager::is_safe_to_trade(const SymbolId& symbol, Exchange /*korean_ex*/, Exchange /*foreign_ex*/) {
+bool OrderManager::is_safe_to_trade(const SymbolId& symbol, Exchange korean_ex, Exchange foreign_ex) {
     // O(1) blacklist lookup - no API calls!
     std::lock_guard lock(blacklist_mutex_);
 
     if (external_position_blacklist_.count(symbol)) {
         Logger::warn("[SAFETY] Skipping {}: In external position blacklist",
                      symbol.to_string());
+        return false;
+    }
+
+    if (engine_ && !engine_->get_price_cache().is_transfer_route_available(
+            korean_ex, foreign_ex, std::string(symbol.get_base()))) {
+        Logger::warn("[SAFETY] Skipping {}: transfer route blocked for {} -> {}",
+                     symbol.to_string(), exchange_name(korean_ex), exchange_name(foreign_ex));
         return false;
     }
 
