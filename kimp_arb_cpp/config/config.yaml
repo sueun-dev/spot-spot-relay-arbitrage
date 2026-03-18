@@ -39,6 +39,13 @@ exchanges:
     secret_key: "${OKX_SECRET_KEY}"
     passphrase: "${OKX_PASSPHRASE}"
 
+  upbit:
+    enabled: true
+    ws_endpoint: "wss://api.upbit.com/websocket/v1"
+    rest_endpoint: "https://api.upbit.com"
+    api_key: "${UPBIT_API_KEY}"
+    secret_key: "${UPBIT_SECRET_KEY}"
+
 threading:
   io_threads: 4
   market_data_threads: 1
