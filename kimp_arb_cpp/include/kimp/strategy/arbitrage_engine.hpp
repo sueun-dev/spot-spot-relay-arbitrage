@@ -8,11 +8,14 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cctype>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
 #include <condition_variable>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 
 namespace kimp::strategy {
@@ -26,6 +29,11 @@ namespace kimp::strategy {
  */
 class PriceCache {
 public:
+    struct NetworkFee {
+        std::string network;   // normalized: "BTC", "ERC20", "TRC20", etc.
+        double fee_coins{0.0};
+    };
+
     struct PriceData {
         double bid{0.0};
         double ask{0.0};
@@ -89,8 +97,77 @@ private:
         return shards_[shard_index(key)];
     }
 
-    // USDT/KRW price from the active Korean venue.
+    // USDT/KRW price from Korean venues.
     std::atomic<double> usdt_krw_bithumb_{0.0};
+    std::atomic<double> usdt_krw_upbit_{0.0};
+
+    // ── Network-aware withdrawal fee storage ──
+    // Korean exchange: per-coin, per-network withdrawal fees in coin units.
+    // Foreign exchange: per-coin, deposit-enabled network set (normalized).
+    // get_withdraw_fee(korean, foreign, coin) intersects and picks minimum.
+    mutable std::shared_mutex withdraw_fee_mutex_;
+    // withdraw_network_fees_[Bithumb]["BTC"] = [{"BTC", 0.0002}]
+    std::unordered_map<Exchange, std::unordered_map<std::string, std::vector<NetworkFee>>> withdraw_network_fees_;
+    // foreign_deposit_nets_[Bybit]["BTC"] = {"BTC"}
+    std::unordered_map<Exchange, std::unordered_map<std::string, std::unordered_set<std::string>>> foreign_deposit_nets_;
+
+    // Precomputed flat cache: (korean_ex, foreign_ex, coin) → fee.
+    // Populated by finalize_withdraw_fees(), read lock-free after that.
+    std::unordered_map<std::string, double> precomputed_fees_;
+
+    static std::string make_fee_key(Exchange k, Exchange f, const std::string& coin) {
+        // "K:F:COIN" — short, unique, no allocation for small coins
+        std::string key;
+        key.reserve(coin.size() + 4);
+        key += static_cast<char>('0' + static_cast<int>(k));
+        key += ':';
+        key += static_cast<char>('0' + static_cast<int>(f));
+        key += ':';
+        key += coin;
+        return key;
+    }
+
+    // Normalize chain name: strip non-alnum, uppercase, then map known aliases
+    // to a canonical form so cross-exchange intersection works.
+    static std::string normalize_chain(std::string_view raw) {
+        std::string out;
+        out.reserve(raw.size());
+        for (char c : raw) {
+            if (std::isalnum(static_cast<unsigned char>(c))) {
+                out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+            }
+        }
+        // Canonical alias table: different exchanges use different names
+        // for the same blockchain network. Map them to one canonical form.
+        static const std::unordered_map<std::string, std::string> aliases = {
+            {"BITCOIN",         "BTC"},
+            {"ETHEREUM",        "ETH"},
+            {"POLYGON",         "MATIC"},
+            {"POL",             "MATIC"},
+            {"SOLANA",          "SOL"},
+            {"TRON",            "TRX"},
+            {"RIPPLE",          "XRP"},
+            {"LITECOIN",        "LTC"},
+            {"DOGECOIN",        "DOGE"},
+            {"AVALANCHE",       "AVAXC"},
+            {"AVALANCHECCHAIN", "AVAXC"},
+            {"STELLAR",         "XLM"},
+            {"COSMOS",          "ATOM"},
+            {"POLKADOT",        "DOT"},
+            {"CARDANO",         "ADA"},
+            {"ALGORAND",        "ALGO"},
+            {"NEAR",            "NEAR"},
+            {"ARBITRUMONE",     "ARBONE"},
+            {"BSC",             "BEP20"},
+            {"BNBSMARTCHAIN",   "BEP20"},
+            {"OPTIMISM",        "OP"},
+        };
+        auto it = aliases.find(out);
+        if (it != aliases.end()) {
+            return it->second;
+        }
+        return out;
+    }
 
 public:
     void update(Exchange ex, const SymbolId& symbol, double bid, double ask, double last,
@@ -135,6 +212,8 @@ public:
     void update_usdt_krw(Exchange ex, double price) {
         if (ex == Exchange::Bithumb) {
             usdt_krw_bithumb_.store(price, std::memory_order_release);
+        } else if (ex == Exchange::Upbit) {
+            usdt_krw_upbit_.store(price, std::memory_order_release);
         }
     }
 
@@ -166,9 +245,143 @@ public:
     double get_usdt_krw(Exchange ex) const {
         if (ex == Exchange::Bithumb) {
             return usdt_krw_bithumb_.load(std::memory_order_acquire);
+        } else if (ex == Exchange::Upbit) {
+            return usdt_krw_upbit_.load(std::memory_order_acquire);
         }
         return 0.0;
     }
+
+    // Store per-network withdrawal fees for a Korean exchange.
+    // Store per-network withdrawal fees. Network names are re-normalized
+    // through the canonical alias table on ingestion so that cross-exchange
+    // intersection works regardless of the source exchange's naming convention.
+    void set_withdraw_network_fees(Exchange ex, const std::string& base,
+                                    std::vector<NetworkFee> fees) {
+        for (auto& nf : fees) nf.network = normalize_chain(nf.network);
+        std::unique_lock lock(withdraw_fee_mutex_);
+        withdraw_network_fees_[ex][base] = std::move(fees);
+    }
+
+    // Store deposit-enabled networks. Same canonical normalization applied.
+    void set_foreign_deposit_networks(Exchange ex, const std::string& base,
+                                       std::unordered_set<std::string> nets) {
+        std::unordered_set<std::string> canonical;
+        for (auto& n : nets) canonical.insert(normalize_chain(n));
+        std::unique_lock lock(withdraw_fee_mutex_);
+        foreign_deposit_nets_[ex][base] = std::move(canonical);
+    }
+
+    // Hot-path lookup: lock-free read from precomputed flat cache.
+    // Call finalize_withdraw_fees() after all data is loaded.
+    double get_withdraw_fee(Exchange korean_ex, Exchange foreign_ex,
+                            const std::string& base) const {
+        // Fast path: precomputed cache (lock-free after finalize)
+        auto key = make_fee_key(korean_ex, foreign_ex, base);
+        auto it = precomputed_fees_.find(key);
+        if (it != precomputed_fees_.end()) return it->second;
+        return 0.0;
+    }
+
+    // Call once after all set_withdraw_network_fees / set_foreign_deposit_networks
+    // calls are done. Precomputes the fee for every (korean_ex, foreign_ex, coin)
+    // combination into a flat lock-free map for zero-overhead hot-path reads.
+    void finalize_withdraw_fees() {
+        std::shared_lock lock(withdraw_fee_mutex_);
+        precomputed_fees_.clear();
+
+        // Collect all coin names
+        std::unordered_set<std::string> all_coins;
+        for (const auto& [ex, coin_map] : withdraw_network_fees_) {
+            for (const auto& [coin, _] : coin_map) all_coins.insert(coin);
+        }
+
+        // Collect all exchange pairs
+        std::vector<Exchange> korean_exs, foreign_exs;
+        for (const auto& [ex, _] : withdraw_network_fees_) korean_exs.push_back(ex);
+        for (const auto& [ex, _] : foreign_deposit_nets_) foreign_exs.push_back(ex);
+        // Also add exchanges that might not have deposit data yet
+        if (foreign_exs.empty()) {
+            foreign_exs = {Exchange::Bybit, Exchange::OKX};
+        }
+
+        for (const auto& coin : all_coins) {
+            for (auto k_ex : korean_exs) {
+                for (auto f_ex : foreign_exs) {
+                    double fee = get_withdraw_fee_locked(k_ex, f_ex, coin);
+                    if (fee > 0.0) {
+                        precomputed_fees_[make_fee_key(k_ex, f_ex, coin)] = fee;
+                    }
+                }
+            }
+        }
+
+    }
+
+    size_t precomputed_fee_count() const { return precomputed_fees_.size(); }
+
+    size_t withdraw_fee_count() const {
+        std::shared_lock lock(withdraw_fee_mutex_);
+        size_t total = 0;
+        for (const auto& [_, m] : withdraw_network_fees_) total += m.size();
+        return total;
+    }
+
+    size_t withdraw_fee_count(Exchange ex) const {
+        std::shared_lock lock(withdraw_fee_mutex_);
+        auto it = withdraw_network_fees_.find(ex);
+        return (it != withdraw_network_fees_.end()) ? it->second.size() : 0;
+    }
+
+private:
+    // Must be called with withdraw_fee_mutex_ held (shared or exclusive).
+    double get_withdraw_fee_locked(Exchange korean_ex, Exchange foreign_ex,
+                                   const std::string& base) const {
+        // Get foreign deposit networks for this coin
+        const std::unordered_set<std::string>* deposit_nets = nullptr;
+        auto fd_it = foreign_deposit_nets_.find(foreign_ex);
+        if (fd_it != foreign_deposit_nets_.end()) {
+            auto coin_it = fd_it->second.find(base);
+            if (coin_it != fd_it->second.end() && !coin_it->second.empty()) {
+                deposit_nets = &coin_it->second;
+            }
+        }
+
+        // Try requested Korean exchange first, then others
+        auto try_korean = [&](Exchange ex) -> double {
+            auto wf_it = withdraw_network_fees_.find(ex);
+            if (wf_it == withdraw_network_fees_.end()) return -1.0;
+            auto coin_it = wf_it->second.find(base);
+            if (coin_it == wf_it->second.end() || coin_it->second.empty()) return -1.0;
+
+            double min_fee = std::numeric_limits<double>::max();
+            for (const auto& nf : coin_it->second) {
+                if (deposit_nets) {
+                    // Only consider networks the foreign exchange can receive
+                    if (deposit_nets->count(nf.network) && nf.fee_coins < min_fee) {
+                        min_fee = nf.fee_coins;
+                    }
+                } else {
+                    // No foreign deposit data → fall back to raw minimum
+                    if (nf.fee_coins < min_fee) min_fee = nf.fee_coins;
+                }
+            }
+            return (min_fee < std::numeric_limits<double>::max()) ? min_fee : -1.0;
+        };
+
+        double fee = try_korean(korean_ex);
+        if (fee >= 0.0) return fee;
+
+        // Fallback: try other Korean exchanges
+        for (const auto& [other_ex, _] : withdraw_network_fees_) {
+            if (other_ex == korean_ex) continue;
+            fee = try_korean(other_ex);
+            if (fee >= 0.0) return fee;
+        }
+
+        return 0.0;
+    }
+
+public:
 
     // Debug: get all stored symbols
     std::vector<std::string> get_all_keys() const {
@@ -445,6 +658,8 @@ public:
         double bithumb_total_fee_krw{0.0};
         double bybit_total_fee_usdt{0.0};
         double bybit_total_fee_krw{0.0};
+        double withdraw_fee_coins{0.0};   // Korean exchange withdrawal fee in coin units
+        double withdraw_fee_krw{0.0};     // Network transfer fee (Korean → Foreign) in KRW
         double total_fee_krw{0.0};
         double gross_spread_krw{0.0};
         double gross_edge_pct{0.0};
@@ -481,7 +696,10 @@ public:
                                                 double korean_ask_qty,
                                                 double foreign_bid,
                                                 double foreign_bid_qty,
-                                                double usdt_krw_rate) {
+                                                double usdt_krw_rate,
+                                                double korean_fee_rate = TradingConfig::BITHUMB_FEE_RATE,
+                                                double foreign_fee_rate = TradingConfig::BYBIT_FEE_RATE,
+                                                double withdraw_fee_coins = 0.0) {
         RelayMetrics metrics;
         if (korean_ask <= 0.0 || korean_ask_qty <= 0.0 ||
             foreign_bid <= 0.0 || foreign_bid_qty <= 0.0 ||
@@ -494,10 +712,10 @@ public:
         metrics.bithumb_top_usdt = metrics.bithumb_top_krw / usdt_krw_rate;
         metrics.bybit_top_usdt = foreign_bid * foreign_bid_qty;
         metrics.bybit_top_krw = metrics.bybit_top_usdt * usdt_krw_rate;
-        metrics.max_tradable_usdt_at_best = foreign_bid * metrics.match_qty;
+        metrics.max_tradable_usdt_at_best = std::min(metrics.bithumb_top_usdt, metrics.bybit_top_usdt);
         metrics.target_coin_qty = TradingConfig::TARGET_ENTRY_USDT / foreign_bid;
-        metrics.bithumb_can_fill_target = korean_ask_qty >= metrics.target_coin_qty;
-        metrics.bybit_can_fill_target = foreign_bid_qty >= metrics.target_coin_qty;
+        metrics.bithumb_can_fill_target = metrics.bithumb_top_usdt >= TradingConfig::TARGET_ENTRY_USDT;
+        metrics.bybit_can_fill_target = metrics.bybit_top_usdt >= TradingConfig::TARGET_ENTRY_USDT;
         metrics.both_can_fill_target = metrics.bithumb_can_fill_target && metrics.bybit_can_fill_target;
 
         // Price the entry on the immediately executable size, capped at the live target notional.
@@ -506,13 +724,15 @@ public:
         metrics.match_sell_usdt = foreign_bid * effective_entry_qty;
         metrics.match_sell_krw = metrics.match_sell_usdt * usdt_krw_rate;
 
-        const double bithumb_fee_per_trade_krw = metrics.match_buy_krw * TradingConfig::BITHUMB_FEE_RATE;
-        const double bybit_fee_per_trade_usdt = metrics.match_sell_usdt * TradingConfig::BYBIT_FEE_RATE;
-        const double bybit_fee_per_trade_krw = metrics.match_sell_krw * TradingConfig::BYBIT_FEE_RATE;
-        metrics.bithumb_total_fee_krw = bithumb_fee_per_trade_krw * TradingConfig::BITHUMB_FEE_EVENTS;
-        metrics.bybit_total_fee_usdt = bybit_fee_per_trade_usdt * TradingConfig::BYBIT_FEE_EVENTS;
-        metrics.bybit_total_fee_krw = bybit_fee_per_trade_krw * TradingConfig::BYBIT_FEE_EVENTS;
-        metrics.total_fee_krw = metrics.bithumb_total_fee_krw + metrics.bybit_total_fee_krw;
+        const double korean_fee_per_trade_krw = metrics.match_buy_krw * korean_fee_rate;
+        const double foreign_fee_per_trade_usdt = metrics.match_sell_usdt * foreign_fee_rate;
+        const double foreign_fee_per_trade_krw = metrics.match_sell_krw * foreign_fee_rate;
+        metrics.bithumb_total_fee_krw = korean_fee_per_trade_krw * TradingConfig::KOREAN_FEE_EVENTS;
+        metrics.bybit_total_fee_usdt = foreign_fee_per_trade_usdt * TradingConfig::FOREIGN_FEE_EVENTS;
+        metrics.bybit_total_fee_krw = foreign_fee_per_trade_krw * TradingConfig::FOREIGN_FEE_EVENTS;
+        metrics.withdraw_fee_coins = withdraw_fee_coins;
+        metrics.withdraw_fee_krw = withdraw_fee_coins * korean_ask;  // Fee in coins × KRW price
+        metrics.total_fee_krw = metrics.bithumb_total_fee_krw + metrics.bybit_total_fee_krw + metrics.withdraw_fee_krw;
 
         metrics.gross_spread_krw = metrics.match_sell_krw - metrics.match_buy_krw;
         if (metrics.match_buy_krw > 0.0) {
@@ -564,12 +784,15 @@ public:
         double bithumb_total_fee_krw{0.0};
         double bybit_total_fee_usdt{0.0};
         double bybit_total_fee_krw{0.0};
+        double withdraw_fee_coins{0.0};
+        double withdraw_fee_krw{0.0};
         double total_fee_krw{0.0};
         double net_profit_krw{0.0};
         bool both_can_fill_target{false};
         uint64_t age_ms{0};
         bool entry_signal{false};
         bool exit_signal{false};
+        Exchange best_korean_exchange{Exchange::Bithumb};
         Exchange best_foreign_exchange{Exchange::Bybit};
     };
 
@@ -580,6 +803,7 @@ public:
     void set_exchange(Exchange ex, ExchangePtr exchange);
     void add_symbol(const SymbolId& symbol);
     void add_exchange_pair(Exchange korean, Exchange foreign);
+    void set_exchange_pair_entry_enabled(Exchange korean, Exchange foreign, bool enabled);
 
     // Lifecycle
     void start();
@@ -656,7 +880,13 @@ private:
     std::unordered_map<SymbolId, size_t, SymbolIdHash> korean_symbol_index_;
     std::unordered_map<SymbolId, size_t, SymbolIdHash> foreign_symbol_index_;
 
-    std::vector<std::pair<Exchange, Exchange>> exchange_pairs_;
+    struct ExchangePairConfig {
+        Exchange korean{Exchange::Bithumb};
+        Exchange foreign{Exchange::Bybit};
+        bool entry_enabled{true};
+    };
+
+    std::vector<ExchangePairConfig> exchange_pairs_;
 
     // Price and position tracking
     PriceCache price_cache_;
@@ -683,6 +913,7 @@ private:
         std::atomic<double> net_profit_krw{0.0};
         std::atomic<double> usdt_rate{0.0};
         std::atomic<bool> both_can_fill_target{false};
+        std::atomic<uint8_t> best_korean_exchange{0};  // Exchange enum of best Korean venue
         std::atomic<uint8_t> best_foreign_exchange{0}; // Exchange enum of best foreign venue
         std::atomic<bool> qualified{false};         // All entry filters passed
         std::atomic<bool> signal_fired{false};      // Dedup: reset when disqualified
@@ -734,7 +965,7 @@ private:
     void sync_entry_state_bits(size_t idx, bool qualifies, bool signal_fired);
 
     static bool is_korean_exchange(Exchange ex) {
-        return ex == Exchange::Bithumb;
+        return ex == Exchange::Bithumb || ex == Exchange::Upbit;
     }
 };
 
