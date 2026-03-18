@@ -256,6 +256,22 @@ double spread_pct(double bid, double ask) {
     return ((ask - bid) / mid) * 100.0;
 }
 
+double resolved_fill_quantity(const kimp::Order& order) {
+    if (order.filled_quantity > 0.0) {
+        return order.filled_quantity;
+    }
+    return order.quantity > 0.0 ? order.quantity : 0.0;
+}
+
+double resolved_fill_price(const kimp::Order& order, double fallback) {
+    return order.average_price > 0.0 ? order.average_price : fallback;
+}
+
+bool quantities_match(double lhs, double rhs) {
+    const double scale = std::max({1.0, std::fabs(lhs), std::fabs(rhs)});
+    return std::fabs(lhs - rhs) <= (scale * 1e-6);
+}
+
 bool quote_pair_is_usable(const kimp::strategy::PriceCache::PriceData& korean_price,
                           const kimp::strategy::PriceCache::PriceData& foreign_price,
                           bool is_exit = false) {
@@ -296,6 +312,8 @@ void OrderManager::set_exchange(Exchange ex, ExchangePtr exchange) {
     exchanges_[static_cast<size_t>(ex)] = exchange;
     if (ex == Exchange::Bithumb) {
         bithumb_exchange_ = std::dynamic_pointer_cast<exchange::bithumb::BithumbExchange>(exchange);
+    } else if (ex == Exchange::Upbit) {
+        upbit_exchange_ = std::dynamic_pointer_cast<exchange::upbit::UpbitExchange>(exchange);
     } else if (ex == Exchange::Bybit) {
         bybit_exchange_ = std::dynamic_pointer_cast<exchange::bybit::BybitExchange>(exchange);
     } else if (ex == Exchange::OKX) {
@@ -306,6 +324,9 @@ void OrderManager::set_exchange(Exchange ex, ExchangePtr exchange) {
 OrderManager::KoreanExchangePtr OrderManager::get_korean_exchange(Exchange ex) {
     if (ex == Exchange::Bithumb) {
         return bithumb_exchange_;
+    }
+    if (ex == Exchange::Upbit) {
+        return upbit_exchange_;
     }
     return nullptr;
 }
@@ -340,7 +361,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
     result.position.position_size_usd = position_size_usd;
 
     auto korean_ex = get_korean_exchange(signal.korean_exchange);
-    auto foreign_ex = get_bybit_exchange();
+    auto foreign_ex = get_foreign_exchange(signal.foreign_exchange);
 
     if (!korean_ex || !foreign_ex) {
         result.error_message = "Exchange not available";
@@ -384,6 +405,13 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
         ? initial_position->foreign_entry_price * initial_position->foreign_amount : 0.0;
     double realized_pnl_krw = initial_position ? initial_position->realized_pnl_krw : 0.0;
     double last_usdt_rate = signal.usdt_krw_rate;
+
+    if (initial_position &&
+        !quantities_match(initial_position->korean_amount, initial_position->foreign_amount)) {
+        result.error_message = "Initial position is already mismatched; manual recovery required";
+        Logger::error("[TOPUP] {}", result.error_message);
+        return result;
+    }
 
     if (initial_position) {
         Logger::info("[TOPUP] Resuming entry for {} from {:.8f} coins (${:.2f}/{:.2f})",
@@ -523,10 +551,14 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
         double next_order_coin_amount = current_foreign_bid > 0.0
             ? (next_order_usd / current_foreign_bid)
             : 0.0;
-        bool korean_can_fill_required = next_order_coin_amount > 0.0 &&
-                                        current_korean_ask_qty >= next_order_coin_amount;
-        bool foreign_can_fill_required = next_order_coin_amount > 0.0 &&
-                                         current_foreign_bid_qty >= next_order_coin_amount;
+        double current_korean_top_usdt = usdt_rate > 0.0
+            ? ((current_korean_ask * current_korean_ask_qty) / usdt_rate)
+            : 0.0;
+        double current_foreign_top_usdt = current_foreign_bid * current_foreign_bid_qty;
+        bool korean_can_fill_required = next_order_usd > 0.0 &&
+                                        current_korean_top_usdt >= next_order_usd;
+        bool foreign_can_fill_required = next_order_usd > 0.0 &&
+                                         current_foreign_top_usdt >= next_order_usd;
         auto relay_metrics = strategy::PremiumCalculator::calculate_relay_metrics(
             current_korean_ask,
             current_korean_ask_qty,
@@ -646,24 +678,124 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
             fill_done.wait();
 
             if (korean_order.status == OrderStatus::Filled) {
-                double short_price = foreign_order.average_price;
-                if (short_price <= 0) {
-                    short_price = current_foreign_bid;
-                    Logger::warn("[ADAPTIVE-ENTRY] No fill price from Bybit, using cache {:.8f}", short_price);
+                double short_price = resolved_fill_price(foreign_order, current_foreign_bid);
+                if (foreign_order.average_price <= 0.0) {
+                    Logger::warn("[ADAPTIVE-ENTRY] No fill price from foreign exchange, using cache {:.8f}", short_price);
                 }
-                double buy_price = korean_order.average_price;
-                if (buy_price <= 0) {
-                    buy_price = current_korean_ask;
-                    Logger::warn("[ADAPTIVE-ENTRY] No fill price from Bithumb, using cache {:.2f}", buy_price);
+                double buy_price = resolved_fill_price(korean_order, current_korean_ask);
+                if (korean_order.average_price <= 0.0) {
+                    Logger::warn("[ADAPTIVE-ENTRY] No fill price from Korean exchange, using cache {:.2f}", buy_price);
                 }
-                // Reconcile filled_quantity if available (should match order.quantity for $25 market orders)
-                if (foreign_order.filled_quantity > 0) actual_filled = foreign_order.filled_quantity;
 
+                double foreign_open_qty = resolved_fill_quantity(foreign_order);
+                double korean_open_qty = resolved_fill_quantity(korean_order);
+                double entry_adjustment_pnl_krw = 0.0;
+
+                if (!quantities_match(foreign_open_qty, korean_open_qty)) {
+                    if (foreign_open_qty > korean_open_qty) {
+                        const double delta = foreign_open_qty - korean_open_qty;
+                        Order correction;
+                        Logger::warn("[HEDGE] Entry foreign fill exceeds Korean fill by {:.8f}; covering delta", delta);
+                        if (!flatten_extra_foreign_short(signal.foreign_exchange, foreign_symbol, delta, correction)) {
+                            Position mismatch;
+                            mismatch.symbol = signal.symbol;
+                            mismatch.korean_exchange = signal.korean_exchange;
+                            mismatch.foreign_exchange = signal.foreign_exchange;
+                            mismatch.entry_time = result.position.entry_time;
+                            mismatch.entry_premium = result.position.entry_premium;
+                            mismatch.position_size_usd = position_size_usd;
+                            mismatch.korean_amount = held_amount + korean_open_qty;
+                            mismatch.foreign_amount = held_amount + foreign_open_qty;
+                            mismatch.korean_entry_price = (held_amount + korean_open_qty) > 0.0
+                                ? (total_korean_cost + (korean_open_qty * buy_price)) / (held_amount + korean_open_qty)
+                                : 0.0;
+                            mismatch.foreign_entry_price = (held_amount + foreign_open_qty) > 0.0
+                                ? (total_foreign_value + (foreign_open_qty * short_price)) / (held_amount + foreign_open_qty)
+                                : 0.0;
+                            mismatch.realized_pnl_krw = realized_pnl_krw;
+                            mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                            trigger_critical_stop(
+                                "[RELAY-ENTRY] Failed to cover excess foreign short after Korean underfill",
+                                mismatch
+                            );
+                            return result;
+                        }
+                        const double correction_qty = resolved_fill_quantity(correction);
+                        const double correction_price = resolved_fill_price(correction, current_foreign_ask);
+                        foreign_open_qty -= correction_qty;
+                        entry_adjustment_pnl_krw += (short_price - correction_price) * correction_qty * usdt_rate;
+                    } else {
+                        const double delta = korean_open_qty - foreign_open_qty;
+                        Order correction;
+                        Logger::warn("[HEDGE] Entry Korean fill exceeds foreign fill by {:.8f}; selling delta", delta);
+                        if (!flatten_extra_korean_long(signal.korean_exchange, signal.symbol, delta, correction)) {
+                            Position mismatch;
+                            mismatch.symbol = signal.symbol;
+                            mismatch.korean_exchange = signal.korean_exchange;
+                            mismatch.foreign_exchange = signal.foreign_exchange;
+                            mismatch.entry_time = result.position.entry_time;
+                            mismatch.entry_premium = result.position.entry_premium;
+                            mismatch.position_size_usd = position_size_usd;
+                            mismatch.korean_amount = held_amount + korean_open_qty;
+                            mismatch.foreign_amount = held_amount + foreign_open_qty;
+                            mismatch.korean_entry_price = (held_amount + korean_open_qty) > 0.0
+                                ? (total_korean_cost + (korean_open_qty * buy_price)) / (held_amount + korean_open_qty)
+                                : 0.0;
+                            mismatch.foreign_entry_price = (held_amount + foreign_open_qty) > 0.0
+                                ? (total_foreign_value + (foreign_open_qty * short_price)) / (held_amount + foreign_open_qty)
+                                : 0.0;
+                            mismatch.realized_pnl_krw = realized_pnl_krw;
+                            mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                            trigger_critical_stop(
+                                "[RELAY-ENTRY] Failed to sell excess Korean spot after foreign underfill",
+                                mismatch
+                            );
+                            return result;
+                        }
+                        const double correction_qty = resolved_fill_quantity(correction);
+                        const double correction_price = resolved_fill_price(correction, current_korean_bid);
+                        korean_open_qty -= correction_qty;
+                        entry_adjustment_pnl_krw += (correction_price - buy_price) * correction_qty;
+                    }
+                }
+
+                if (!quantities_match(foreign_open_qty, korean_open_qty)) {
+                    Position mismatch;
+                    mismatch.symbol = signal.symbol;
+                    mismatch.korean_exchange = signal.korean_exchange;
+                    mismatch.foreign_exchange = signal.foreign_exchange;
+                    mismatch.entry_time = result.position.entry_time;
+                    mismatch.entry_premium = result.position.entry_premium;
+                    mismatch.position_size_usd = position_size_usd;
+                    mismatch.korean_amount = held_amount + korean_open_qty;
+                    mismatch.foreign_amount = held_amount + foreign_open_qty;
+                    mismatch.korean_entry_price = (held_amount + korean_open_qty) > 0.0
+                        ? (total_korean_cost + (korean_open_qty * buy_price)) / (held_amount + korean_open_qty)
+                        : 0.0;
+                    mismatch.foreign_entry_price = (held_amount + foreign_open_qty) > 0.0
+                        ? (total_foreign_value + (foreign_open_qty * short_price)) / (held_amount + foreign_open_qty)
+                        : 0.0;
+                    mismatch.realized_pnl_krw = realized_pnl_krw + entry_adjustment_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[RELAY-ENTRY] Entry legs remain mismatched after delta hedge",
+                        mismatch
+                    );
+                    return result;
+                }
+
+                actual_filled = std::min(foreign_open_qty, korean_open_qty);
                 double actual_korean_cost = actual_filled * buy_price;
 
                 held_amount += actual_filled;
                 total_korean_cost += actual_korean_cost;
                 total_foreign_value += actual_filled * short_price;
+                realized_pnl_krw += entry_adjustment_pnl_krw;
+                result.korean_filled_amount = actual_filled;
+                result.foreign_filled_amount = actual_filled;
 
                 double new_open_notional_usd = total_foreign_value;
                 double effective_entry_pm = calculate_effective_entry_pm(usdt_rate);
@@ -709,6 +841,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
             } else {
                 Logger::error("[RELAY-ENTRY] Korean BUY failed, rolling back Bybit spot-margin short");
                 record_latency(LatencyStage::Error, static_cast<int64_t>(korean_order.status));
+                actual_filled = resolved_fill_quantity(foreign_order);
                 Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
                 if (rollback.status != OrderStatus::Filled) {
                     Position mismatch;
@@ -807,27 +940,109 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
             fill_done.wait();
 
             if (korean_order.status == OrderStatus::Filled) {
-                // Reconcile filled_quantity if available
-                if (foreign_order.filled_quantity > 0) actual_covered = foreign_order.filled_quantity;
-
-                double cover_price = foreign_order.average_price;
-                if (cover_price <= 0) {
-                    cover_price = current_foreign_ask;
-                    Logger::warn("[ADAPTIVE-EXIT] No cover fill price from Bybit, using cache {:.8f}", cover_price);
-                }
-                double sell_price = korean_order.average_price;
-                if (sell_price <= 0) {
-                    sell_price = current_korean_bid;
-                    Logger::warn("[ADAPTIVE-EXIT] No sell fill price from Bithumb, using cache {:.2f}", sell_price);
-                }
-
-                // P&L using average entry prices
                 double avg_korean_entry = held_amount > 0 ? total_korean_cost / held_amount : 0.0;
                 double avg_foreign_entry = held_amount > 0 ? total_foreign_value / held_amount : 0.0;
-                double korean_pnl_krw = (sell_price - avg_korean_entry) * actual_covered;
-                double foreign_pnl_usd = (avg_foreign_entry - cover_price) * actual_covered;
-                double foreign_pnl_krw = foreign_pnl_usd * usdt_rate;
-                double split_pnl_krw = korean_pnl_krw + foreign_pnl_krw;
+
+                double foreign_closed_qty = resolved_fill_quantity(foreign_order);
+                double korean_closed_qty = resolved_fill_quantity(korean_order);
+                double cover_price = resolved_fill_price(foreign_order, current_foreign_ask);
+                if (foreign_order.average_price <= 0.0) {
+                    Logger::warn("[ADAPTIVE-EXIT] No cover fill price from foreign exchange, using cache {:.8f}", cover_price);
+                }
+                double sell_price = resolved_fill_price(korean_order, current_korean_bid);
+                if (korean_order.average_price <= 0.0) {
+                    Logger::warn("[ADAPTIVE-EXIT] No sell fill price from Korean exchange, using cache {:.2f}", sell_price);
+                }
+
+                double korean_pnl_krw = (sell_price - avg_korean_entry) * korean_closed_qty;
+                double foreign_pnl_usd = (avg_foreign_entry - cover_price) * foreign_closed_qty;
+                double split_pnl_krw = korean_pnl_krw + (foreign_pnl_usd * usdt_rate);
+
+                if (!quantities_match(foreign_closed_qty, korean_closed_qty)) {
+                    if (foreign_closed_qty > korean_closed_qty) {
+                        const double delta = foreign_closed_qty - korean_closed_qty;
+                        Order correction;
+                        Logger::warn("[HEDGE] Exit foreign cover exceeds Korean sell by {:.8f}; selling delta", delta);
+                        if (!flatten_extra_korean_long(signal.korean_exchange, signal.symbol, delta, correction)) {
+                            Position mismatch;
+                            mismatch.symbol = signal.symbol;
+                            mismatch.korean_exchange = signal.korean_exchange;
+                            mismatch.foreign_exchange = signal.foreign_exchange;
+                            mismatch.entry_time = result.position.entry_time;
+                            mismatch.entry_premium = result.position.entry_premium;
+                            mismatch.position_size_usd = position_size_usd;
+                            mismatch.korean_amount = std::max(0.0, held_amount - korean_closed_qty);
+                            mismatch.foreign_amount = std::max(0.0, held_amount - foreign_closed_qty);
+                            mismatch.korean_entry_price = avg_korean_entry;
+                            mismatch.foreign_entry_price = avg_foreign_entry;
+                            mismatch.realized_pnl_krw = realized_pnl_krw;
+                            mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                            trigger_critical_stop(
+                                "[ADAPTIVE-EXIT] Failed to liquidate excess Korean spot after foreign over-cover",
+                                mismatch
+                            );
+                            return result;
+                        }
+                        const double correction_qty = resolved_fill_quantity(correction);
+                        const double correction_price = resolved_fill_price(correction, current_korean_bid);
+                        korean_closed_qty += correction_qty;
+                        split_pnl_krw += (correction_price - avg_korean_entry) * correction_qty;
+                    } else {
+                        const double delta = korean_closed_qty - foreign_closed_qty;
+                        Order correction;
+                        Logger::warn("[HEDGE] Exit Korean sell exceeds foreign cover by {:.8f}; covering delta", delta);
+                        if (!flatten_extra_foreign_short(signal.foreign_exchange, foreign_symbol, delta, correction)) {
+                            Position mismatch;
+                            mismatch.symbol = signal.symbol;
+                            mismatch.korean_exchange = signal.korean_exchange;
+                            mismatch.foreign_exchange = signal.foreign_exchange;
+                            mismatch.entry_time = result.position.entry_time;
+                            mismatch.entry_premium = result.position.entry_premium;
+                            mismatch.position_size_usd = position_size_usd;
+                            mismatch.korean_amount = std::max(0.0, held_amount - korean_closed_qty);
+                            mismatch.foreign_amount = std::max(0.0, held_amount - foreign_closed_qty);
+                            mismatch.korean_entry_price = avg_korean_entry;
+                            mismatch.foreign_entry_price = avg_foreign_entry;
+                            mismatch.realized_pnl_krw = realized_pnl_krw;
+                            mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                            trigger_critical_stop(
+                                "[ADAPTIVE-EXIT] Failed to cover excess foreign short after Korean over-sell",
+                                mismatch
+                            );
+                            return result;
+                        }
+                        const double correction_qty = resolved_fill_quantity(correction);
+                        const double correction_price = resolved_fill_price(correction, current_foreign_ask);
+                        foreign_closed_qty += correction_qty;
+                        split_pnl_krw += (avg_foreign_entry - correction_price) * correction_qty * usdt_rate;
+                    }
+                }
+
+                if (!quantities_match(foreign_closed_qty, korean_closed_qty)) {
+                    Position mismatch;
+                    mismatch.symbol = signal.symbol;
+                    mismatch.korean_exchange = signal.korean_exchange;
+                    mismatch.foreign_exchange = signal.foreign_exchange;
+                    mismatch.entry_time = result.position.entry_time;
+                    mismatch.entry_premium = result.position.entry_premium;
+                    mismatch.position_size_usd = position_size_usd;
+                    mismatch.korean_amount = std::max(0.0, held_amount - korean_closed_qty);
+                    mismatch.foreign_amount = std::max(0.0, held_amount - foreign_closed_qty);
+                    mismatch.korean_entry_price = avg_korean_entry;
+                    mismatch.foreign_entry_price = avg_foreign_entry;
+                    mismatch.realized_pnl_krw = realized_pnl_krw + split_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[ADAPTIVE-EXIT] Exit legs remain mismatched after delta hedge",
+                        mismatch
+                    );
+                    return result;
+                }
+
+                actual_covered = std::min(foreign_closed_qty, korean_closed_qty);
                 realized_pnl_krw += split_pnl_krw;
 
                 // Reduce costs proportionally
@@ -908,6 +1123,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
             } else {
                 // SELL failed after COVER — retry to avoid unhedged state
                 // Resolve fill prices for P&L on retry path
+                actual_covered = resolved_fill_quantity(foreign_order);
                 double cover_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_ask;
 
                 Logger::error("[ADAPTIVE-EXIT] Korean SELL failed after COVER, retrying... Unhedged: {:.8f} coins", actual_covered);
@@ -1007,11 +1223,17 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
     result.position = position;
 
     auto korean_ex = get_korean_exchange(signal.korean_exchange);
-    auto foreign_ex = get_bybit_exchange();
+    auto foreign_ex = get_foreign_exchange(signal.foreign_exchange);
 
     if (!korean_ex || !foreign_ex) {
         result.error_message = "Exchange not available";
         Logger::error("Exit failed: {}", result.error_message);
+        return result;
+    }
+
+    if (!quantities_match(position.korean_amount, position.foreign_amount)) {
+        result.error_message = "Position is mismatched; manual recovery required before exit";
+        Logger::error("[EXIT] {}", result.error_message);
         return result;
     }
 
@@ -1285,6 +1507,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                     }
                 }
             } else {
+                actual_covered = resolved_fill_quantity(foreign_order);
                 double cover_price = foreign_order.average_price > 0 ? foreign_order.average_price : current_foreign_ask;
 
                 // SELL failed after COVER — retry to avoid unhedged state
@@ -1433,23 +1656,107 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
             fill_done.wait();
 
             if (korean_order.status == OrderStatus::Filled) {
-                if (foreign_order.filled_quantity > 0) actual_filled = foreign_order.filled_quantity;
+                double short_price = resolved_fill_price(foreign_order, current_foreign_bid);
+                if (foreign_order.average_price <= 0.0) {
+                    Logger::warn("[ADAPTIVE-REENTRY] No fill price from foreign exchange, using cache {:.8f}", short_price);
+                }
+                double buy_price = resolved_fill_price(korean_order, current_korean_ask);
+                if (korean_order.average_price <= 0.0) {
+                    Logger::warn("[ADAPTIVE-REENTRY] No fill price from Korean exchange, using cache {:.2f}", buy_price);
+                }
 
-                double short_price = foreign_order.average_price;
-                if (short_price <= 0) {
-                    short_price = current_foreign_bid;
-                    Logger::warn("[ADAPTIVE-REENTRY] No fill price from Bybit, using cache {:.8f}", short_price);
+                double foreign_open_qty = resolved_fill_quantity(foreign_order);
+                double korean_open_qty = resolved_fill_quantity(korean_order);
+                double reentry_adjustment_pnl_krw = 0.0;
+
+                if (!quantities_match(foreign_open_qty, korean_open_qty)) {
+                    if (foreign_open_qty > korean_open_qty) {
+                        const double delta = foreign_open_qty - korean_open_qty;
+                        Order correction;
+                        Logger::warn("[HEDGE] Re-entry foreign fill exceeds Korean fill by {:.8f}; covering delta", delta);
+                        if (!flatten_extra_foreign_short(signal.foreign_exchange, foreign_symbol, delta, correction)) {
+                            Position mismatch = position;
+                            mismatch.korean_amount = remaining_amount + korean_open_qty;
+                            mismatch.foreign_amount = remaining_amount + foreign_open_qty;
+                            mismatch.korean_entry_price = (remaining_amount + korean_open_qty) > 0.0
+                                ? (total_korean_cost + (korean_open_qty * buy_price)) / (remaining_amount + korean_open_qty)
+                                : 0.0;
+                            mismatch.foreign_entry_price = (remaining_amount + foreign_open_qty) > 0.0
+                                ? (total_foreign_value + (foreign_open_qty * short_price)) / (remaining_amount + foreign_open_qty)
+                                : 0.0;
+                            mismatch.entry_premium = calculate_effective_entry_pm(usdt_rate);
+                            mismatch.realized_pnl_krw = realized_pnl_krw;
+                            mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                            trigger_critical_stop(
+                                "[ADAPTIVE-REENTRY] Failed to cover excess foreign short after Korean underfill",
+                                mismatch
+                            );
+                            return result;
+                        }
+                        const double correction_qty = resolved_fill_quantity(correction);
+                        const double correction_price = resolved_fill_price(correction, current_foreign_ask);
+                        foreign_open_qty -= correction_qty;
+                        reentry_adjustment_pnl_krw += (short_price - correction_price) * correction_qty * usdt_rate;
+                    } else {
+                        const double delta = korean_open_qty - foreign_open_qty;
+                        Order correction;
+                        Logger::warn("[HEDGE] Re-entry Korean fill exceeds foreign fill by {:.8f}; selling delta", delta);
+                        if (!flatten_extra_korean_long(signal.korean_exchange, position.symbol, delta, correction)) {
+                            Position mismatch = position;
+                            mismatch.korean_amount = remaining_amount + korean_open_qty;
+                            mismatch.foreign_amount = remaining_amount + foreign_open_qty;
+                            mismatch.korean_entry_price = (remaining_amount + korean_open_qty) > 0.0
+                                ? (total_korean_cost + (korean_open_qty * buy_price)) / (remaining_amount + korean_open_qty)
+                                : 0.0;
+                            mismatch.foreign_entry_price = (remaining_amount + foreign_open_qty) > 0.0
+                                ? (total_foreign_value + (foreign_open_qty * short_price)) / (remaining_amount + foreign_open_qty)
+                                : 0.0;
+                            mismatch.entry_premium = calculate_effective_entry_pm(usdt_rate);
+                            mismatch.realized_pnl_krw = realized_pnl_krw;
+                            mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                            trigger_critical_stop(
+                                "[ADAPTIVE-REENTRY] Failed to sell excess Korean spot after foreign underfill",
+                                mismatch
+                            );
+                            return result;
+                        }
+                        const double correction_qty = resolved_fill_quantity(correction);
+                        const double correction_price = resolved_fill_price(correction, current_korean_bid);
+                        korean_open_qty -= correction_qty;
+                        reentry_adjustment_pnl_krw += (correction_price - buy_price) * correction_qty;
+                    }
                 }
-                double buy_price = korean_order.average_price;
-                if (buy_price <= 0) {
-                    buy_price = current_korean_ask;
-                    Logger::warn("[ADAPTIVE-REENTRY] No fill price from Bithumb, using cache {:.2f}", buy_price);
+
+                if (!quantities_match(foreign_open_qty, korean_open_qty)) {
+                    Position mismatch = position;
+                    mismatch.korean_amount = remaining_amount + korean_open_qty;
+                    mismatch.foreign_amount = remaining_amount + foreign_open_qty;
+                    mismatch.korean_entry_price = (remaining_amount + korean_open_qty) > 0.0
+                        ? (total_korean_cost + (korean_open_qty * buy_price)) / (remaining_amount + korean_open_qty)
+                        : 0.0;
+                    mismatch.foreign_entry_price = (remaining_amount + foreign_open_qty) > 0.0
+                        ? (total_foreign_value + (foreign_open_qty * short_price)) / (remaining_amount + foreign_open_qty)
+                        : 0.0;
+                    mismatch.entry_premium = calculate_effective_entry_pm(usdt_rate);
+                    mismatch.realized_pnl_krw = realized_pnl_krw + reentry_adjustment_pnl_krw;
+                    mismatch.is_active = mismatch.korean_amount > 0.0 || mismatch.foreign_amount > 0.0;
+
+                    trigger_critical_stop(
+                        "[ADAPTIVE-REENTRY] Re-entry legs remain mismatched after delta hedge",
+                        mismatch
+                    );
+                    return result;
                 }
+
+                actual_filled = std::min(foreign_open_qty, korean_open_qty);
                 double actual_korean_cost = actual_filled * buy_price;
 
                 remaining_amount += actual_filled;
                 total_korean_cost += actual_korean_cost;
                 total_foreign_value += actual_filled * short_price;
+                realized_pnl_krw += reentry_adjustment_pnl_krw;
 
                 Logger::info("[ADAPTIVE-REENTRY] {} +{:.8f} coins, remaining: {:.8f}/{:.8f}, entry_pm: {:.4f}%, buy_price: {:.2f}",
                              position.symbol.to_string(), actual_filled, remaining_amount, original_amount, entry_premium, buy_price);
@@ -1475,6 +1782,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
             } else {
                 Logger::error("[ADAPTIVE-REENTRY] Korean BUY failed, rolling back Bybit spot-margin short");
                 record_latency(LatencyStage::Error, static_cast<int64_t>(korean_order.status));
+                actual_filled = resolved_fill_quantity(foreign_order);
                 Order rollback = execute_foreign_cover(signal.foreign_exchange, foreign_symbol, actual_filled);
                 if (rollback.status != OrderStatus::Filled) {
                     Position mismatch = position;
@@ -1575,21 +1883,28 @@ bool OrderManager::prepare_okx_shorting(const std::vector<SymbolId>& symbols) {
         return false;
     }
 
-    std::optional<SymbolId> sample_symbol;
-    if (!symbols.empty()) {
-        sample_symbol = SymbolId(symbols.front().get_base(), "USDT");
+    std::vector<SymbolId> unique_symbols;
+    std::unordered_set<std::string> seen_bases;
+    unique_symbols.reserve(symbols.size());
+    for (const auto& symbol : symbols) {
+        std::string base(symbol.get_base());
+        if (seen_bases.insert(base).second) {
+            unique_symbols.emplace_back(base, "USDT");
+        }
     }
-    if (!sample_symbol) {
-        sample_symbol = SymbolId("BTC", "USDT");
+    if (unique_symbols.empty()) {
+        unique_symbols.emplace_back("BTC", "USDT");
     }
 
-    const bool ready = okx->prepare_shorting(*sample_symbol);
-    if (ready) {
-        Logger::info("Prepared OKX spot-margin shorting for {} symbols", symbols.size());
-    } else {
-        Logger::error("Failed to prepare OKX spot-margin shorting");
+    for (const auto& symbol : unique_symbols) {
+        if (!okx->prepare_shorting(symbol)) {
+            Logger::error("Failed to prepare OKX spot-margin shorting for {}", symbol.to_string());
+            return false;
+        }
     }
-    return ready;
+
+    Logger::info("Prepared OKX spot-margin shorting for {} symbols", unique_symbols.size());
+    return true;
 }
 
 Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount) {
@@ -1642,6 +1957,30 @@ Order OrderManager::execute_foreign_cover(Exchange ex, const SymbolId& symbol, d
     return short_ex->close_short(symbol, quantity);
 }
 
+bool OrderManager::flatten_extra_korean_long(Exchange ex,
+                                             const SymbolId& symbol,
+                                             double quantity,
+                                             Order& order_out) {
+    order_out = execute_korean_sell(ex, symbol, quantity);
+    if (order_out.status != OrderStatus::Filled) {
+        return false;
+    }
+    query_korean_fill(ex, symbol, order_out);
+    return resolved_fill_quantity(order_out) > 0.0;
+}
+
+bool OrderManager::flatten_extra_foreign_short(Exchange ex,
+                                               const SymbolId& symbol,
+                                               double quantity,
+                                               Order& order_out) {
+    order_out = execute_foreign_cover(ex, symbol, quantity);
+    if (order_out.status != OrderStatus::Filled) {
+        return false;
+    }
+    query_foreign_fill(ex, order_out);
+    return resolved_fill_quantity(order_out) > 0.0;
+}
+
 void OrderManager::query_foreign_fill(Exchange ex, Order& order) {
     if (order.order_id_str.empty() || order.status != OrderStatus::Filled) return;
     if (ex == Exchange::Bybit && bybit_exchange_) {
@@ -1656,6 +1995,10 @@ void OrderManager::query_korean_fill(Exchange ex, const SymbolId& symbol, Order&
     if (ex == Exchange::Bithumb) {
         if (bithumb_exchange_) {
             bithumb_exchange_->query_order_detail(order.order_id_str, symbol, order);
+        }
+    } else if (ex == Exchange::Upbit) {
+        if (upbit_exchange_) {
+            upbit_exchange_->query_order_detail(order.order_id_str, order);
         }
     }
 }
@@ -1767,16 +2110,16 @@ void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbo
 
     std::unordered_set<SymbolId> new_blacklist;
 
-    // Check Bithumb spot balances for all trading symbols
-    auto bithumb = get_korean_exchange(Exchange::Bithumb);
-    if (bithumb) {
+    for (Exchange ex : {Exchange::Bithumb, Exchange::Upbit}) {
+        auto korean = get_korean_exchange(ex);
+        if (!korean) continue;
         for (const auto& sym : symbols) {
             if (bot_managed.count(sym)) continue;  // Skip bot's own positions
-            double balance = bithumb->get_balance(std::string(sym.get_base()));
+            double balance = korean->get_balance(std::string(sym.get_base()));
             if (balance > 0.0001) {  // Ignore dust
                 new_blacklist.insert(sym);
-                Logger::warn("[BLACKLIST] {} - Bithumb spot balance: {:.6f}",
-                             sym.to_string(), balance);
+                Logger::warn("[BLACKLIST] {} - {} spot balance: {:.6f}",
+                             sym.to_string(), exchange_name(ex), balance);
             }
         }
     }
@@ -1791,6 +2134,20 @@ void OrderManager::refresh_external_positions(const std::vector<SymbolId>& symbo
                 if (bot_managed.count(krw_symbol)) continue;  // Skip bot's own positions
                 new_blacklist.insert(krw_symbol);
                 Logger::warn("[BLACKLIST] {} - Bybit spot-margin liability: {:.6f}",
+                             krw_symbol.to_string(), pos.foreign_amount);
+            }
+        }
+    }
+
+    auto okx = get_okx_exchange();
+    if (okx) {
+        auto positions = okx->get_short_positions();
+        for (const auto& pos : positions) {
+            if (pos.foreign_amount > 0.0001) {
+                SymbolId krw_symbol(pos.symbol.get_base(), "KRW");
+                if (bot_managed.count(krw_symbol)) continue;
+                new_blacklist.insert(krw_symbol);
+                Logger::warn("[BLACKLIST] {} - OKX margin liability: {:.6f}",
                              krw_symbol.to_string(), pos.foreign_amount);
             }
         }

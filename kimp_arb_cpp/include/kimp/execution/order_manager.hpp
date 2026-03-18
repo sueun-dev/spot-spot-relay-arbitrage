@@ -4,6 +4,7 @@
 #include "kimp/core/latency_probe.hpp"
 #include "kimp/exchange/exchange_base.hpp"
 #include "kimp/exchange/bithumb/bithumb.hpp"
+#include "kimp/exchange/upbit/upbit.hpp"
 #include "kimp/exchange/bybit/bybit.hpp"
 #include "kimp/exchange/okx/okx.hpp"
 #include "kimp/execution/lifecycle_executor.hpp"
@@ -70,6 +71,7 @@ private:
     // Exchange references
     std::array<ExchangePtr, static_cast<size_t>(Exchange::Count)> exchanges_{};
     std::shared_ptr<exchange::bithumb::BithumbExchange> bithumb_exchange_;
+    std::shared_ptr<exchange::upbit::UpbitExchange> upbit_exchange_;
     std::shared_ptr<exchange::bybit::BybitExchange> bybit_exchange_;
     std::shared_ptr<exchange::okx::OkxExchange> okx_exchange_;
 
@@ -154,6 +156,8 @@ private:
     void handle_fill_query(FillQueryTask&& task, std::size_t worker_index);
     void dispatch_fill_query(FillQueryTask task);
     void wait_for_next_market_update(uint64_t update_seq_before_trade);
+    bool flatten_extra_korean_long(Exchange ex, const SymbolId& symbol, double quantity, Order& order_out);
+    bool flatten_extra_foreign_short(Exchange ex, const SymbolId& symbol, double quantity, Order& order_out);
 };
 
 } // namespace kimp::execution
