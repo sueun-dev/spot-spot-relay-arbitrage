@@ -174,6 +174,30 @@ std::string sign_bithumb_v1_jwt(std::string_view secret_key,
     return signing_input + "." + base64url_encode(signature);
 }
 
+std::optional<bool> parse_boolish(simdjson::ondemand::value value) {
+    auto bool_result = value.get_bool();
+    if (!bool_result.error()) {
+        return bool_result.value();
+    }
+    auto int_result = value.get_int64();
+    if (!int_result.error()) {
+        return int_result.value() != 0;
+    }
+    auto uint_result = value.get_uint64();
+    if (!uint_result.error()) {
+        return uint_result.value() != 0;
+    }
+    auto string_result = value.get_string();
+    if (!string_result.error()) {
+        std::string raw(string_result.value());
+        std::transform(raw.begin(), raw.end(), raw.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (raw == "1" || raw == "true" || raw == "y" || raw == "yes") return true;
+        if (raw == "0" || raw == "false" || raw == "n" || raw == "no") return false;
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 namespace kimp::exchange::bithumb {
@@ -1556,6 +1580,57 @@ BithumbExchange::fetch_withdrawal_fees() {
 
     Logger::info("[Bithumb] Loaded withdrawal fees for {} coins", fees.size());
     return fees;
+}
+
+std::unordered_map<std::string, BithumbExchange::AssetStatus>
+BithumbExchange::fetch_asset_statuses() {
+    std::unordered_map<std::string, AssetStatus> statuses;
+
+    auto response = rest_client_->get("/public/assetsstatus/ALL");
+    if (!response.success) {
+        Logger::error("[Bithumb] Failed to fetch asset statuses: {}", response.error);
+        return statuses;
+    }
+
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
+
+        auto status = doc["status"].get_string();
+        if (status.error() || status.value() != "0000") {
+            Logger::error("[Bithumb] asset status returned non-success status");
+            return statuses;
+        }
+
+        auto data = doc["data"].get_object();
+        if (data.error()) {
+            return statuses;
+        }
+
+        for (auto field : data.value()) {
+            std::string currency(field.unescaped_key().value());
+            auto obj = field.value().get_object();
+            if (obj.error()) {
+                continue;
+            }
+
+            bool deposit_enabled = false;
+            bool withdraw_enabled = false;
+            if (auto parsed = parse_boolish(obj.value()["deposit_status"]); parsed) {
+                deposit_enabled = *parsed;
+            }
+            if (auto parsed = parse_boolish(obj.value()["withdrawal_status"]); parsed) {
+                withdraw_enabled = *parsed;
+            }
+            statuses.emplace(std::move(currency), AssetStatus{deposit_enabled, withdraw_enabled});
+        }
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::error("[Bithumb] Failed to parse asset statuses: {}", e.what());
+    }
+
+    Logger::info("[Bithumb] Loaded asset statuses for {} coins", statuses.size());
+    return statuses;
 }
 
 } // namespace kimp::exchange::bithumb

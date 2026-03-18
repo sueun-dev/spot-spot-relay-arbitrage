@@ -141,6 +141,12 @@ public:
     // {coin → [{network, fee_coins}]}
     struct NetworkFee { std::string network; double fee_coins{0.0}; };
     std::unordered_map<std::string, std::vector<NetworkFee>> fetch_withdrawal_fees();
+
+    struct AssetStatus {
+        bool deposit_enabled{false};
+        bool withdraw_enabled{false};
+    };
+    std::unordered_map<std::string, AssetStatus> fetch_asset_statuses();
 };
 
 } // namespace kimp::exchange::bithumb
