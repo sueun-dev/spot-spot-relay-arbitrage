@@ -1143,4 +1143,95 @@ void BybitExchange::on_private_ws_message(std::string_view message) {
     }
 }
 
+// ── Deposit Network Fetcher ─────────────────────────────────────────────
+
+std::unordered_map<std::string, std::unordered_set<std::string>>
+BybitExchange::fetch_deposit_networks() {
+    std::unordered_map<std::string, std::unordered_set<std::string>> result;
+
+    if (credentials_.api_key.empty() || credentials_.secret_key.empty()) {
+        Logger::warn("[Bybit] No API credentials — cannot fetch deposit networks");
+        return result;
+    }
+
+    auto headers = build_auth_headers("");
+    auto response = rest_client_->get("/v5/asset/coin/query-info", headers);
+    if (!response.success) {
+        Logger::error("[Bybit] Failed to fetch coin info: {}", response.error);
+        return result;
+    }
+
+    auto normalize = [](std::string_view raw) -> std::string {
+        std::string out;
+        out.reserve(raw.size());
+        for (char c : raw) {
+            if (std::isalnum(static_cast<unsigned char>(c)))
+                out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+        return out;
+    };
+
+    try {
+        simdjson::ondemand::parser parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = parser.iterate(padded);
+
+        auto ret_code = doc["retCode"].get_int64();
+        if (ret_code.error() || ret_code.value() != 0) {
+            Logger::error("[Bybit] coin query-info returned non-zero retCode");
+            return result;
+        }
+
+        auto rows = doc["result"]["rows"].get_array();
+        if (rows.error()) return result;
+
+        for (auto row : rows.value()) {
+            auto coin = row["coin"].get_string();
+            if (coin.error()) continue;
+
+            std::unordered_set<std::string> deposit_nets;
+            auto chain_arr = row["chains"].get_array();
+            if (!chain_arr.error()) {
+                for (auto chain_item : chain_arr.value()) {
+                    // Check deposit enabled
+                    auto dep = chain_item["chainDeposit"].get_string();
+                    bool deposit_ok = false;
+                    if (!dep.error()) {
+                        deposit_ok = (dep.value() == "1" || dep.value() == "true");
+                    } else {
+                        // Try as int
+                        auto dep_int = chain_item["chainDeposit"].get_int64();
+                        if (!dep_int.error()) deposit_ok = (dep_int.value() != 0);
+                    }
+
+                    if (!deposit_ok) continue;
+
+                    // Get chain name
+                    std::string chain_name;
+                    auto chain_val = chain_item["chain"].get_string();
+                    if (!chain_val.error()) {
+                        chain_name = normalize(chain_val.value());
+                    } else {
+                        auto ct = chain_item["chainType"].get_string();
+                        if (!ct.error()) chain_name = normalize(ct.value());
+                    }
+
+                    if (!chain_name.empty()) {
+                        deposit_nets.insert(std::move(chain_name));
+                    }
+                }
+            }
+
+            if (!deposit_nets.empty()) {
+                result[std::string(coin.value())] = std::move(deposit_nets);
+            }
+        }
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::error("[Bybit] Failed to parse coin info: {}", e.what());
+    }
+
+    Logger::info("[Bybit] Loaded deposit networks for {} coins", result.size());
+    return result;
+}
+
 } // namespace kimp::exchange::bybit
