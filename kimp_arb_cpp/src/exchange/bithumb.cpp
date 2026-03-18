@@ -3,6 +3,7 @@
 #include "kimp/core/optimization.hpp"
 
 #include <array>
+#include <charconv>
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
@@ -1482,6 +1483,79 @@ bool BithumbExchange::query_order_detail(const std::string& order_id, const Symb
 
     Logger::error("[Bithumb] Failed to get fill price via v1+legacy paths for order {}", order_id);
     return false;
+}
+
+std::unordered_map<std::string, std::vector<BithumbExchange::NetworkFee>>
+BithumbExchange::fetch_withdrawal_fees() {
+    std::unordered_map<std::string, std::vector<NetworkFee>> fees;
+
+    auto response = rest_client_->get("/v2/fee/inout/ALL");
+    if (!response.success) {
+        Logger::error("[Bithumb] Failed to fetch withdrawal fees: {}", response.error);
+        return fees;
+    }
+
+    auto normalize = [](std::string_view raw) -> std::string {
+        std::string out;
+        out.reserve(raw.size());
+        for (char c : raw) {
+            if (std::isalnum(static_cast<unsigned char>(c)))
+                out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+        return out;
+    };
+
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
+
+        // Response: [{currency, networks: [{net_type, withdraw_fee_quantity, ...}]}]
+        auto arr = doc.get_array();
+        for (auto item : arr) {
+            auto obj = item.get_object();
+            std::string_view currency;
+            if (auto r = obj["currency"].get_string(); !r.error()) {
+                currency = r.value();
+            } else {
+                continue;
+            }
+
+            std::vector<NetworkFee> coin_fees;
+            if (auto networks = obj["networks"].get_array(); !networks.error()) {
+                for (auto net : networks.value()) {
+                    auto net_obj = net.get_object();
+
+                    // Extract network name (net_type)
+                    std::string net_name;
+                    if (auto nt = net_obj["net_type"].get_string(); !nt.error()) {
+                        net_name = normalize(nt.value());
+                    } else {
+                        net_name = normalize(currency);  // fallback to coin name
+                    }
+
+                    // Extract fee
+                    if (auto fee_r = net_obj["withdraw_fee_quantity"].get_string(); !fee_r.error()) {
+                        double fee = 0.0;
+                        auto sv = fee_r.value();
+                        auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), fee);
+                        if (ec == std::errc{}) {
+                            coin_fees.push_back({std::move(net_name), fee});
+                        }
+                    }
+                }
+            }
+
+            if (!coin_fees.empty()) {
+                fees[std::string(currency)] = std::move(coin_fees);
+            }
+        }
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::error("[Bithumb] Failed to parse withdrawal fees: {}", e.what());
+    }
+
+    Logger::info("[Bithumb] Loaded withdrawal fees for {} coins", fees.size());
+    return fees;
 }
 
 } // namespace kimp::exchange::bithumb

@@ -134,6 +134,13 @@ private:
 public:
     void fetch_all_orderbook_snapshots(const std::vector<SymbolId>& symbols,
                                        std::size_t depth_count = ORDERBOOK_SNAPSHOT_DEPTH);
+
+    // Fetch per-coin withdrawal fees from /v2/fee/inout/ALL (public, no auth).
+    // Returns map: uppercase base symbol → minimum withdrawal fee in coin units across all networks.
+    // Returns per-coin per-network withdrawal fees.
+    // {coin → [{network, fee_coins}]}
+    struct NetworkFee { std::string network; double fee_coins{0.0}; };
+    std::unordered_map<std::string, std::vector<NetworkFee>> fetch_withdrawal_fees();
 };
 
 } // namespace kimp::exchange::bithumb
