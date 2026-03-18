@@ -697,11 +697,11 @@ bool OkxExchange::prepare_shorting(const SymbolId& symbol) {
         return false;
     }
 
-    // Set leverage for the base currency (best-effort, not critical)
+    // Force 1x cross margin so spot-short sizing matches the Korean spot leg.
     std::string base(symbol.get_base());
     char body_buf[256];
     int body_len = std::snprintf(body_buf, sizeof(body_buf),
-        "{\"lever\":\"5\",\"mgnMode\":\"cross\",\"ccy\":\"%s\"}",
+        "{\"lever\":\"1\",\"mgnMode\":\"cross\",\"ccy\":\"%s\"}",
         base.c_str());
     if (body_len > 0 && static_cast<size_t>(body_len) < sizeof(body_buf)) {
         std::string body_str(body_buf, static_cast<size_t>(body_len));
@@ -709,10 +709,29 @@ bool OkxExchange::prepare_shorting(const SymbolId& symbol) {
         headers["Content-Type"] = "application/json";
 
         auto response = rest_client_->post("/api/v5/account/set-leverage", body_str, headers);
-        if (response.success) {
-            Logger::info("[OKX] Set leverage for {} to 5x cross", base);
-        } else {
+        if (!response.success) {
             Logger::warn("[OKX] Failed to set leverage for {}: {}", base, response.body);
+            return false;
+        }
+
+        try {
+            simdjson::ondemand::parser local_parser;
+            simdjson::padded_string padded(response.body);
+            auto doc = local_parser.iterate(padded);
+            std::string_view code = doc["code"].get_string().value();
+            if (code != "0") {
+                auto msg = doc["msg"];
+                if (!msg.error()) {
+                    Logger::warn("[OKX] Failed to set leverage for {} to 1x: {}", base, msg.get_string().value());
+                } else {
+                    Logger::warn("[OKX] Failed to set leverage for {} to 1x: code={}", base, code);
+                }
+                return false;
+            }
+            Logger::info("[OKX] Set leverage for {} to 1x cross", base);
+        } catch (const simdjson::simdjson_error& e) {
+            Logger::warn("[OKX] Failed to parse leverage response for {}: {}", base, e.what());
+            return false;
         }
     }
 
@@ -1329,6 +1348,94 @@ void OkxExchange::on_private_ws_message(std::string_view message) {
     } catch (const simdjson::simdjson_error&) {
         // Ignore parse errors for non-JSON messages
     }
+}
+
+// ── Deposit Network Fetcher ─────────────────────────────────────────────
+
+std::unordered_map<std::string, std::unordered_set<std::string>>
+OkxExchange::fetch_deposit_networks() {
+    std::unordered_map<std::string, std::unordered_set<std::string>> result;
+
+    if (credentials_.api_key.empty() || credentials_.secret_key.empty()) {
+        Logger::warn("[OKX] No API credentials — cannot fetch deposit networks");
+        return result;
+    }
+
+    auto headers = build_auth_headers("GET", "/api/v5/asset/currencies");
+    auto response = rest_client_->get("/api/v5/asset/currencies", headers);
+    if (!response.success) {
+        Logger::error("[OKX] Failed to fetch currencies: {}", response.error);
+        return result;
+    }
+
+    auto normalize = [](std::string_view raw) -> std::string {
+        std::string out;
+        out.reserve(raw.size());
+        for (char c : raw) {
+            if (std::isalnum(static_cast<unsigned char>(c)))
+                out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+        return out;
+    };
+
+    try {
+        simdjson::ondemand::parser parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = parser.iterate(padded);
+
+        auto code = doc["code"].get_string();
+        if (code.error() || code.value() != "0") {
+            Logger::error("[OKX] currencies returned non-zero code");
+            return result;
+        }
+
+        // Response: {"code":"0","data":[{"ccy":"BTC","chain":"BTC-Bitcoin","canDep":true,...}]}
+        // Multi-chain coins appear as separate entries with different "chain" values.
+        auto data = doc["data"].get_array();
+        if (data.error()) return result;
+
+        for (auto item : data.value()) {
+            auto ccy = item["ccy"].get_string();
+            if (ccy.error()) continue;
+
+            // Check deposit enabled (can be bool or string "true"/"false")
+            bool deposit_ok = false;
+            auto can_dep_bool = item["canDep"].get_bool();
+            if (!can_dep_bool.error()) {
+                deposit_ok = can_dep_bool.value();
+            } else {
+                auto can_dep_str = item["canDep"].get_string();
+                if (!can_dep_str.error()) {
+                    deposit_ok = (can_dep_str.value() == "true" || can_dep_str.value() == "1");
+                }
+            }
+
+            if (!deposit_ok) continue;
+
+            // Extract chain name: OKX format is "BTC-Bitcoin", "ETH-ERC20", etc.
+            // Normalize by taking the part after '-' if it exists, else the whole thing.
+            std::string chain_name;
+            auto chain_val = item["chain"].get_string();
+            if (!chain_val.error()) {
+                std::string_view chain_sv = chain_val.value();
+                auto dash = chain_sv.find('-');
+                if (dash != std::string_view::npos) {
+                    chain_name = normalize(chain_sv.substr(dash + 1));
+                } else {
+                    chain_name = normalize(chain_sv);
+                }
+            }
+
+            if (!chain_name.empty()) {
+                result[std::string(ccy.value())].insert(std::move(chain_name));
+            }
+        }
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::error("[OKX] Failed to parse currencies: {}", e.what());
+    }
+
+    Logger::info("[OKX] Loaded deposit networks for {} coins", result.size());
+    return result;
 }
 
 } // namespace kimp::exchange::okx
