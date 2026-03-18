@@ -89,6 +89,10 @@ constexpr const char* OKX_WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public";
 constexpr const char* OKX_WS_PRIVATE = "wss://ws.okx.com:8443/ws/v5/private";
 constexpr const char* OKX_REST = "https://www.okx.com";
 
+// Upbit
+constexpr const char* UPBIT_WS = "wss://api.upbit.com/websocket/v1";
+constexpr const char* UPBIT_REST = "https://api.upbit.com";
+
 } // namespace endpoints
 
 } // namespace kimp

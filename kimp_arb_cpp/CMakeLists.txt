@@ -39,6 +39,7 @@ endif()
 # Find packages
 find_package(Boost REQUIRED COMPONENTS json)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 
 set(KIMP_SIMDJSON_TARGET "")
 set(KIMP_SPDLOG_TARGET "")
@@ -111,6 +112,7 @@ target_link_libraries(kimp_lib
         Boost::headers
         OpenSSL::SSL
         OpenSSL::Crypto
+        ZLIB::ZLIB
         ${KIMP_SIMDJSON_TARGET}
         ${KIMP_SPDLOG_TARGET}
         ${KIMP_FMT_TARGET}
