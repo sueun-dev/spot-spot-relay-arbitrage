@@ -10,6 +10,7 @@
 #include <cmath>
 #include <ctime>
 #include <unordered_set>
+#include <algorithm>
 
 namespace kimp::exchange::okx {
 
@@ -691,26 +692,21 @@ bool OkxExchange::cancel_order(uint64_t /*order_id*/) {
 }
 
 bool OkxExchange::prepare_shorting(const SymbolId& symbol) {
-    (void)symbol;
-
     if (!ensure_margin_mode()) {
         return false;
     }
 
     // Force 1x cross margin so spot-short sizing matches the Korean spot leg.
     std::string base(symbol.get_base());
-    char body_buf[256];
-    int body_len = std::snprintf(body_buf, sizeof(body_buf),
-        "{\"lever\":\"1\",\"mgnMode\":\"cross\",\"ccy\":\"%s\"}",
-        base.c_str());
-    if (body_len > 0 && static_cast<size_t>(body_len) < sizeof(body_buf)) {
-        std::string body_str(body_buf, static_cast<size_t>(body_len));
+    const std::string inst_id = symbol_to_okx(symbol);
+
+    auto submit_leverage = [&](const std::string& body_str, std::string_view mode_label) -> bool {
         auto headers = build_auth_headers("POST", "/api/v5/account/set-leverage", body_str);
         headers["Content-Type"] = "application/json";
 
         auto response = rest_client_->post("/api/v5/account/set-leverage", body_str, headers);
         if (!response.success) {
-            Logger::warn("[OKX] Failed to set leverage for {}: {}", base, response.body);
+            Logger::warn("[OKX] Failed to set leverage for {} via {}: {}", base, mode_label, response.body);
             return false;
         }
 
@@ -722,20 +718,47 @@ bool OkxExchange::prepare_shorting(const SymbolId& symbol) {
             if (code != "0") {
                 auto msg = doc["msg"];
                 if (!msg.error()) {
-                    Logger::warn("[OKX] Failed to set leverage for {} to 1x: {}", base, msg.get_string().value());
+                    Logger::warn("[OKX] Failed to set leverage for {} to 1x via {}: {}",
+                                 base, mode_label, msg.get_string().value());
                 } else {
-                    Logger::warn("[OKX] Failed to set leverage for {} to 1x: code={}", base, code);
+                    Logger::warn("[OKX] Failed to set leverage for {} to 1x via {}: code={}",
+                                 base, mode_label, code);
                 }
                 return false;
             }
-            Logger::info("[OKX] Set leverage for {} to 1x cross", base);
+            Logger::info("[OKX] Set leverage for {} to 1x cross via {}", base, mode_label);
+            return true;
         } catch (const simdjson::simdjson_error& e) {
-            Logger::warn("[OKX] Failed to parse leverage response for {}: {}", base, e.what());
+            Logger::warn("[OKX] Failed to parse leverage response for {} via {}: {}", base, mode_label, e.what());
             return false;
+        }
+    };
+
+    // Try instId first (instrument-level) — works reliably for spot margin.
+    // Fall back to ccy (currency-level) if instId fails.
+    char inst_body_buf[256];
+    int inst_body_len = std::snprintf(inst_body_buf, sizeof(inst_body_buf),
+        "{\"lever\":\"1\",\"mgnMode\":\"cross\",\"instId\":\"%s\"}",
+        inst_id.c_str());
+    if (inst_body_len > 0 && static_cast<size_t>(inst_body_len) < sizeof(inst_body_buf)) {
+        std::string body_str(inst_body_buf, static_cast<size_t>(inst_body_len));
+        if (submit_leverage(body_str, "instId")) {
+            return true;
         }
     }
 
-    return true;
+    char ccy_body_buf[256];
+    int ccy_body_len = std::snprintf(ccy_body_buf, sizeof(ccy_body_buf),
+        "{\"lever\":\"1\",\"mgnMode\":\"cross\",\"ccy\":\"%s\"}",
+        base.c_str());
+    if (ccy_body_len > 0 && static_cast<size_t>(ccy_body_len) < sizeof(ccy_body_buf)) {
+        std::string body_str(ccy_body_buf, static_cast<size_t>(ccy_body_len));
+        if (submit_leverage(body_str, "ccy")) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 std::vector<Position> OkxExchange::get_short_positions() {
@@ -858,6 +881,82 @@ double OkxExchange::get_balance(const std::string& currency) {
 
     Logger::warn("[OKX] {} not found in account", currency);
     return 0.0;
+}
+
+std::vector<AccountBalance> OkxExchange::get_all_balances() {
+    auto headers = build_auth_headers("GET", "/api/v5/account/balance", "");
+    auto response = rest_client_->get("/api/v5/account/balance", headers);
+
+    if (!response.success) {
+        Logger::error("[OKX] Failed to fetch all balances: {}", response.error);
+        return {};
+    }
+
+    std::vector<AccountBalance> balances;
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
+
+        std::string_view code = doc["code"].get_string().value();
+        if (code != "0") {
+            Logger::warn("[OKX] All balances query error, code: {}", code);
+            return {};
+        }
+
+        auto data = doc["data"].get_array();
+        for (auto account : data) {
+            auto details = account["details"].get_array();
+            for (auto detail : details) {
+                AccountBalance balance;
+                balance.currency = std::string(detail["ccy"].get_string().value());
+
+                auto cash_bal_field = detail["cashBal"];
+                if (!cash_bal_field.error()) {
+                    balance.total = opt::fast_stod(cash_bal_field.get_string().value());
+                }
+
+                auto avail_bal_field = detail["availBal"];
+                if (!avail_bal_field.error()) {
+                    balance.available = opt::fast_stod(avail_bal_field.get_string().value());
+                }
+
+                auto frozen_bal_field = detail["frozenBal"];
+                if (!frozen_bal_field.error()) {
+                    balance.locked = opt::fast_stod(frozen_bal_field.get_string().value());
+                }
+
+                auto liab_field = detail["liab"];
+                if (!liab_field.error()) {
+                    balance.liability = std::abs(opt::fast_stod(liab_field.get_string().value()));
+                }
+
+                if (balance.total == 0.0) {
+                    auto eq_field = detail["eq"];
+                    if (!eq_field.error()) {
+                        balance.total = opt::fast_stod(eq_field.get_string().value());
+                    }
+                }
+
+                if (std::abs(balance.total) <= 1e-12 &&
+                    std::abs(balance.available) <= 1e-12 &&
+                    std::abs(balance.locked) <= 1e-12 &&
+                    std::abs(balance.liability) <= 1e-12) {
+                    continue;
+                }
+                balances.push_back(std::move(balance));
+            }
+        }
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::error("[OKX] Failed to parse all balances: {}", e.what());
+        return {};
+    }
+
+    std::sort(balances.begin(), balances.end(),
+              [](const AccountBalance& a, const AccountBalance& b) {
+                  return a.currency < b.currency;
+              });
+    return balances;
 }
 
 void OkxExchange::on_ws_message(std::string_view message) {

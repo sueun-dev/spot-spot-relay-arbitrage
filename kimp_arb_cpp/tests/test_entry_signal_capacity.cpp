@@ -44,7 +44,13 @@ int main() {
     const std::vector<std::string> bases = {"AAA", "BBB", "CCC", "DDD", "EEE"};
     for (const auto& base : bases) {
         engine.add_symbol(SymbolId(base, "KRW"));
+        engine.get_price_cache().set_withdraw_network_fees(
+            Exchange::Bithumb, base, {PriceCache::NetworkFee{"ETH", 0.0}});
+        engine.get_price_cache().set_foreign_deposit_networks(
+            Exchange::Bybit, base, {"ETH"});
+        engine.get_price_cache().set_korean_withdraw_enabled(Exchange::Bithumb, base, true);
     }
+    engine.get_price_cache().finalize_withdraw_fees();
 
     // Seed USDT/KRW.
     engine.on_ticker_update(make_ticker(

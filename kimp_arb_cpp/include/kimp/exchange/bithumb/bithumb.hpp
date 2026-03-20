@@ -93,6 +93,7 @@ public:
     bool cancel_order(uint64_t order_id) override;
 
     double get_balance(const std::string& currency) override;
+    std::vector<AccountBalance> get_all_balances() override;
 
     // Public fill query for async/parallel execution from OrderManager
     bool query_order_detail(const std::string& order_id, const SymbolId& symbol, Order& order);

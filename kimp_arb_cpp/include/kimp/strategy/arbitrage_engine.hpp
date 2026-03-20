@@ -881,6 +881,7 @@ public:
         double net_profit_krw{0.0};
         bool both_can_fill_target{false};
         uint64_t age_ms{0};
+        bool quote_usable{false};
         bool entry_signal{false};
         bool exit_signal{false};
         Exchange best_korean_exchange{Exchange::Bithumb};

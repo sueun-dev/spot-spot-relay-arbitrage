@@ -38,6 +38,14 @@ struct HttpResponse {
     std::string error;
 };
 
+struct AccountBalance {
+    std::string currency;
+    double total{0.0};
+    double available{0.0};
+    double locked{0.0};
+    double liability{0.0};
+};
+
 /**
  * REST API client for exchanges with connection pooling
  *
@@ -149,6 +157,7 @@ public:
 
     // Balance
     virtual double get_balance(const std::string& currency) = 0;
+    virtual std::vector<AccountBalance> get_all_balances() { return {}; }
 };
 
 /**

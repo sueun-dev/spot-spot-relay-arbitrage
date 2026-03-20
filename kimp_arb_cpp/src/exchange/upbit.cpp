@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_set>
 #include <cctype>
+#include <algorithm>
 
 namespace kimp::exchange::upbit {
 
@@ -262,6 +263,7 @@ bool UpbitExchange::connect() {
 
 void UpbitExchange::disconnect() {
     Logger::info("[Upbit] Disconnecting...");
+    stop_orderbook_resync_loop();
     if (ws_client_) {
         ws_client_->disconnect();
     }
@@ -274,17 +276,30 @@ void UpbitExchange::on_ws_connected() {
     connected_.store(true);
 
     // Re-subscribe if we have stored subscriptions
-    std::lock_guard lock(subscription_mutex_);
-    if (!subscribed_orderbooks_.empty()) {
-        subscribe_orderbook(subscribed_orderbooks_);
-    } else if (!subscribed_tickers_.empty()) {
-        subscribe_ticker(subscribed_tickers_);
+    std::vector<SymbolId> orderbooks;
+    std::vector<SymbolId> tickers;
+    {
+        std::lock_guard lock(subscription_mutex_);
+        orderbooks = subscribed_orderbooks_;
+        tickers = subscribed_tickers_;
+    }
+    if (!orderbooks.empty()) {
+        subscribe_orderbook(orderbooks);
+    } else if (!tickers.empty()) {
+        subscribe_ticker(tickers);
     }
 }
 
 void UpbitExchange::on_ws_disconnected() {
     Logger::warn("[Upbit] WebSocket disconnected");
     connected_.store(false);
+    stop_orderbook_resync_loop();
+    for (auto& [_, bbo] : orderbook_bbo_) {
+        bbo.best_bid.store(0.0, std::memory_order_relaxed);
+        bbo.best_ask.store(0.0, std::memory_order_relaxed);
+        bbo.best_bid_qty.store(0.0, std::memory_order_relaxed);
+        bbo.best_ask_qty.store(0.0, std::memory_order_relaxed);
+    }
 }
 
 void UpbitExchange::on_ws_message(std::string_view message) {
@@ -525,6 +540,132 @@ void UpbitExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) {
 
     ws_client_->send(sub_msg);
     Logger::info("[Upbit] Subscribed to {} orderbook symbols", symbols.size());
+    fetch_orderbook_snapshots(symbols);
+    start_orderbook_resync_loop();
+}
+
+void UpbitExchange::fetch_orderbook_snapshots(const std::vector<SymbolId>& symbols) {
+    if (symbols.empty() || !rest_client_) {
+        return;
+    }
+
+    constexpr size_t BATCH_SIZE = 40;
+    size_t updated = 0;
+    const auto now = std::chrono::steady_clock::now();
+
+    for (size_t start = 0; start < symbols.size(); start += BATCH_SIZE) {
+        const size_t end = std::min(start + BATCH_SIZE, symbols.size());
+        std::string markets;
+        for (size_t i = start; i < end; ++i) {
+            if (!markets.empty()) markets.push_back(',');
+            markets += symbol_to_upbit(symbols[i]);
+        }
+
+        auto response = rest_client_->get("/v1/orderbook?markets=" + markets);
+        if (!response.success) {
+            Logger::warn("[Upbit] Failed to fetch orderbook snapshot batch: {}", response.error);
+            continue;
+        }
+
+        try {
+            simdjson::dom::parser parser;
+            auto doc = parser.parse(response.body);
+            for (auto item : doc.get_array()) {
+                const std::string market = parse_dom_string(item["market"]);
+                if (market.rfind("KRW-", 0) != 0) {
+                    continue;
+                }
+                const std::string base = market.substr(4);
+                SymbolId symbol(base, "KRW");
+
+                auto units = item["orderbook_units"].get_array();
+                if (units.error()) {
+                    continue;
+                }
+                auto it = units.begin();
+                if (it == units.end()) {
+                    continue;
+                }
+
+                const double ask_price = parse_dom_double((*it)["ask_price"]);
+                const double bid_price = parse_dom_double((*it)["bid_price"]);
+                const double ask_size = parse_dom_double((*it)["ask_size"]);
+                const double bid_size = parse_dom_double((*it)["bid_size"]);
+                if (ask_price <= 0.0 || bid_price <= 0.0) {
+                    continue;
+                }
+
+                auto& bbo = orderbook_bbo_[symbol];
+                bbo.best_bid.store(bid_price, std::memory_order_relaxed);
+                bbo.best_ask.store(ask_price, std::memory_order_relaxed);
+                bbo.best_bid_qty.store(bid_size, std::memory_order_relaxed);
+                bbo.best_ask_qty.store(ask_size, std::memory_order_relaxed);
+
+                double last = 0.0;
+                {
+                    std::lock_guard lk(last_price_mutex_);
+                    auto pit = last_price_cache_.find(symbol);
+                    if (pit != last_price_cache_.end()) {
+                        last = pit->second;
+                    }
+                }
+
+                Ticker ticker;
+                ticker.exchange = Exchange::Upbit;
+                ticker.symbol = symbol;
+                ticker.timestamp = now;
+                ticker.bid = bid_price;
+                ticker.ask = ask_price;
+                ticker.bid_qty = bid_size;
+                ticker.ask_qty = ask_size;
+                ticker.last = last > 0.0 ? last : (bid_price + ask_price) * 0.5;
+                dispatch_ticker(ticker);
+                ++updated;
+
+                if (base == "USDT") {
+                    usdt_krw_price_.store((bid_price + ask_price) * 0.5, std::memory_order_release);
+                }
+            }
+        } catch (const simdjson::simdjson_error& e) {
+            Logger::warn("[Upbit] Failed to parse orderbook snapshot batch: {}", e.what());
+        }
+    }
+
+    if (updated > 0) {
+        Logger::info("[Upbit] Refreshed authoritative orderbook snapshots for {} symbols", updated);
+    }
+}
+
+void UpbitExchange::start_orderbook_resync_loop() {
+    if (orderbook_resync_running_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    orderbook_resync_thread_ = std::thread([this]() {
+        constexpr auto kResyncInterval = std::chrono::seconds(2);
+        while (orderbook_resync_running_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(kResyncInterval);
+            if (!orderbook_resync_running_.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            std::vector<SymbolId> symbols;
+            {
+                std::lock_guard lock(subscription_mutex_);
+                symbols = subscribed_orderbooks_;
+            }
+            fetch_orderbook_snapshots(symbols);
+        }
+    });
+}
+
+void UpbitExchange::stop_orderbook_resync_loop() {
+    if (!orderbook_resync_running_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (orderbook_resync_thread_.joinable()) {
+        orderbook_resync_thread_.join();
+    }
 }
 
 Order UpbitExchange::place_market_order(const SymbolId& symbol, Side side, Quantity quantity) {
@@ -687,6 +828,53 @@ double UpbitExchange::get_balance(const std::string& currency) {
     }
 
     return 0.0;
+}
+
+std::vector<AccountBalance> UpbitExchange::get_all_balances() {
+    if (credentials_.api_key.empty() || credentials_.secret_key.empty()) {
+        Logger::warn("[Upbit] No API credentials — cannot fetch all balances");
+        return {};
+    }
+
+    std::string token = generate_jwt_token();
+    std::unordered_map<std::string, std::string> headers = {
+        {"Authorization", "Bearer " + token},
+        {"accept", "application/json"}
+    };
+
+    auto response = rest_client_->get("/v1/accounts", headers);
+    if (!response.success) {
+        Logger::error("[Upbit] Failed to fetch all balances: {}", response.error);
+        return {};
+    }
+
+    std::vector<AccountBalance> balances;
+    try {
+        simdjson::dom::parser parser;
+        auto doc = parser.parse(response.body);
+        for (auto item : doc.get_array()) {
+            AccountBalance balance;
+            balance.currency = parse_dom_string(item["currency"]);
+            balance.available = parse_dom_double(item["balance"]);
+            balance.locked = parse_dom_double(item["locked"]);
+            balance.total = balance.available + balance.locked;
+            if (std::abs(balance.total) <= 1e-12 &&
+                std::abs(balance.available) <= 1e-12 &&
+                std::abs(balance.locked) <= 1e-12) {
+                continue;
+            }
+            balances.push_back(std::move(balance));
+        }
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::error("[Upbit] Failed to parse all balances: {}", e.what());
+        return {};
+    }
+
+    std::sort(balances.begin(), balances.end(),
+              [](const AccountBalance& a, const AccountBalance& b) {
+                  return a.currency < b.currency;
+              });
+    return balances;
 }
 
 bool UpbitExchange::query_order_detail(const std::string& order_id, Order& order) {

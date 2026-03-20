@@ -6,6 +6,7 @@
 #include <simdjson.h>
 #include <map>
 #include <condition_variable>
+#include <thread>
 
 namespace kimp::exchange::upbit {
 
@@ -43,6 +44,10 @@ private:
     // Decompression buffer for gzip WebSocket frames
     std::vector<char> decompress_buf_;
 
+    // Periodic REST snapshot overlay to prevent stale/incorrect BBO drift.
+    std::atomic<bool> orderbook_resync_running_{false};
+    std::thread orderbook_resync_thread_;
+
 public:
     UpbitExchange(net::io_context& ioc, ExchangeCredentials creds)
         : KoreanExchangeBase(Exchange::Upbit, MarketType::Spot, "Upbit", ioc, std::move(creds)) {
@@ -64,6 +69,7 @@ public:
     bool cancel_order(uint64_t order_id) override;
 
     double get_balance(const std::string& currency) override;
+    std::vector<AccountBalance> get_all_balances() override;
     bool query_order_detail(const std::string& order_id, Order& order);
 
 protected:
@@ -80,6 +86,10 @@ private:
 
     // Fast parser for Upbit ticker WS message
     bool parse_ticker_message(std::string_view message);
+
+    void fetch_orderbook_snapshots(const std::vector<SymbolId>& symbols);
+    void start_orderbook_resync_loop();
+    void stop_orderbook_resync_loop();
 
     std::string symbol_to_upbit(const SymbolId& symbol) const {
         return std::string(symbol.get_quote()) + "-" + std::string(symbol.get_base());

@@ -82,9 +82,13 @@ public:
     Order close_short(const SymbolId& symbol, Quantity quantity) override;
 
     double get_balance(const std::string& currency) override;
+    std::vector<AccountBalance> get_all_balances() override;
 
     // Public fill query for async/parallel execution from OrderManager
     bool query_order_fill(const std::string& order_id, Order& order);
+
+    // Repay margin borrow for a specific coin (UTA quick-repayment)
+    bool repay_margin_borrow(const std::string& coin);
 
     // Fetch deposit-enabled networks per coin.
     // Returns {coin → {normalized_network_set}}.
@@ -107,6 +111,7 @@ private:
     bool parse_ticker_message(std::string_view message, Ticker& ticker);
     bool parse_order_response(const std::string& response, Order& order, std::string* order_id_out = nullptr);
     double normalize_order_qty(const SymbolId& symbol, double qty, bool is_open) const;
+    double normalize_close_qty(const SymbolId& symbol, double qty) const;
 
     std::string symbol_to_bybit(const SymbolId& symbol) const {
         return std::string(symbol.get_base()) + std::string(symbol.get_quote());

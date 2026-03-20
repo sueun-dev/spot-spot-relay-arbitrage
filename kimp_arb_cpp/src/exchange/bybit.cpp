@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <limits>
 #include <cmath>
+#include <algorithm>
 
 namespace kimp::exchange::bybit {
 
@@ -314,6 +315,12 @@ std::vector<SymbolId> BybitExchange::get_available_symbols() {
                     auto step = lot["qtyStep"];
                     if (!step.error()) {
                         info.qty_step = opt::fast_stod(step.get_string().value());
+                    } else {
+                        // Some Bybit spot instruments omit qtyStep and only expose basePrecision.
+                        auto base_precision = lot["basePrecision"];
+                        if (!base_precision.error()) {
+                            info.qty_step = opt::fast_stod(base_precision.get_string().value());
+                        }
                     }
                     auto min_amt = lot["minOrderAmt"];
                     if (!min_amt.error()) {
@@ -509,7 +516,7 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
     order.symbol = symbol;
     order.side = Side::Buy;
     order.type = OrderType::Market;
-    double adj_qty = normalize_order_qty(symbol, quantity, false);
+    double adj_qty = normalize_close_qty(symbol, quantity);
     if (adj_qty <= 0.0) {
         order.status = OrderStatus::Rejected;
         Logger::warn("[Bybit] Short close qty invalid after lot size check: {} {}", symbol.to_string(), quantity);
@@ -525,6 +532,7 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
         return order;
     }
 
+    // Step 1: Market buy to acquire the coins (provides fill price for P&L).
     // Try WebSocket Trade API first (~5-20ms vs ~150-300ms REST)
     if (trade_ws_ && trade_ws_->is_connected()) {
         Order ws_order = trade_ws_->place_order_sync(
@@ -535,6 +543,8 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
             ws_order.client_order_id = order.client_order_id;
             Logger::info("[Bybit-WS] Closed spot-margin short {} {} - orderId: {}",
                          symbol.to_string(), adj_qty, ws_order.order_id_str);
+            // Step 2: Repay the margin borrow (UTA does not auto-repay on buy).
+            repay_margin_borrow(std::string(symbol.get_base()));
             return ws_order;
         }
         Logger::warn("[Bybit] WS close failed, falling back to REST");
@@ -567,6 +577,9 @@ Order BybitExchange::close_short(const SymbolId& symbol, Quantity quantity) {
     Logger::info("[Bybit-REST] Closed spot-margin short {} {} - Status: {}, orderId: {}",
                  symbol.to_string(), adj_qty, static_cast<int>(order.status),
                  order.order_id_str);
+
+    // Step 2: Repay the margin borrow (UTA does not auto-repay on buy).
+    repay_margin_borrow(std::string(symbol.get_base()));
     return order;
 }
 
@@ -613,14 +626,79 @@ double BybitExchange::normalize_order_qty(const SymbolId& symbol, double qty, bo
     return qty;
 }
 
+double BybitExchange::normalize_close_qty(const SymbolId& symbol, double qty) const {
+    if (qty <= 0.0) return 0.0;
+    const std::string key = symbol_to_bybit(symbol);
+    double step = 0.0;
+    double min_qty = 0.0;
+    {
+        std::shared_lock lock(metadata_mutex_);
+        auto it = lot_size_cache_.find(key);
+        if (it == lot_size_cache_.end()) {
+            return qty;
+        }
+        step = it->second.qty_step > 0.0 ? it->second.qty_step : 0.0;
+        min_qty = it->second.min_qty;
+    }
+
+    if (step > 0.0) {
+        // Ceil for close: must repay at least the borrowed amount
+        qty = std::ceil(qty / step - 1e-9) * step;
+    }
+    if (qty < min_qty) {
+        return min_qty;
+    }
+    return qty;
+}
+
 bool BybitExchange::cancel_order(uint64_t /*order_id*/) {
     // TODO: Implement if needed
     return false;
 }
 
 bool BybitExchange::prepare_shorting(const SymbolId& symbol) {
-    (void)symbol;
-    return ensure_spot_margin_mode();
+    if (!ensure_spot_margin_mode()) {
+        return false;
+    }
+
+    // Enable collateral for this coin so Bybit allows margin borrowing.
+    // POST /v5/account/set-collateral-switch  {"coin":"ADA","collateralSwitch":"ON"}
+    std::string base(symbol.get_base());
+    char body_buf[128];
+    int body_len = std::snprintf(body_buf, sizeof(body_buf),
+        R"({"coin":"%s","collateralSwitch":"ON"})", base.c_str());
+    if (body_len <= 0 || static_cast<size_t>(body_len) >= sizeof(body_buf)) {
+        Logger::error("[Bybit] Collateral switch body buffer overflow for {}", base);
+        return false;
+    }
+    std::string body_str(body_buf, static_cast<size_t>(body_len));
+    auto headers = build_auth_headers(body_str);
+    headers["Content-Type"] = "application/json";
+
+    auto response = rest_client_->post("/v5/account/set-collateral-switch", body_str, headers);
+    if (!response.success) {
+        Logger::error("[Bybit] Collateral switch request failed for {}: {}", base, response.body);
+        return false;
+    }
+
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
+        int ret_code = static_cast<int>(doc["retCode"].get_int64().value());
+        if (ret_code != 0) {
+            std::string_view ret_msg = doc["retMsg"].get_string().value();
+            // retCode 0 = success; some coins may already be ON — treat as success
+            Logger::warn("[Bybit] Collateral switch for {} retCode={}: {}", base, ret_code, ret_msg);
+            return false;
+        }
+        Logger::info("[Bybit] Collateral enabled for {}", base);
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::warn("[Bybit] Failed to parse collateral switch response for {}: {}", base, e.what());
+        return false;
+    }
+
+    return true;
 }
 
 std::vector<Position> BybitExchange::get_short_positions() {
@@ -685,18 +763,97 @@ bool BybitExchange::close_short_position(const SymbolId& symbol) {
     return true;  // No position to close
 }
 
-double BybitExchange::get_balance(const std::string& currency) {
-    // Try UNIFIED first (Unified Trading Account), fall back to CONTRACT (legacy)
-    for (const char* acct_type : {"UNIFIED", "CONTRACT"}) {
-        std::string query = std::string("accountType=") + acct_type;
-        auto headers = build_auth_headers(query);
-        auto response = rest_client_->get("/v5/account/wallet-balance?" + query, headers);
+bool BybitExchange::repay_margin_borrow(const std::string& coin) {
+    // POST /v5/account/quick-repayment  {"coin":"ADA"}
+    char body_buf[128];
+    int body_len = std::snprintf(body_buf, sizeof(body_buf),
+        R"({"coin":"%s"})", coin.c_str());
+    if (body_len <= 0 || static_cast<size_t>(body_len) >= sizeof(body_buf)) {
+        Logger::error("[Bybit] repay body buffer overflow");
+        return false;
+    }
+    std::string body_str(body_buf, static_cast<size_t>(body_len));
+    auto headers = build_auth_headers(body_str);
+    headers["Content-Type"] = "application/json";
 
-        if (!response.success) {
-            Logger::error("[Bybit] Failed to fetch balance ({}): {}", acct_type, response.error);
-            continue;
+    auto response = rest_client_->post("/v5/account/quick-repayment", body_str, headers);
+    if (!response.success) {
+        Logger::error("[Bybit] Quick repayment failed for {}: {}", coin, response.error);
+        return false;
+    }
+
+    // Parse response
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
+        int64_t ret_code = doc["retCode"].get_int64().value();
+        if (ret_code != 0) {
+            std::string_view msg = doc["retMsg"].get_string().value();
+            // retCode=10016 ("Internal System Error") is known to succeed despite
+            // the non-zero code — treat as warning, not hard failure.
+            Logger::warn("[Bybit] Quick repayment {} retCode={} msg={}", coin, ret_code, msg);
+            return false;
+        }
+        Logger::info("[Bybit] Quick repayment succeeded for {}", coin);
+        return true;
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::error("[Bybit] Quick repayment parse error: {}", e.what());
+        return false;
+    }
+}
+
+double BybitExchange::get_balance(const std::string& currency) {
+    std::string query = "accountType=UNIFIED";
+    auto headers = build_auth_headers(query);
+    auto response = rest_client_->get("/v5/account/wallet-balance?" + query, headers);
+
+    if (!response.success) {
+        Logger::error("[Bybit] Failed to fetch balance: {}", response.error);
+        return 0.0;
+    }
+
+    try {
+        simdjson::ondemand::parser local_parser;
+        simdjson::padded_string padded(response.body);
+        auto doc = local_parser.iterate(padded);
+
+        int ret_code = static_cast<int>(doc["retCode"].get_int64().value());
+        if (ret_code != 0) {
+            std::string_view ret_msg = doc["retMsg"].get_string().value();
+            Logger::warn("[Bybit] Balance query retCode={}: {}", ret_code, ret_msg);
+            return 0.0;
         }
 
+        auto list = doc["result"]["list"].get_array();
+        for (auto account : list) {
+            auto coins = account["coin"].get_array();
+            for (auto coin : coins) {
+                std::string_view coin_name = coin["coin"].get_string().value();
+                if (coin_name == currency) {
+                    std::string_view balance_str = coin["walletBalance"].get_string().value();
+                    double balance = opt::fast_stod(balance_str);
+                    return balance;
+                }
+            }
+        }
+    } catch (const simdjson::simdjson_error& e) {
+        Logger::error("[Bybit] Failed to parse balance: {}", e.what());
+    }
+
+    return 0.0;
+}
+
+std::vector<AccountBalance> BybitExchange::get_all_balances() {
+    std::unordered_map<std::string, AccountBalance> balances_by_currency;
+
+    std::string query = "accountType=UNIFIED";
+    auto headers = build_auth_headers(query);
+    auto response = rest_client_->get("/v5/account/wallet-balance?" + query, headers);
+
+    if (!response.success) {
+        Logger::error("[Bybit] Failed to fetch all balances: {}", response.error);
+    } else {
         try {
             simdjson::ondemand::parser local_parser;
             simdjson::padded_string padded(response.body);
@@ -705,30 +862,63 @@ double BybitExchange::get_balance(const std::string& currency) {
             int ret_code = static_cast<int>(doc["retCode"].get_int64().value());
             if (ret_code != 0) {
                 std::string_view ret_msg = doc["retMsg"].get_string().value();
-                Logger::warn("[Bybit] Balance query retCode={} ({}): {}", ret_code, acct_type, ret_msg);
-                continue;
-            }
+                Logger::warn("[Bybit] All balances query retCode={}: {}", ret_code, ret_msg);
+            } else {
+                auto list = doc["result"]["list"].get_array();
+                for (auto account : list) {
+                    auto coins = account["coin"].get_array();
+                    for (auto coin : coins) {
+                        std::string currency(coin["coin"].get_string().value());
+                        AccountBalance& balance = balances_by_currency[currency];
+                        balance.currency = currency;
 
-            auto list = doc["result"]["list"].get_array();
-            for (auto account : list) {
-                auto coins = account["coin"].get_array();
-                for (auto coin : coins) {
-                    std::string_view coin_name = coin["coin"].get_string().value();
-                    if (coin_name == currency) {
-                        std::string_view balance_str = coin["walletBalance"].get_string().value();
-                        double balance = opt::fast_stod(balance_str);
-                        Logger::info("[Bybit] {} balance: {} ({})", currency, balance, acct_type);
-                        return balance;
+                        auto wallet_balance_field = coin["walletBalance"];
+                        if (!wallet_balance_field.error()) {
+                            balance.total += opt::fast_stod(wallet_balance_field.get_string().value());
+                        }
+
+                        auto locked_field = coin["locked"];
+                        if (!locked_field.error()) {
+                            balance.locked += opt::fast_stod(locked_field.get_string().value());
+                        }
+
+                        auto free_field = coin["free"];
+                        if (!free_field.error()) {
+                            balance.available += opt::fast_stod(free_field.get_string().value());
+                        }
+
+                        auto borrow_amount_field = coin["borrowAmount"];
+                        if (!borrow_amount_field.error()) {
+                            balance.liability += opt::fast_stod(borrow_amount_field.get_string().value());
+                        }
                     }
                 }
             }
         } catch (const simdjson::simdjson_error& e) {
-            Logger::error("[Bybit] Failed to parse balance ({}): {}", acct_type, e.what());
+            Logger::error("[Bybit] Failed to parse all balances: {}", e.what());
         }
     }
 
-    Logger::warn("[Bybit] {} not found in any account type", currency);
-    return 0.0;
+    std::vector<AccountBalance> balances;
+    balances.reserve(balances_by_currency.size());
+    for (auto& [currency, balance] : balances_by_currency) {
+        if (balance.available == 0.0) {
+            balance.available = balance.total - balance.locked;
+        }
+        if (std::abs(balance.total) <= 1e-12 &&
+            std::abs(balance.available) <= 1e-12 &&
+            std::abs(balance.locked) <= 1e-12 &&
+            std::abs(balance.liability) <= 1e-12) {
+            continue;
+        }
+        balances.push_back(balance);
+    }
+
+    std::sort(balances.begin(), balances.end(),
+              [](const AccountBalance& a, const AccountBalance& b) {
+                  return a.currency < b.currency;
+              });
+    return balances;
 }
 
 void BybitExchange::on_ws_message(std::string_view message) {

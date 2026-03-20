@@ -272,6 +272,26 @@ bool quantities_match(double lhs, double rhs) {
     return std::fabs(lhs - rhs) <= (scale * 1e-6);
 }
 
+void log_hedge_audit(std::string_view phase,
+                     const kimp::SymbolId& symbol,
+                     double korean_qty,
+                     double foreign_qty,
+                     double korean_price,
+                     double foreign_price,
+                     double adjustment_pnl_krw = 0.0) {
+    kimp::Logger::info(
+        "[HEDGE-AUDIT] {} {} | kr {:.8f} @ {:.2f} | fr {:.8f} @ {:.8f} | delta {:.8f} | adj_pnl {:.0f} KRW | {}",
+        phase,
+        symbol.to_string(),
+        korean_qty,
+        korean_price,
+        foreign_qty,
+        foreign_price,
+        korean_qty - foreign_qty,
+        adjustment_pnl_krw,
+        quantities_match(korean_qty, foreign_qty) ? "MATCH" : "MISMATCH");
+}
+
 bool quote_pair_is_usable(const kimp::strategy::PriceCache::PriceData& korean_price,
                           const kimp::strategy::PriceCache::PriceData& foreign_price,
                           bool is_exit = false) {
@@ -787,6 +807,14 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                     return result;
                 }
 
+                log_hedge_audit("ENTRY",
+                                signal.symbol,
+                                korean_open_qty,
+                                foreign_open_qty,
+                                buy_price,
+                                short_price,
+                                entry_adjustment_pnl_krw);
+
                 actual_filled = std::min(foreign_open_qty, korean_open_qty);
                 double actual_korean_cost = actual_filled * buy_price;
 
@@ -1041,6 +1069,14 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
                     );
                     return result;
                 }
+
+                log_hedge_audit("EXIT",
+                                signal.symbol,
+                                korean_closed_qty,
+                                foreign_closed_qty,
+                                sell_price,
+                                cover_price,
+                                split_pnl_krw);
 
                 actual_covered = std::min(foreign_closed_qty, korean_closed_qty);
                 realized_pnl_krw += split_pnl_krw;
@@ -1326,7 +1362,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
             auto& cache = engine_->get_price_cache();
             auto foreign_price = cache.get_price(signal.foreign_exchange, foreign_symbol);
             auto korean_price = cache.get_price(signal.korean_exchange, position.symbol);
-            if (quote_pair_is_usable(korean_price, foreign_price)) {
+            if (quote_pair_is_usable(korean_price, foreign_price, /*is_exit=*/true)) {
                 current_foreign_bid = foreign_price.bid;
                 current_foreign_ask = foreign_price.ask;
                 current_korean_ask = korean_price.ask;
@@ -1750,6 +1786,14 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
                     return result;
                 }
 
+                log_hedge_audit("REENTRY",
+                                position.symbol,
+                                korean_open_qty,
+                                foreign_open_qty,
+                                buy_price,
+                                short_price,
+                                reentry_adjustment_pnl_krw);
+
                 actual_filled = std::min(foreign_open_qty, korean_open_qty);
                 double actual_korean_cost = actual_filled * buy_price;
 
@@ -1859,21 +1903,28 @@ bool OrderManager::prepare_bybit_shorting(const std::vector<SymbolId>& symbols) 
         return false;
     }
 
-    std::optional<SymbolId> sample_symbol;
-    if (!symbols.empty()) {
-        sample_symbol = SymbolId(symbols.front().get_base(), "USDT");
+    std::vector<SymbolId> unique_symbols;
+    std::unordered_set<std::string> seen_bases;
+    unique_symbols.reserve(symbols.size());
+    for (const auto& symbol : symbols) {
+        std::string base(symbol.get_base());
+        if (seen_bases.insert(base).second) {
+            unique_symbols.emplace_back(base, "USDT");
+        }
     }
-    if (!sample_symbol) {
-        sample_symbol = SymbolId("BTC", "USDT");
+    if (unique_symbols.empty()) {
+        unique_symbols.emplace_back("BTC", "USDT");
     }
 
-    const bool ready = bybit->prepare_shorting(*sample_symbol);
-    if (ready) {
-        Logger::info("Prepared Bybit spot-margin shorting for {} symbols", symbols.size());
-    } else {
-        Logger::error("Failed to prepare Bybit spot-margin shorting");
+    for (const auto& symbol : unique_symbols) {
+        if (!bybit->prepare_shorting(symbol)) {
+            Logger::error("Failed to prepare Bybit spot-margin shorting for {}", symbol.to_string());
+            return false;
+        }
     }
-    return ready;
+
+    Logger::info("Prepared Bybit spot-margin shorting for {} symbols", unique_symbols.size());
+    return true;
 }
 
 bool OrderManager::prepare_okx_shorting(const std::vector<SymbolId>& symbols) {

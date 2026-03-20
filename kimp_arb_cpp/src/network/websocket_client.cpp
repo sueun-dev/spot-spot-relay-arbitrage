@@ -115,9 +115,13 @@ void WebSocketClient::send(std::string message) {
     }
 
     if (!is_writing_.exchange(true)) {
-        net::dispatch(strand_, [self = shared_from_this()] {
-            self->do_write();
-        });
+        if (auto self = weak_from_this().lock()) {
+            net::dispatch(strand_, [self = std::move(self)] {
+                self->do_write();
+            });
+        } else {
+            is_writing_.store(false, std::memory_order_release);
+        }
     }
 }
 
@@ -126,9 +130,13 @@ void WebSocketClient::send(std::string_view message) {
 }
 
 void WebSocketClient::do_resolve() {
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return;
+    }
     resolver_.async_resolve(
         host_, port_,
-        beast::bind_front_handler(&WebSocketClient::on_resolve, shared_from_this()));
+        beast::bind_front_handler(&WebSocketClient::on_resolve, std::move(self)));
 }
 
 void WebSocketClient::on_resolve(beast::error_code ec, tcp::resolver::results_type results) {
@@ -144,9 +152,13 @@ void WebSocketClient::on_resolve(beast::error_code ec, tcp::resolver::results_ty
     beast::get_lowest_layer(*ws_).expires_after(std::chrono::seconds(30));
 
     // Connect
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return;
+    }
     beast::get_lowest_layer(*ws_).async_connect(
         results,
-        beast::bind_front_handler(&WebSocketClient::on_connect, shared_from_this()));
+        beast::bind_front_handler(&WebSocketClient::on_connect, std::move(self)));
 }
 
 void WebSocketClient::on_connect(beast::error_code ec, tcp::resolver::results_type::endpoint_type ep) {
@@ -170,9 +182,13 @@ void WebSocketClient::on_connect(beast::error_code ec, tcp::resolver::results_ty
 
     // SSL handshake
     beast::get_lowest_layer(*ws_).expires_after(std::chrono::seconds(30));
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return;
+    }
     ws_->next_layer().async_handshake(
         ssl::stream_base::client,
-        beast::bind_front_handler(&WebSocketClient::on_ssl_handshake, shared_from_this()));
+        beast::bind_front_handler(&WebSocketClient::on_ssl_handshake, std::move(self)));
 }
 
 void WebSocketClient::on_ssl_handshake(beast::error_code ec) {
@@ -202,8 +218,12 @@ void WebSocketClient::on_ssl_handshake(beast::error_code ec) {
     }));
 
     // WebSocket handshake
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return;
+    }
     ws_->async_handshake(host_, path_,
-        beast::bind_front_handler(&WebSocketClient::on_handshake, shared_from_this()));
+        beast::bind_front_handler(&WebSocketClient::on_handshake, std::move(self)));
 }
 
 void WebSocketClient::on_handshake(beast::error_code ec) {
@@ -229,9 +249,13 @@ void WebSocketClient::on_handshake(beast::error_code ec) {
 }
 
 void WebSocketClient::do_read() {
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return;
+    }
     ws_->async_read(
         read_buffer_,
-        beast::bind_front_handler(&WebSocketClient::on_read, shared_from_this()));
+        beast::bind_front_handler(&WebSocketClient::on_read, std::move(self)));
 }
 
 void WebSocketClient::on_read(beast::error_code ec, std::size_t bytes_transferred) {
@@ -279,9 +303,15 @@ void WebSocketClient::do_write() {
 
         current_write_message_ = std::move(*message);
         ws_->text(true);
+        auto self = weak_from_this().lock();
+        if (!self) {
+            current_write_message_.clear();
+            is_writing_.store(false, std::memory_order_release);
+            return;
+        }
         ws_->async_write(
             net::buffer(current_write_message_),
-            beast::bind_front_handler(&WebSocketClient::on_write, shared_from_this()));
+            beast::bind_front_handler(&WebSocketClient::on_write, std::move(self)));
         return;
     }
 }
@@ -302,9 +332,13 @@ void WebSocketClient::on_write(beast::error_code ec, std::size_t bytes_transferr
 }
 
 void WebSocketClient::do_close() {
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return;
+    }
     ws_->async_close(
         websocket::close_code::normal,
-        beast::bind_front_handler(&WebSocketClient::on_close, shared_from_this()));
+        beast::bind_front_handler(&WebSocketClient::on_close, std::move(self)));
 }
 
 void WebSocketClient::on_close(beast::error_code ec) {
@@ -343,8 +377,12 @@ void WebSocketClient::schedule_reconnect() {
                  name_, delay, attempts);
 
     reconnect_timer_.expires_after(std::chrono::milliseconds(delay));
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return;
+    }
     reconnect_timer_.async_wait(
-        beast::bind_front_handler(&WebSocketClient::on_reconnect_timer, shared_from_this()));
+        beast::bind_front_handler(&WebSocketClient::on_reconnect_timer, std::move(self)));
 }
 
 void WebSocketClient::on_reconnect_timer(beast::error_code ec) {
@@ -364,8 +402,12 @@ void WebSocketClient::on_reconnect_timer(beast::error_code ec) {
 
 void WebSocketClient::schedule_ping() {
     ping_timer_.expires_after(std::chrono::milliseconds(PING_INTERVAL_MS));
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return;
+    }
     ping_timer_.async_wait(
-        beast::bind_front_handler(&WebSocketClient::on_ping_timer, shared_from_this()));
+        beast::bind_front_handler(&WebSocketClient::on_ping_timer, std::move(self)));
 }
 
 void WebSocketClient::on_ping_timer(beast::error_code ec) {
@@ -378,11 +420,15 @@ void WebSocketClient::on_ping_timer(beast::error_code ec) {
     }
 
     // Send ping
-    ws_->async_ping({}, [self = shared_from_this()](beast::error_code ec) {
-        if (ec) {
-            Logger::warn("[{}] Ping failed: {}", self->name_, ec.message());
-        }
-    });
+    if (auto self = weak_from_this().lock()) {
+        ws_->async_ping({}, [self = std::move(self)](beast::error_code ec) {
+            if (ec) {
+                Logger::warn("[{}] Ping failed: {}", self->name_, ec.message());
+            }
+        });
+    } else {
+        return;
+    }
 
     // Schedule next ping
     schedule_ping();

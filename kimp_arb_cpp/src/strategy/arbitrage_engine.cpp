@@ -419,10 +419,11 @@ double ArbitrageEngine::calculate_premium(const SymbolId& symbol,
         foreign_symbol = SymbolId(symbol.get_base(), "USDT");
     }
 
-    // If multiple exchanges exist, pick the pair with the best spread
+    // If multiple exchanges exist, pick the pair with the best projected net profit.
     double best_foreign_bid = 0.0;
     double usdt_rate = 0.0;
-    double best_spread = -1e18;
+    double best_net_profit = -1e18;
+    double best_net_edge = -1e18;
     const std::string base(symbol.get_base());
     for (const auto& pair : exchange_pairs_) {
         if (pair.korean != korean_ex) continue;
@@ -432,9 +433,21 @@ double ArbitrageEngine::calculate_premium(const SymbolId& symbol,
         if (!quote_pair_is_usable(pair.korean, pair.foreign, korean_price, fp)) continue;
         double rate = price_cache_.get_usdt_krw(pair.korean);
         if (rate <= 0) continue;
-        double spread = fp.bid * rate - korean_price.ask;
-        if (spread > best_spread) {
-            best_spread = spread;
+        double withdraw_fee = price_cache_.get_withdraw_fee(pair.korean, pair.foreign, base);
+        auto relay_metrics = PremiumCalculator::calculate_relay_metrics(
+            korean_price.ask,
+            korean_price.ask_qty,
+            fp.bid,
+            fp.bid_qty,
+            rate,
+            TradingConfig::get_korean_fee_rate(pair.korean),
+            TradingConfig::get_foreign_fee_rate(pair.foreign),
+            withdraw_fee);
+        if (relay_metrics.net_profit_krw > best_net_profit ||
+            (relay_metrics.net_profit_krw == best_net_profit &&
+             relay_metrics.net_edge_pct > best_net_edge)) {
+            best_net_profit = relay_metrics.net_profit_krw;
+            best_net_edge = relay_metrics.net_edge_pct;
             best_foreign_bid = fp.bid;
             usdt_rate = rate;
         }
@@ -538,14 +551,13 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
     const auto& foreign_symbol = foreign_symbols_[idx];
     const std::string base(symbol.get_base());
 
-    // ── Multi-exchange selection: pick the pair with the best gross spread ──
-    // Iterate all exchange pairs (Korean × Foreign) and select the one with the
-    // highest spread = foreign_bid * usdt_krw − korean_ask.
+    // Pick the pair with the best projected net profit after fees and transfer cost.
     Exchange best_korean_ex = exchange_pairs_[0].korean;
     Exchange best_foreign_ex = exchange_pairs_[0].foreign;
     PriceCache::PriceData best_korean_price{};
     PriceCache::PriceData best_foreign_price{};
-    double best_spread = -1e18;
+    double best_net_profit = -1e18;
+    double best_net_edge = -1e18;
     double best_usdt_rate = 0.0;
 
     for (const auto& pair : exchange_pairs_) {
@@ -563,9 +575,21 @@ void ArbitrageEngine::update_symbol_entry(size_t idx) {
         double rate = price_cache_.get_usdt_krw(pair.korean);
         if (rate <= 0) continue;
 
-        double spread = foreign_price.bid * rate - korean_price.ask;
-        if (spread > best_spread) {
-            best_spread = spread;
+        double withdraw_fee = price_cache_.get_withdraw_fee(pair.korean, pair.foreign, base);
+        auto relay_metrics = PremiumCalculator::calculate_relay_metrics(
+            korean_price.ask,
+            korean_price.ask_qty,
+            foreign_price.bid,
+            foreign_price.bid_qty,
+            rate,
+            TradingConfig::get_korean_fee_rate(pair.korean),
+            TradingConfig::get_foreign_fee_rate(pair.foreign),
+            withdraw_fee);
+        if (relay_metrics.net_profit_krw > best_net_profit ||
+            (relay_metrics.net_profit_krw == best_net_profit &&
+             relay_metrics.net_edge_pct > best_net_edge)) {
+            best_net_profit = relay_metrics.net_profit_krw;
+            best_net_edge = relay_metrics.net_edge_pct;
             best_korean_ex = pair.korean;
             best_foreign_ex = pair.foreign;
             best_korean_price = korean_price;
@@ -874,7 +898,7 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
     best_korean_exchanges.reserve(n);
 
     // Phase 1: Collect valid prices directly into SoA arrays (single pass)
-    // For each symbol, pick the pair with the best gross spread across all exchange pairs.
+    // For each symbol, pick the pair with the best projected net profit across exchange pairs.
     for (size_t i = 0; i < n; ++i) {
         const auto& symbol = monitored_symbols_[i];
         const auto& foreign_symbol = foreign_symbols_[i];
@@ -883,7 +907,8 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
         PriceCache::PriceData best_kr{};
         PriceCache::PriceData best_fr{};
         double best_rate = 0.0;
-        double best_spread = -1e18;
+        double best_net_profit = -1e18;
+        double best_net_edge = -1e18;
         Exchange best_k_ex = Exchange::Bithumb;
         Exchange best_f_ex = Exchange::Bybit;
 
@@ -895,14 +920,24 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
             auto foreign_price = price_cache_.get_price(pair.foreign, foreign_symbol);
             if (!foreign_price.valid || foreign_price.bid <= 0) continue;
 
-            if (!quote_pair_is_usable(pair.korean, pair.foreign, korean_price, foreign_price)) continue;
-
             double usdt_rate = price_cache_.get_usdt_krw(pair.korean);
             if (usdt_rate <= 0) continue;
 
-            double spread = foreign_price.bid * usdt_rate - korean_price.ask;
-            if (spread > best_spread) {
-                best_spread = spread;
+            double withdraw_fee = price_cache_.get_withdraw_fee(pair.korean, pair.foreign, base);
+            auto relay_metrics = PremiumCalculator::calculate_relay_metrics(
+                korean_price.ask,
+                korean_price.ask_qty,
+                foreign_price.bid,
+                foreign_price.bid_qty,
+                usdt_rate,
+                TradingConfig::get_korean_fee_rate(pair.korean),
+                TradingConfig::get_foreign_fee_rate(pair.foreign),
+                withdraw_fee);
+            if (relay_metrics.net_profit_krw > best_net_profit ||
+                (relay_metrics.net_profit_krw == best_net_profit &&
+                 relay_metrics.net_edge_pct > best_net_edge)) {
+                best_net_profit = relay_metrics.net_profit_krw;
+                best_net_edge = relay_metrics.net_edge_pct;
                 best_kr = korean_price;
                 best_fr = foreign_price;
                 best_rate = usdt_rate;
@@ -1004,8 +1039,27 @@ std::vector<ArbitrageEngine::PremiumInfo> ArbitrageEngine::get_all_premiums() co
         info.both_can_fill_target = relay_metrics.both_can_fill_target;
         const uint64_t newest_ts = std::max(korean_timestamps[i], foreign_timestamps[i]);
         info.age_ms = newest_ts > 0 && now_ms > newest_ts ? (now_ms - newest_ts) : 0;
+        PriceCache::PriceData best_korean_price{};
+        best_korean_price.valid = true;
+        best_korean_price.bid = korean_bids[i];
+        best_korean_price.ask = korean_asks[i];
+        best_korean_price.bid_qty = korean_bid_qtys[i];
+        best_korean_price.ask_qty = korean_ask_qtys[i];
+        best_korean_price.timestamp = korean_timestamps[i];
+        PriceCache::PriceData best_foreign_price{};
+        best_foreign_price.valid = true;
+        best_foreign_price.bid = foreign_bids[i];
+        best_foreign_price.ask = foreign_asks[i];
+        best_foreign_price.bid_qty = foreign_bid_qtys[i];
+        best_foreign_price.ask_qty = foreign_ask_qtys[i];
+        best_foreign_price.timestamp = foreign_timestamps[i];
+        info.quote_usable = quote_pair_is_usable(
+            best_korean_exchanges[i],
+            best_foreign_exchanges[i],
+            best_korean_price,
+            best_foreign_price);
         info.entry_signal = TradingConfig::entry_gate_passes(
-            relay_metrics.both_can_fill_target,
+            info.quote_usable && relay_metrics.both_can_fill_target,
             relay_metrics.match_qty,
             relay_metrics.net_edge_pct,
             relay_metrics.net_profit_krw);

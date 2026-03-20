@@ -552,7 +552,7 @@ void test_section8_dynamic_exit_threshold() {
               kimp::TradingConfig::EXIT_PREMIUM_THRESHOLD, 1e-10);
 
     TEST("SPLIT_ORDERS = 1", kimp::TradingConfig::SPLIT_ORDERS == 1);
-    TEST_NEAR("ORDER_SIZE = 70 USDT per add", kimp::TradingConfig::ORDER_SIZE_USD, 70.0, 1e-10);
+    TEST_NEAR("ORDER_SIZE = 35 USDT per add", kimp::TradingConfig::ORDER_SIZE_USD, 35.0, 1e-10);
     TEST_NEAR("POSITION_SIZE = $3000 side cap", kimp::TradingConfig::POSITION_SIZE_USD, 3000.0, 1e-10);
 }
 

@@ -179,6 +179,30 @@ target_link_libraries(kimp_test_bithumb_ws PRIVATE kimp_lib)
 add_executable(kimp_test_bithumb_private_ws tests/test_bithumb_private_ws.cpp)
 target_link_libraries(kimp_test_bithumb_private_ws PRIVATE kimp_lib)
 
+# Live smoke: dotenv + config + private/public exchange readiness
+add_executable(kimp_test_live_entry tests/test_live_entry_selection.cpp)
+target_link_libraries(kimp_test_live_entry PRIVATE kimp_lib)
+
+# Live smoke: single-pair hedge readiness without placing orders
+add_executable(kimp_test_live_hedge tests/test_live_hedge_accuracy.cpp)
+target_link_libraries(kimp_test_live_hedge PRIVATE kimp_lib)
+
+# Live smoke: concurrent private REST balance fetch on all configured venues
+add_executable(kimp_test_parallel_fill tests/test_parallel_fill.cpp)
+target_link_libraries(kimp_test_parallel_fill PRIVATE kimp_lib)
+
+# Live smoke: multi-coin relay universe availability without order placement
+add_executable(kimp_test_multicoin_hedge tests/test_multicoin_hedge.cpp)
+target_link_libraries(kimp_test_multicoin_hedge PRIVATE kimp_lib)
+
+# Live smoke: confirm Bybit margin mode and OKX 1x cross setup without orders
+add_executable(kimp_test_live_margin_setup tests/test_live_margin_setup.cpp)
+target_link_libraries(kimp_test_live_margin_setup PRIVATE kimp_lib)
+
+# Live test harness: dry-run or explicit execute for one KR↔foreign pair roundtrip
+add_executable(kimp_test_live_pair_roundtrip tests/test_live_pair_roundtrip.cpp)
+target_link_libraries(kimp_test_live_pair_roundtrip PRIVATE kimp_lib)
+
 # Regression: KRW price formatting must not round sub-won Bithumb quotes into fake prices
 add_executable(kimp_test_price_format tests/test_price_format.cpp)
 target_link_libraries(kimp_test_price_format PRIVATE kimp_lib)
@@ -212,6 +236,10 @@ add_custom_command(TARGET kimp_bot POST_BUILD
 # Install
 install(TARGETS kimp_bot RUNTIME DESTINATION bin)
 install(DIRECTORY config/ DESTINATION etc/kimp)
+
+# Utility: close leftover short positions on Bybit
+add_executable(kimp_close_ada_short tests/test_close_ada_short.cpp)
+target_link_libraries(kimp_close_ada_short PRIVATE kimp_lib)
 
 # Print configuration summary
 message(STATUS "")

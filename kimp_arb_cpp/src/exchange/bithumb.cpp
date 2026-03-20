@@ -7,6 +7,10 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <optional>
 
 namespace {
 
@@ -36,6 +40,44 @@ bool extract_quoted_value(std::string_view source,
     out_value = source.substr(content_start, content_end - content_start);
     out_end = content_end;
     return true;
+}
+
+double parse_dom_double(simdjson::dom::element elem, double fallback = 0.0) {
+    if (elem.is_null()) {
+        return fallback;
+    }
+    auto dbl = elem.get_double();
+    if (!dbl.error()) {
+        return dbl.value();
+    }
+    auto int64_val = elem.get_int64();
+    if (!int64_val.error()) {
+        return static_cast<double>(int64_val.value());
+    }
+    auto uint64_val = elem.get_uint64();
+    if (!uint64_val.error()) {
+        return static_cast<double>(uint64_val.value());
+    }
+    auto str = elem.get_string();
+    if (!str.error()) {
+        return kimp::opt::fast_stod(str.value());
+    }
+    return fallback;
+}
+
+std::string parse_dom_string(simdjson::dom::element elem) {
+    auto str = elem.get_string();
+    if (!str.error()) {
+        return std::string(str.value());
+    }
+    return {};
+}
+
+std::string to_upper_copy(std::string value) {
+    for (auto& c : value) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return value;
 }
 
 bool parse_ticker_fast(std::string_view message, kimp::Ticker& ticker) {
@@ -789,37 +831,139 @@ bool BithumbExchange::cancel_order(uint64_t /*order_id*/) {
 }
 
 double BithumbExchange::get_balance(const std::string& currency) {
+    const std::string normalized_currency = to_upper_copy(currency);
+    for (const auto& balance : get_all_balances()) {
+        if (balance.currency == normalized_currency) {
+            return balance.available;
+        }
+    }
+    return 0.0;
+}
+
+std::vector<AccountBalance> BithumbExchange::get_all_balances() {
+    auto v1_headers = build_v1_auth_headers();
+    auto v1_response = rest_client_->get("/v1/accounts", v1_headers);
+    if (v1_response.success) {
+        try {
+            simdjson::dom::parser parser;
+            auto doc = parser.parse(v1_response.body);
+            std::vector<AccountBalance> balances;
+            for (auto item : doc.get_array()) {
+                AccountBalance balance;
+                balance.currency = to_upper_copy(parse_dom_string(item["currency"]));
+                balance.available = parse_dom_double(item["balance"]);
+                balance.locked = parse_dom_double(item["locked"]);
+                balance.total = balance.available + balance.locked;
+                if (balance.currency.empty()) {
+                    continue;
+                }
+                if (std::abs(balance.total) <= 1e-12 &&
+                    std::abs(balance.available) <= 1e-12 &&
+                    std::abs(balance.locked) <= 1e-12) {
+                    continue;
+                }
+                balances.push_back(std::move(balance));
+            }
+            std::sort(balances.begin(), balances.end(),
+                      [](const AccountBalance& a, const AccountBalance& b) {
+                          return a.currency < b.currency;
+                      });
+            if (!balances.empty()) {
+                return balances;
+            }
+        } catch (const simdjson::simdjson_error& e) {
+            Logger::warn("[Bithumb] Failed to parse /v1/accounts, falling back to legacy /info/balance: {}",
+                         e.what());
+        }
+    } else {
+        Logger::warn("[Bithumb] /v1/accounts failed, falling back to legacy /info/balance: {}",
+                     v1_response.error);
+    }
+
     std::string endpoint = "/info/balance";
-    std::string params = "currency=" + currency;
+    std::string params = "currency=ALL";
 
     auto headers = build_auth_headers(endpoint, params);
     headers["Content-Type"] = "application/x-www-form-urlencoded";
 
     auto response = rest_client_->post(endpoint, params, headers);
     if (!response.success) {
-        Logger::error("[Bithumb] Failed to fetch balance: {}", response.error);
-        return -1.0;
+        Logger::error("[Bithumb] Failed to fetch all balances: {}", response.error);
+        return {};
     }
+
+    std::unordered_map<std::string, AccountBalance> balances_by_currency;
 
     try {
-        simdjson::ondemand::parser local_parser;
-        simdjson::padded_string padded(response.body);
-        auto doc = local_parser.iterate(padded);
-        std::string field = "available_" + currency;
+        simdjson::dom::parser parser;
+        auto doc = parser.parse(response.body);
+        auto data = doc["data"];
+        for (auto field : data.get_object()) {
+            std::string key(field.key);
+            if (key.rfind("xcoin_last_", 0) == 0) {
+                continue;
+            }
 
-        // Convert to lowercase for the field name
-        for (auto& c : field) c = std::tolower(c);
+            constexpr std::string_view available_prefix = "available_";
+            constexpr std::string_view in_use_prefix = "in_use_";
+            constexpr std::string_view total_prefix = "total_";
 
-        auto balance = doc["data"][field];
-        if (!balance.error()) {
-            std::string_view bal_str = balance.get_string().value();
-            return opt::fast_stod(bal_str);
+            std::string currency;
+            enum class FieldType { Available, Locked, Total };
+            std::optional<FieldType> field_type;
+
+            if (key.rfind(available_prefix, 0) == 0) {
+                currency = to_upper_copy(key.substr(available_prefix.size()));
+                field_type = FieldType::Available;
+            } else if (key.rfind(in_use_prefix, 0) == 0) {
+                currency = to_upper_copy(key.substr(in_use_prefix.size()));
+                field_type = FieldType::Locked;
+            } else if (key.rfind(total_prefix, 0) == 0) {
+                currency = to_upper_copy(key.substr(total_prefix.size()));
+                field_type = FieldType::Total;
+            } else {
+                continue;
+            }
+
+            AccountBalance& balance = balances_by_currency[currency];
+            balance.currency = currency;
+            const double value = parse_dom_double(field.value, 0.0);
+            switch (*field_type) {
+                case FieldType::Available:
+                    balance.available = value;
+                    break;
+                case FieldType::Locked:
+                    balance.locked = value;
+                    break;
+                case FieldType::Total:
+                    balance.total = value;
+                    break;
+            }
         }
     } catch (const simdjson::simdjson_error& e) {
-        Logger::error("[Bithumb] Failed to parse balance: {}", e.what());
+        Logger::error("[Bithumb] Failed to parse all balances: {}", e.what());
+        return {};
     }
 
-    return -1.0;
+    std::vector<AccountBalance> balances;
+    balances.reserve(balances_by_currency.size());
+    for (auto& [currency, balance] : balances_by_currency) {
+        if (balance.total == 0.0) {
+            balance.total = balance.available + balance.locked;
+        }
+        if (std::abs(balance.total) <= 1e-12 &&
+            std::abs(balance.available) <= 1e-12 &&
+            std::abs(balance.locked) <= 1e-12) {
+            continue;
+        }
+        balances.push_back(balance);
+    }
+
+    std::sort(balances.begin(), balances.end(),
+              [](const AccountBalance& a, const AccountBalance& b) {
+                  return a.currency < b.currency;
+              });
+    return balances;
 }
 
 void BithumbExchange::on_ws_message(std::string_view message) {

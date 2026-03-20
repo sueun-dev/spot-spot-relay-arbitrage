@@ -82,6 +82,7 @@ public:
     Order close_short(const SymbolId& symbol, Quantity quantity) override;
 
     double get_balance(const std::string& currency) override;
+    std::vector<AccountBalance> get_all_balances() override;
 
     // Public fill query for async/parallel execution from OrderManager
     bool query_order_fill(const std::string& order_id, const SymbolId& symbol, Order& order);

@@ -66,6 +66,7 @@ RuntimeConfig ConfigLoader::load(const std::string& path) {
         load_exchange("bithumb", Exchange::Bithumb);
         load_exchange("bybit", Exchange::Bybit);
         load_exchange("okx", Exchange::OKX);
+        load_exchange("upbit", Exchange::Upbit);
         // Threading config
         if (yaml["threading"]) {
             auto th = yaml["threading"];
@@ -138,6 +139,17 @@ RuntimeConfig ConfigLoader::load_from_env() {
         true
     };
 
+    config.exchanges[Exchange::Upbit] = {
+        get_env("UPBIT_API_KEY"),
+        get_env("UPBIT_SECRET_KEY"),
+        "",  // passphrase
+        endpoints::UPBIT_WS,
+        "",
+        "",
+        endpoints::UPBIT_REST,
+        true
+    };
+
     return config;
 }
 
@@ -153,6 +165,9 @@ RuntimeConfig ConfigLoader::get_default() {
     };
     config.exchanges[Exchange::OKX] = {
         "", "", "", endpoints::OKX_WS_PUBLIC, endpoints::OKX_WS_PRIVATE, "", endpoints::OKX_REST, false
+    };
+    config.exchanges[Exchange::Upbit] = {
+        "", "", "", endpoints::UPBIT_WS, "", "", endpoints::UPBIT_REST, false
     };
     return config;
 }

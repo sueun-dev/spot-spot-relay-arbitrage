@@ -1,5 +1,6 @@
 #include "kimp/core/types.hpp"
 #include "kimp/core/config.hpp"
+#include "kimp/core/dotenv.hpp"
 #include "kimp/core/logger.hpp"
 #include "kimp/core/latency_probe.hpp"
 #include "kimp/core/optimization.hpp"
@@ -120,6 +121,45 @@ std::string format_time(const kimp::SystemTimestamp& ts) {
     std::ostringstream oss;
     oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
     return oss.str();
+}
+
+std::string normalize_input(std::string value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    for (auto& c : value) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+bool is_yes_input(const std::string& raw) {
+    const auto v = normalize_input(raw);
+    return v == "Y" || v == "YES";
+}
+
+void print_balance_section(const std::string& exchange_name,
+                           const std::vector<kimp::exchange::AccountBalance>& balances) {
+    std::cout << "\n=== " << exchange_name << " Balances";
+    if (balances.empty()) {
+        std::cout << " (no non-zero balances or unavailable) ===\n";
+        return;
+    }
+    std::cout << " (" << balances.size() << " assets) ===\n";
+    std::cout << fmt::format("{:<12} {:>18} {:>18} {:>18} {:>18}\n",
+                             "Currency", "Total", "Available", "Locked", "Liability");
+    std::cout << std::string(88, '-') << "\n";
+    for (const auto& balance : balances) {
+        std::cout << fmt::format("{:<12} {:>18} {:>18} {:>18} {:>18}\n",
+                                 balance.currency,
+                                 kimp::format::format_decimal_trimmed(balance.total, 12),
+                                 kimp::format::format_decimal_trimmed(balance.available, 12),
+                                 kimp::format::format_decimal_trimmed(balance.locked, 12),
+                                 kimp::format::format_decimal_trimmed(balance.liability, 12));
+    }
 }
 
 void append_trade_log(const kimp::Position& pos,
@@ -302,104 +342,6 @@ std::string expand_env(const std::string& val) {
     return val;
 }
 
-std::string trim_ascii(std::string_view value) {
-    size_t start = 0;
-    size_t end = value.size();
-    while (start < end && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-    return std::string(value.substr(start, end - start));
-}
-
-std::string unquote_env_value(std::string value) {
-    if (value.size() >= 2) {
-        const char first = value.front();
-        const char last = value.back();
-        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
-            value = value.substr(1, value.size() - 2);
-        }
-    }
-    return value;
-}
-
-bool load_dotenv_file(const std::filesystem::path& path, size_t& loaded_count) {
-    std::ifstream in(path);
-    if (!in.is_open()) {
-        return false;
-    }
-
-    std::string line;
-    size_t line_no = 0;
-    while (std::getline(in, line)) {
-        ++line_no;
-        std::string trimmed = trim_ascii(line);
-        if (trimmed.empty() || trimmed[0] == '#') {
-            continue;
-        }
-        if (trimmed.rfind("export ", 0) == 0) {
-            trimmed = trim_ascii(trimmed.substr(7));
-        }
-
-        const size_t eq_pos = trimmed.find('=');
-        if (eq_pos == std::string::npos) {
-            std::cerr << "Skipping malformed .env line " << line_no << ": " << path << std::endl;
-            continue;
-        }
-
-        std::string key = trim_ascii(std::string_view(trimmed).substr(0, eq_pos));
-        std::string value = trim_ascii(std::string_view(trimmed).substr(eq_pos + 1));
-        if (key.empty()) {
-            continue;
-        }
-
-        value = unquote_env_value(value);
-        if (std::getenv(key.c_str()) == nullptr) {
-            ::setenv(key.c_str(), value.c_str(), 0);
-            ++loaded_count;
-        }
-    }
-    return true;
-}
-
-std::optional<std::filesystem::path> find_dotenv_path() {
-    std::error_code ec;
-    auto current = std::filesystem::current_path(ec);
-    if (ec) {
-        return std::nullopt;
-    }
-
-    for (int depth = 0; depth < 6; ++depth) {
-        const auto candidate = current / ".env";
-        if (std::filesystem::exists(candidate)) {
-            return candidate;
-        }
-        if (!current.has_parent_path()) {
-            break;
-        }
-        auto parent = current.parent_path();
-        if (parent == current) {
-            break;
-        }
-        current = std::move(parent);
-    }
-    return std::nullopt;
-}
-
-void load_dotenv_if_present() {
-    auto dotenv_path = find_dotenv_path();
-    if (!dotenv_path) {
-        return;
-    }
-
-    size_t loaded_count = 0;
-    if (load_dotenv_file(*dotenv_path, loaded_count)) {
-        std::cerr << "Loaded " << loaded_count << " env vars from " << dotenv_path->string() << std::endl;
-    }
-}
-
 std::optional<std::string> env_placeholder_name(const std::string& val) {
     if (val.size() > 3 && val[0] == '$' && val[1] == '{' && val.back() == '}') {
         return val.substr(2, val.size() - 3);
@@ -560,12 +502,14 @@ std::optional<kimp::RuntimeConfig> load_config(const std::string& path,
 }
 
 int main(int argc, char* argv[]) {
-    load_dotenv_if_present();
+    kimp::load_dotenv_if_present(nullptr, &std::cerr);
 
     std::string config_path = "config/config.yaml";
     bool monitor_mode = true;
     bool monitor_only = false;
     bool scan_spot_relay = false;
+    bool show_balances = false;
+    bool manual_confirm_once = false;
     std::optional<bool> dashboard_stream_override;
     std::optional<bool> latency_probe_override;
     std::optional<bool> latency_summary_override;
@@ -591,6 +535,14 @@ int main(int argc, char* argv[]) {
             scan_spot_relay = true;
             monitor_only = true;
             monitor_mode = false;
+        } else if (arg == "--show-balances") {
+            show_balances = true;
+            monitor_only = true;
+            monitor_mode = false;
+        } else if (arg == "--manual-confirm-once") {
+            manual_confirm_once = true;
+            monitor_only = false;
+            monitor_mode = true;
         } else if (arg == "--dashboard-stream") {
             dashboard_stream_override = true;
         } else if (arg == "--no-dashboard-stream") {
@@ -645,6 +597,8 @@ int main(int argc, char* argv[]) {
                       << "      --latency-probe-summary  Enable latency summary export (default: OFF)\n"
                       << "      --no-latency-probe-summary  Disable latency summary export\n"
                       << "      --scan-spot-relay  Scan Bithumb↔Bybit spot-transfer candidates\n"
+                      << "      --show-balances  Print non-zero balances on all configured exchanges\n"
+                      << "      --manual-confirm-once  Wait for one live candidate, prompt, and trade only after manual confirmation\n"
                       << "      --monitor-interval-sec <n>  Monitor refresh interval (default: 2)\n"
                       << "  -h, --help           Show this help\n";
             return 0;
@@ -786,6 +740,34 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (show_balances) {
+        auto fetch_balances = [](const std::string& name, auto& exchange_ptr) {
+            std::vector<kimp::exchange::AccountBalance> balances;
+            if (!exchange_ptr) {
+                return balances;
+            }
+            if (!exchange_ptr->initialize_rest()) {
+                spdlog::error("[{}] Failed to initialize REST connection pool for balance fetch", name);
+                return balances;
+            }
+            balances = exchange_ptr->get_all_balances();
+            exchange_ptr->shutdown_rest();
+            return balances;
+        };
+
+        print_balance_section("Bithumb", fetch_balances("Bithumb", bithumb));
+        if (upbit_enabled) {
+            print_balance_section("Upbit", fetch_balances("Upbit", upbit));
+        }
+        print_balance_section("Bybit", fetch_balances("Bybit", bybit));
+        if (okx_enabled) {
+            print_balance_section("OKX", fetch_balances("OKX", okx));
+        }
+
+        kimp::Logger::shutdown();
+        return 0;
+    }
+
     // Strategy engine
     kimp::strategy::ArbitrageEngine engine;
     engine.set_exchange(kimp::Exchange::Bithumb, bithumb);
@@ -830,6 +812,9 @@ int main(int argc, char* argv[]) {
         }
     });
 
+    std::atomic<bool> manual_trade_pending{false};
+    std::atomic<bool> manual_prompt_active{false};
+
     kimp::execution::LifecycleExecutor<LifecycleTask> lifecycle_executor(
         [&](LifecycleTask&& task, std::size_t worker_index) {
             LoopGuard guard(g_active_loops, &engine);
@@ -858,6 +843,12 @@ int main(int argc, char* argv[]) {
 
             spdlog::debug("[LIFECYCLE] {} worker {} finished",
                           task.signal.symbol.to_string(), worker_index);
+            if (manual_confirm_once && !result.success && !result.position_managed) {
+                manual_trade_pending.store(false, std::memory_order_release);
+                engine.set_entry_suppressed(false);
+                spdlog::warn("[MANUAL-TEST] Entry attempt failed safely for {}. Waiting for next candidate.",
+                             task.signal.symbol.to_string());
+            }
             if (!result.error_message.empty()) {
                 spdlog::error("Lifecycle loop error: {}", result.error_message);
             }
@@ -903,6 +894,11 @@ int main(int argc, char* argv[]) {
                 append_trade_log(closed_pos, pnl_usd, usdt_rate, capital_before, capital_after);
                 spdlog::info("[TRADE COMPLETE] {} P&L: {:.0f} KRW ({:.2f} USD), capital: ${:.2f}",
                              closed_pos.symbol.to_string(), pnl_krw, pnl_usd, capital_after);
+                if (manual_confirm_once) {
+                    spdlog::info("[MANUAL-TEST] One full trade cycle completed. Shutting down.");
+                    g_shutdown.store(true, std::memory_order_release);
+                    order_manager.request_shutdown();
+                }
             });
 
         engine.set_entry_callback([&](const kimp::ArbitrageSignal& signal) {
@@ -911,12 +907,96 @@ int main(int argc, char* argv[]) {
                 return;
             }
 
+            if (manual_confirm_once) {
+                if (manual_trade_pending.load(std::memory_order_acquire)) {
+                    return;
+                }
+                bool expected = false;
+                if (!manual_prompt_active.compare_exchange_strong(
+                        expected, true, std::memory_order_acq_rel)) {
+                    return;
+                }
+
+                engine.set_entry_suppressed(true);
+
+                auto prompt_guard = [&]() {
+                    manual_prompt_active.store(false, std::memory_order_release);
+                };
+
+                auto premiums = engine.get_all_premiums();
+                const auto* premium_info = static_cast<const kimp::strategy::ArbitrageEngine::PremiumInfo*>(nullptr);
+                for (const auto& p : premiums) {
+                    if (p.symbol == signal.symbol &&
+                        p.best_korean_exchange == signal.korean_exchange &&
+                        p.best_foreign_exchange == signal.foreign_exchange) {
+                        premium_info = &p;
+                        break;
+                    }
+                }
+
+                std::cout << "\n=========================================\n";
+                std::cout << "  MANUAL LIVE TEST CANDIDATE\n";
+                std::cout << "=========================================\n";
+                std::cout << fmt::format("Symbol: {} | Pair: {}-{}\n",
+                                          signal.symbol.to_string(),
+                                          kimp::exchange_name(signal.korean_exchange),
+                                          kimp::exchange_name(signal.foreign_exchange));
+                std::cout << fmt::format("KR ask: {} | KR qty: {:.8f}\n",
+                                          kimp::format::format_decimal_trimmed(signal.korean_ask),
+                                          signal.korean_ask_qty);
+                std::cout << fmt::format("FR bid: {:.8f} | FR qty: {:.8f}\n",
+                                          signal.foreign_bid,
+                                          signal.foreign_bid_qty);
+                std::cout << fmt::format("Match qty: {:.8f} | target coin qty: {:.8f} | max top-book usdt: {:.2f}\n",
+                                          signal.match_qty,
+                                          signal.target_coin_qty,
+                                          signal.max_tradable_usdt_at_best);
+                std::cout << fmt::format("EntryPM: {:.4f}% | Net%: {:.4f}% | NetKRW: {:.2f}\n",
+                                          signal.premium,
+                                          signal.net_edge_pct,
+                                          signal.net_profit_krw);
+                std::cout << fmt::format("FX: {:.2f} | both fill target: {}\n",
+                                          signal.usdt_krw_rate,
+                                          signal.both_can_fill_target ? "YES" : "NO");
+                if (premium_info) {
+                    std::cout << fmt::format("Commission: {} / {:.0f}krw | blocked age: {}ms\n",
+                                              kimp::format::format_decimal_trimmed(premium_info->withdraw_fee_coins),
+                                              premium_info->withdraw_fee_krw,
+                                              premium_info->age_ms);
+                }
+                std::cout << "=========================================\n";
+                std::cout << "실계정 1회 진입을 진행할까요? (y/n): ";
+                std::cout.flush();
+
+                std::string confirm_input;
+                const bool approved = read_stdin_line(confirm_input) && is_yes_input(confirm_input);
+                if (!approved) {
+                    spdlog::info("[MANUAL-TEST] Candidate declined: {}", signal.symbol.to_string());
+                    engine.set_entry_suppressed(false);
+                    prompt_guard();
+                    return;
+                }
+
+                manual_trade_pending.store(true, std::memory_order_release);
+                prompt_guard();
+            }
+
             if (!try_claim_lifecycle_slot()) {
+                if (manual_confirm_once) {
+                    manual_trade_pending.store(false, std::memory_order_release);
+                    manual_prompt_active.store(false, std::memory_order_release);
+                    engine.set_entry_suppressed(false);
+                }
                 return;
             }
 
             if (!lifecycle_executor.enqueue(LifecycleTask{signal, std::nullopt})) {
                 release_claimed_lifecycle_slot();
+                if (manual_confirm_once) {
+                    manual_trade_pending.store(false, std::memory_order_release);
+                    manual_prompt_active.store(false, std::memory_order_release);
+                    engine.set_entry_suppressed(false);
+                }
                 spdlog::error("[LIFECYCLE] enqueue failed for {}", signal.symbol.to_string());
                 return;
             }
@@ -1530,31 +1610,15 @@ int main(int argc, char* argv[]) {
     // STARTUP RECOVERY: Check for existing positions (trade mode only)
     // =========================================================================
     std::optional<kimp::Position> recovered_position;  // For launching lifecycle loop after engine.start()
-    if (!monitor_only) {
+    if (!monitor_only && !manual_confirm_once) {
         bool resumed_position = false;
-        auto normalize_input = [](std::string value) {
-            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
-                value.pop_back();
-            }
-            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
-                value.erase(value.begin());
-            }
-            for (auto& c : value) {
-                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            }
-            return value;
-        };
-        auto is_yes = [&](const std::string& raw) {
-            auto v = normalize_input(raw);
-            return v == "Y" || v == "YES";
-        };
 
         if (!g_shutdown && !resumed_position) {
             std::cout << "\n시작 시 기존 포지션 복구를 진행할까요? (y/n): ";
             std::cout.flush();
 
             std::string recover_input;
-            if (read_stdin_line(recover_input) && is_yes(recover_input)) {
+            if (read_stdin_line(recover_input) && is_yes_input(recover_input)) {
                 struct RecoveryCandidate {
                     kimp::Position pos;
                     double spot_balance{0.0};
@@ -1763,7 +1827,11 @@ int main(int argc, char* argv[]) {
             }
         }
     } else {
-        spdlog::info("Monitor-only mode: skipping position recovery prompts");
+        if (manual_confirm_once) {
+            spdlog::info("Manual confirm mode: skipping startup recovery prompts");
+        } else {
+            spdlog::info("Monitor-only mode: skipping position recovery prompts");
+        }
     }
 
     if (g_shutdown) {
@@ -1774,7 +1842,7 @@ int main(int argc, char* argv[]) {
     // =========================================================================
     // MAX_POSITIONS configuration (1~4)
     // =========================================================================
-    if (!g_shutdown && !monitor_only) {
+    if (!g_shutdown && !monitor_only && !manual_confirm_once) {
         std::cout << fmt::format("\n최대 동시 포지션 수 (1~4, 현재: {}, Enter=유지): ",
                                   kimp::TradingConfig::MAX_POSITIONS);
         std::cout.flush();
@@ -1799,6 +1867,9 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+    } else if (manual_confirm_once) {
+        kimp::TradingConfig::MAX_POSITIONS = 1;
+        spdlog::info("Manual confirm mode: MAX_POSITIONS forced to 1");
     }
 
     std::thread transfer_refresh_thread;
@@ -1850,6 +1921,13 @@ int main(int argc, char* argv[]) {
             spdlog::info("=== Bot Running (MONITOR-ONLY, Auto-Trading DISABLED) ===");
             spdlog::info("Monitor interval: {}s", monitor_interval_sec);
             spdlog::info("Press Ctrl+C to stop");
+        } else if (manual_confirm_once) {
+            spdlog::info("=== Bot Running (MANUAL CONFIRM ONCE) ===");
+            spdlog::info("Mode: wait for first eligible candidate, prompt, enter once after y, then auto-exit and stop");
+            spdlog::info("Entry: negative EntryPM + NetKRW >= {:.0f} + both venues can fill {:.2f} USDT",
+                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
+                         kimp::TradingConfig::TARGET_ENTRY_USDT);
+            spdlog::info("Press y at the prompt to place one live trade, or Ctrl+C to stop");
         } else {
             spdlog::info("=== Bot Running (Auto-Trading ENABLED) ===");
             spdlog::info("Mode: relay gate (70 USDT, 1-tick only) | Max positions: {}",
@@ -1993,21 +2071,24 @@ int main(int argc, char* argv[]) {
                         }
                     }
 
+                    const auto usable_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
+                        return p.quote_usable;
+                    });
                     std::cout << fmt::format("=== Spot Relay Monitor | negative-entry carry enterable {} / usable {} / common {} | 환율: {} KRW/USDT | target: {:.2f} USDT | every {}s ===\n",
                         std::count_if(visible_premiums.begin(), visible_premiums.end(), [](const auto& p) {
-                            return p.entry_premium < 0.0 && p.both_can_fill_target && p.match_qty > 0.0;
+                            return p.quote_usable && p.entry_premium < 0.0 && p.both_can_fill_target && p.match_qty > 0.0;
                         }),
-                        premiums.size(),
+                        usable_count,
                         universe_count,
                         rate_str,
                         kimp::TradingConfig::TARGET_ENTRY_USDT, monitor_interval_sec);
                     std::cout << fmt::format(
-                        "Columns: EntryPM 음수 + NetKRW {:.0f}원 이상 코인만 표시 | 전략: KR 현물 매수 -> Foreign 현물숏/차후 릴레이\n",
+                        "Columns: EntryPM 음수 + NetKRW {:.0f}원 이상 raw gap 표시 | 실진입 가능 여부는 usable/enterable 확인 | 전략: KR 현물 매수 -> Foreign 현물숏/차후 릴레이\n",
                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
                     std::cout << fmt::format(
-                        "{:<10} {:<6} {:>14} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>24} {:>11} {:>12}\n",
+                        "{:<10} {:<6} {:>14} {:>12} {:>12} {:>12} {:>12} {:>12} {:>11} {:>11} {:>11} {:>11} {:>24} {:>11} {:>16}\n",
                         "Symbol", "Pair", "K_ask", "K_qty", "K_KRW", "F_bid", "F_qty", "MatchQty",
-                        "EntryPM", "Net%", "KFeeKRW", "FFeeU", "Commission", "NetKRW", "Age/1Tick");
+                        "EntryPM", "Net%", "KFeeKRW", "FFeeU", "Commission", "NetKRW", "Age/Usable/1T");
                     std::cout << std::string(230, '-') << "\n";
 
                     if (visible_premiums.empty()) {
@@ -2017,6 +2098,7 @@ int main(int argc, char* argv[]) {
 
                     for (const auto& p : visible_premiums) {
                         const char* one_tick = p.both_can_fill_target ? "YES" : "NO";
+                        const char* usable = p.quote_usable ? "YES" : "NO";
                         const std::string korean_ask = kimp::format::format_decimal_trimmed(p.korean_ask);
                         const std::string commission = fmt::format(
                             "{} / {:.0f}krw",
@@ -2038,7 +2120,7 @@ int main(int argc, char* argv[]) {
                             p.bybit_total_fee_usdt,
                             commission,
                             p.net_profit_krw,
-                            fmt::format("{}ms/{}", p.age_ms, one_tick));
+                            fmt::format("{}ms/{}/{}", p.age_ms, usable, one_tick));
                     }
 
                     std::cout << std::string(215, '-') << "\n";
@@ -2069,13 +2151,14 @@ int main(int argc, char* argv[]) {
 
                         std::cout << fmt::format("\n\033[1m=== Top {} Negative-Entry Carry Candidates (EntryPM < 0, NetKRW > 0) ===\033[0m\n", top_n);
                         std::cout << fmt::format(
-                            "{:<10} {:<6} {:>14} {:>12} {:>12} {:>10} {:>10} {:>24} {:>11} {:>11}\n",
+                            "{:<10} {:<6} {:>14} {:>12} {:>12} {:>10} {:>10} {:>24} {:>11} {:>16}\n",
                             "Symbol", "Pair", "K_ask", "F_bid", "MatchQty",
-                            "EntryPM", "Net%", "Commission", "NetKRW", "Age/1Tick");
+                            "EntryPM", "Net%", "Commission", "NetKRW", "Age/Usable/1T");
                         std::cout << std::string(136, '-') << "\n";
                         for (size_t i = 0; i < top_n; ++i) {
                             const auto& p = *top_candidates[i];
                             const char* one_tick = p.both_can_fill_target ? "YES" : "NO";
+                            const char* usable = p.quote_usable ? "YES" : "NO";
                             const std::string korean_ask = kimp::format::format_decimal_trimmed(p.korean_ask);
                             const std::string commission = fmt::format(
                                 "{} / {:.0f}krw",
@@ -2092,7 +2175,7 @@ int main(int argc, char* argv[]) {
                                 p.entry_premium, p.net_edge_pct,
                                 commission,
                                 p.net_profit_krw,
-                                fmt::format("{}ms/{}", p.age_ms, one_tick));
+                                fmt::format("{}ms/{}/{}", p.age_ms, usable, one_tick));
                         }
                         if (top_n == 0) {
                             std::cout << "EntryPM 음수이면서 NetKRW가 양수인 코인이 없습니다.\n";
@@ -2101,7 +2184,8 @@ int main(int argc, char* argv[]) {
                     }
 
                     auto enterable_count = std::count_if(premiums.begin(), premiums.end(), [](const auto& p) {
-                        return p.entry_premium < 0.0 &&
+                        return p.quote_usable &&
+                            p.entry_premium < 0.0 &&
                             kimp::TradingConfig::entry_gate_passes(
                             p.both_can_fill_target,
                             p.match_qty,
@@ -2121,7 +2205,7 @@ int main(int argc, char* argv[]) {
                         "quotes: korean {}/{} (Bi:{} Up:{}) | foreign {}/{} (By:{} Ok:{}) | usable {}/{} | bestKR(Bi:{} Up:{}) | bestFR(By:{} Ok:{}) | net>={:.0f} {} | enterable {} | fee: 국내 {}회 + 해외 {}회 | wdFee: Bi:{} Up:{}\n",
                         any_korean_quote_ready, universe_count, bithumb_quote_ready, upbit_quote_ready,
                         any_foreign_quote_ready, universe_count, bybit_quote_ready, okx_quote_ready,
-                        premiums.size(), universe_count,
+                        usable_count, universe_count,
                         bithumb_winning, upbit_winning,
                         bybit_winning, okx_winning,
                         kimp::TradingConfig::MIN_ENTRY_NET_PROFIT_KRW,
