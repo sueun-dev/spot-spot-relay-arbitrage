@@ -415,6 +415,16 @@ void BithumbExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) 
         }
     }
 
+    // Pre-populate orderbook_bbo_ map for all subscribed symbols.
+    // This guarantees the map structure is immutable after this point,
+    // allowing lock-free atomic reads from the ticker hot path.
+    {
+        std::lock_guard lock(orderbook_mutex_);
+        for (const auto& sym : symbols) {
+            orderbook_bbo_[sym];  // default-construct BBO entry
+        }
+    }
+
     Logger::info("[Bithumb] Subscribed to {} orderbook depth streams in {} batches",
                  symbols.size(), (symbols.size() + BATCH_SIZE - 1) / BATCH_SIZE);
 
@@ -991,9 +1001,8 @@ void BithumbExchange::on_ws_message(std::string_view message) {
             usdt_krw_price_.store(ticker.last);
         }
 
-        // Overlay real bid/ask from orderbook BBO
+        // Overlay real bid/ask from orderbook BBO (lock-free — map structure is immutable)
         if (orderbook_ready_.load(std::memory_order_acquire)) {
-            std::lock_guard lock(orderbook_mutex_);
             auto bbo_it = orderbook_bbo_.find(ticker.symbol);
             if (bbo_it != orderbook_bbo_.end()) {
                 double real_bid = bbo_it->second.best_bid.load(std::memory_order_acquire);
@@ -1229,8 +1238,11 @@ void BithumbExchange::subscribe_private_myorder() {
 
 bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& ticker) {
     if (parse_ticker_fast(message, ticker)) {
-        std::lock_guard lock(orderbook_mutex_);
-        last_price_cache_[ticker.symbol] = ticker.last;
+        // Update last_price in lock-free BBO cache (map structure immutable)
+        auto bbo_it = orderbook_bbo_.find(ticker.symbol);
+        if (bbo_it != orderbook_bbo_.end()) {
+            bbo_it->second.last_price.store(ticker.last, std::memory_order_release);
+        }
         return true;
     }
 
@@ -1261,10 +1273,10 @@ bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& tic
         ticker.bid = 0.0;
         ticker.ask = 0.0;
 
-        // Cache last price for orderbookdepth-driven dispatch
-        {
-            std::lock_guard lock(orderbook_mutex_);
-            last_price_cache_[ticker.symbol] = ticker.last;
+        // Cache last price in lock-free BBO (map structure immutable)
+        auto bbo_it = orderbook_bbo_.find(ticker.symbol);
+        if (bbo_it != orderbook_bbo_.end()) {
+            bbo_it->second.last_price.store(ticker.last, std::memory_order_release);
         }
 
         return true;
@@ -1275,8 +1287,7 @@ bool BithumbExchange::parse_ticker_message(std::string_view message, Ticker& tic
 }
 
 std::optional<Ticker> BithumbExchange::make_bbo_ticker(const SymbolId& symbol) {
-    std::lock_guard lock(orderbook_mutex_);
-
+    // Lock-free: map structure is immutable after subscribe, only atomics are read
     auto bbo_it = orderbook_bbo_.find(symbol);
     if (bbo_it == orderbook_bbo_.end()) {
         return std::nullopt;
@@ -1290,11 +1301,8 @@ std::optional<Ticker> BithumbExchange::make_bbo_ticker(const SymbolId& symbol) {
         return std::nullopt;
     }
 
-    double last = 0.0;
-    auto last_it = last_price_cache_.find(symbol);
-    if (last_it != last_price_cache_.end() && last_it->second > 0.0) {
-        last = last_it->second;
-    } else {
+    double last = bbo_it->second.last_price.load(std::memory_order_acquire);
+    if (last <= 0.0) {
         last = (bid + ask) * 0.5;
     }
 
@@ -1432,8 +1440,11 @@ void BithumbExchange::update_bbo(const SymbolId& symbol) {
     auto state_it = orderbook_state_.find(symbol);
     if (state_it == orderbook_state_.end() || !state_it->second.initialized) return;
 
+    auto bbo_it = orderbook_bbo_.find(symbol);
+    if (bbo_it == orderbook_bbo_.end()) return;  // not pre-populated — skip
+
     const auto& state = state_it->second;
-    auto& bbo = orderbook_bbo_[symbol];
+    auto& bbo = bbo_it->second;
 
     if (!state.bids.empty()) {
         bbo.best_bid.store(state.bids.begin()->first, std::memory_order_release);
