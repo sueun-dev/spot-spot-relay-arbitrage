@@ -57,19 +57,21 @@ private:
     std::mutex orderbook_mutex_;
 
     // Lock-free BBO cache for hot ticker path
+    // SAFETY: orderbook_bbo_ map structure is populated once during subscribe_orderbook()
+    // and fetch_orderbook_snapshot(), BEFORE orderbook_ready_ is set to true.
+    // After that, only atomic values inside BBO are updated — the map itself is never
+    // modified. This allows lock-free reads from the ticker hot path.
     struct BBO {
         std::atomic<double> best_bid{0.0};
         std::atomic<double> best_ask{0.0};
         std::atomic<double> best_bid_qty{0.0};
         std::atomic<double> best_ask_qty{0.0};
+        std::atomic<double> last_price{0.0};  // replaces last_price_cache_
     };
     std::unordered_map<SymbolId, BBO> orderbook_bbo_;
     std::atomic<bool> orderbook_ready_{false};
     std::atomic<bool> orderbook_resync_running_{false};
     std::thread orderbook_resync_thread_;
-
-    // Cache last known ticker price per symbol for orderbookdepth-driven dispatch
-    std::unordered_map<SymbolId, double> last_price_cache_;
 
 public:
     BithumbExchange(net::io_context& ioc, ExchangeCredentials creds)
