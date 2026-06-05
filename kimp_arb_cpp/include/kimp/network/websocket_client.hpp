@@ -67,7 +67,6 @@ public:
 
 private:
     // Networking
-    net::io_context& io_context_;
     ssl::context ssl_context_;
     net::strand<net::io_context::executor_type> strand_;
     std::unique_ptr<WebSocketStream> ws_;
@@ -108,8 +107,7 @@ private:
 
 public:
     explicit WebSocketClient(net::io_context& ioc, std::string name = "WebSocket")
-        : io_context_(ioc)
-        , ssl_context_(ssl::context::tls_client)
+        : ssl_context_(ssl::context::tls_client)
         , strand_(net::make_strand(ioc))
         , resolver_(net::make_strand(ioc))
         , reconnect_timer_(ioc)
