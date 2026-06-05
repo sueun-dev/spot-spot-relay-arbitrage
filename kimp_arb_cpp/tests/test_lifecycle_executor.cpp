@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cassert>
+#include "test_check.hpp"
 #include <chrono>
 #include <iostream>
 #include <mutex>
@@ -53,7 +53,7 @@ int main() {
     executor.start(options);
 
     for (int i = 0; i < 8; ++i) {
-        assert(executor.enqueue(TestTask{i}));
+        KIMP_CHECK(executor.enqueue(TestTask{i}));
     }
 
     const auto deadline = std::chrono::steady_clock::now() + 2s;
@@ -64,16 +64,16 @@ int main() {
 
     executor.stop();
 
-    assert(completed.load(std::memory_order_acquire) == 8);
-    assert(worker_ids.size() <= 2);
-    assert(executor.pending() == 0);
+    KIMP_CHECK(completed.load(std::memory_order_acquire) == 8);
+    KIMP_CHECK(worker_ids.size() <= 2);
+    KIMP_CHECK(executor.pending() == 0);
 
     {
         std::lock_guard<std::mutex> lock(seen_mutex);
         std::sort(seen_ids.begin(), seen_ids.end());
-        assert(seen_ids.size() == 8);
+        KIMP_CHECK(seen_ids.size() == 8);
         for (int i = 0; i < 8; ++i) {
-            assert(seen_ids[static_cast<std::size_t>(i)] == i);
+            KIMP_CHECK(seen_ids[static_cast<std::size_t>(i)] == i);
         }
     }
 

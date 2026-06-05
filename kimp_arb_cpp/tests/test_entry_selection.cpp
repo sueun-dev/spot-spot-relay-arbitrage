@@ -1,7 +1,7 @@
 #include "kimp/strategy/arbitrage_engine.hpp"
 #include "kimp/core/logger.hpp"
 
-#include <cassert>
+#include "test_check.hpp"
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -142,34 +142,40 @@ void test_selects_best_net_edge() {
     h.set_korean_book("BBB", 2905.0, 2910.0, 30.0, 30.0);
     h.set_foreign_book("BBB", 3.0, 3.01, 30.0, 30.0);
 
-    // Positive spread but insufficient first-tick liquidity for 70 USDT.
+    // CCC fills the 35 USDT target but its net profit stays below the floor, so
+    // only BBB (highest net edge) qualifies and must be the selected signal.
     h.set_korean_book("CCC", 1980.0, 1985.0, 20.0, 20.0);
     h.set_foreign_book("CCC", 2.0, 2.01, 20.0, 20.0);
 
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "AAA", 0.0);
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "BBB", 0.0);
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "CCC", 0.0);
     h.set_usdt_rate(USDT_KRW);
 
-    assert(h.captured_signal.has_value());
-    assert(h.captured_signal->symbol.get_base() == "BBB");
-    assert(h.captured_signal->net_edge_pct > 0.0);
-    assert(h.captured_signal->net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
-    assert(h.captured_signal->both_can_fill_target);
+    KIMP_CHECK(h.captured_signal.has_value());
+    KIMP_CHECK(h.captured_signal->symbol.get_base() == "BBB");
+    KIMP_CHECK(h.captured_signal->net_edge_pct > 0.0);
+    KIMP_CHECK(h.captured_signal->net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
+    KIMP_CHECK(h.captured_signal->both_can_fill_target);
 
     std::cout << "PASS (" << h.captured_signal->symbol.get_base()
               << ", net=" << h.captured_signal->net_edge_pct << "%)" << std::endl;
 }
 
-void test_blocks_when_first_tick_cannot_fill_70_usdt() {
-    std::cout << "TEST 2: 70 USDT 1틱 물량 부족이면 진입 차단... ";
+void test_blocks_when_first_tick_cannot_fill_target_usdt() {
+    std::cout << "TEST 2: 타깃 USDT 1틱 물량 부족이면 진입 차단... ";
 
     TestHarness h;
     h.add_coin("AAA");
 
-    // Bybit bid=2 => target qty = 35, but each side only has 34.
-    h.set_korean_book("AAA", 1980.0, 1985.0, 34.0, 34.0);
-    h.set_foreign_book("AAA", 2.0, 2.01, 34.0, 34.0);
+    // Healthy premium, but each side only has 17 coins (~34 USDT at bid=2),
+    // below the 35 USDT target — entry must be blocked on liquidity alone.
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "AAA", 0.0);
+    h.set_korean_book("AAA", 1940.0, 1945.0, 17.0, 17.0);
+    h.set_foreign_book("AAA", 2.0, 2.01, 17.0, 17.0);
     h.set_usdt_rate(USDT_KRW);
 
-    assert(!h.captured_signal.has_value());
+    KIMP_CHECK(!h.captured_signal.has_value());
     std::cout << "PASS" << std::endl;
 }
 
@@ -180,26 +186,29 @@ void test_blocks_when_fee_adjusted_net_edge_is_negative() {
     h.add_coin("AAA");
 
     // Gross spread is tiny; fee model should flip this negative.
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "AAA", 0.0);
     h.set_korean_book("AAA", 1999.0, 2000.0, 100.0, 100.0);
     h.set_foreign_book("AAA", 2.001, 2.01, 100.0, 100.0);
     h.set_usdt_rate(USDT_KRW);
 
-    assert(!h.captured_signal.has_value());
+    KIMP_CHECK(!h.captured_signal.has_value());
     std::cout << "PASS" << std::endl;
 }
 
-void test_blocks_when_net_profit_is_below_800_krw() {
-    std::cout << "TEST 4: NetKRW 800 미만이면 진입 차단... ";
+void test_blocks_when_net_profit_is_below_floor() {
+    std::cout << "TEST 4: NetKRW가 진입 최소 수익 미만이면 진입 차단... ";
 
     TestHarness h;
     h.add_coin("AAA");
 
-    // Positive edge on the 70 USDT target, but projected net profit stays below 800 KRW.
+    // Positive edge on the 35 USDT target, but projected net profit (~231 KRW)
+    // stays below MIN_ENTRY_NET_PROFIT_KRW.
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "AAA", 0.0);
     h.set_korean_book("AAA", 1975.0, 1980.0, 100.0, 100.0);
     h.set_foreign_book("AAA", 2.0, 2.01, 100.0, 100.0);
     h.set_usdt_rate(USDT_KRW);
 
-    assert(!h.captured_signal.has_value());
+    KIMP_CHECK(!h.captured_signal.has_value());
     std::cout << "PASS" << std::endl;
 }
 
@@ -209,19 +218,22 @@ void test_signal_contains_relay_metrics() {
     TestHarness h;
     h.add_coin("AAA");
 
-    h.set_korean_book("AAA", 1955.0, 1960.0, 50.0, 50.0);
-    h.set_foreign_book("AAA", 2.0, 2.01, 50.0, 50.0);
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "AAA", 0.0);
+    h.set_korean_book("AAA", 1940.0, 1945.0, 50.0, 50.0);
+    // Foreign spread must stay within MAX_FOREIGN_SPREAD_PCT (0.40%).
+    h.set_foreign_book("AAA", 2.0, 2.005, 50.0, 50.0);
     h.set_usdt_rate(USDT_KRW);
 
-    assert(h.captured_signal.has_value());
+    KIMP_CHECK(h.captured_signal.has_value());
     const auto& sig = *h.captured_signal;
-    assert(std::abs(sig.target_coin_qty - 35.0) < 1e-9);
-    assert(std::abs(sig.korean_ask_qty - 50.0) < 1e-9);
-    assert(std::abs(sig.foreign_bid_qty - 50.0) < 1e-9);
-    assert(std::abs(sig.match_qty - 50.0) < 1e-9);
-    assert(sig.net_edge_pct > 0.0);
-    assert(sig.net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
-    assert(sig.both_can_fill_target);
+    // target_coin_qty = TARGET_ENTRY_USDT (35) / foreign_bid (2.0) = 17.5
+    KIMP_CHECK(std::abs(sig.target_coin_qty - 17.5) < 1e-9);
+    KIMP_CHECK(std::abs(sig.korean_ask_qty - 50.0) < 1e-9);
+    KIMP_CHECK(std::abs(sig.foreign_bid_qty - 50.0) < 1e-9);
+    KIMP_CHECK(std::abs(sig.match_qty - 50.0) < 1e-9);
+    KIMP_CHECK(sig.net_edge_pct > 0.0);
+    KIMP_CHECK(sig.net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
+    KIMP_CHECK(sig.both_can_fill_target);
 
     std::cout << "PASS (targetQty=" << sig.target_coin_qty
               << ", matchQty=" << sig.match_qty
@@ -240,6 +252,11 @@ void test_no_entry_when_position_held() {
     h.set_korean_book("BBB", 2905.0, 2910.0, 30.0, 30.0);
     h.set_foreign_book("BBB", 3.0, 3.01, 30.0, 30.0);
 
+    // BBB clears every entry gate on its own; the only thing that should keep it
+    // from firing is the position slot already taken by AAA (MAX_POSITIONS=1).
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "AAA", 0.0);
+    h.set_route(Exchange::Bithumb, Exchange::Bybit, "BBB", 0.0);
+
     Position pos;
     pos.symbol = SymbolId("AAA", "KRW");
     pos.korean_exchange = Exchange::Bithumb;
@@ -248,7 +265,7 @@ void test_no_entry_when_position_held() {
 
     h.set_usdt_rate(USDT_KRW);
 
-    assert(!h.captured_signal.has_value());
+    KIMP_CHECK(!h.captured_signal.has_value());
     std::cout << "PASS" << std::endl;
 }
 
@@ -272,11 +289,11 @@ void test_multi_exchange_prefers_best_net_route() {
     h.set_usdt_rate(Exchange::Upbit, 1500.0);
 
     auto premiums = h.engine.get_all_premiums();
-    assert(premiums.size() == 1);
+    KIMP_CHECK(premiums.size() == 1);
     const auto& p = premiums.front();
-    assert(p.best_korean_exchange == Exchange::Upbit);
-    assert(p.best_foreign_exchange == Exchange::OKX);
-    assert(p.net_profit_krw > 0.0);
+    KIMP_CHECK(p.best_korean_exchange == Exchange::Upbit);
+    KIMP_CHECK(p.best_foreign_exchange == Exchange::OKX);
+    KIMP_CHECK(p.net_profit_krw > 0.0);
 
     std::cout << "PASS (winner="
               << static_cast<int>(p.best_korean_exchange) << "-"
@@ -291,9 +308,9 @@ int main() {
 
     std::cout << "\n===== Relay Entry Gate Tests =====\n" << std::endl;
     test_selects_best_net_edge();
-    test_blocks_when_first_tick_cannot_fill_70_usdt();
+    test_blocks_when_first_tick_cannot_fill_target_usdt();
     test_blocks_when_fee_adjusted_net_edge_is_negative();
-    test_blocks_when_net_profit_is_below_800_krw();
+    test_blocks_when_net_profit_is_below_floor();
     test_signal_contains_relay_metrics();
     test_no_entry_when_position_held();
     test_multi_exchange_prefers_best_net_route();

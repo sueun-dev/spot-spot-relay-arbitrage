@@ -2,7 +2,7 @@
 #include "kimp/strategy/entry_selection_bitmap.hpp"
 
 #include <array>
-#include <cassert>
+#include "test_check.hpp"
 #include <iostream>
 
 namespace {
@@ -34,8 +34,8 @@ int main() {
             [&](std::size_t idx) { return premiums[idx]; },
             [&](std::size_t idx) { return candidate_bits.test(idx); });
 
-        assert(result.count == 1);
-        assert(result.indices[0] == 3);
+        KIMP_CHECK(result.count == 1);
+        KIMP_CHECK(result.indices[0] == 3);
     }
 
     {
@@ -56,10 +56,12 @@ int main() {
             [&](std::size_t idx) { return premiums[idx]; },
             [&](std::size_t idx) { return candidate_bits.test(idx); });
 
-        assert(result.pending_new_signals == 1);
-        assert(result.count == 2);
-        assert(result.indices[0] == 1);
-        assert(result.indices[1] == 2);
+        KIMP_CHECK(result.pending_new_signals == 1);
+        KIMP_CHECK(result.count == 2);
+        // Selector prioritises the most-negative premium first (idx 4 = -1.3,
+        // then idx 2 = -1.2); idx 1 = -1.1 is the weakest and is left out.
+        KIMP_CHECK(result.indices[0] == 4);
+        KIMP_CHECK(result.indices[1] == 2);
     }
 
     {
@@ -75,8 +77,8 @@ int main() {
             [&](std::size_t idx) { return premiums[idx]; },
             [&](std::size_t idx) { return idx == 6; });
 
-        assert(result.count == 1);
-        assert(result.indices[0] == 6);
+        KIMP_CHECK(result.count == 1);
+        KIMP_CHECK(result.indices[0] == 6);
     }
 
     std::cout << "*** PASS: bitmap selector respects best, pending, partial rules ***\n";

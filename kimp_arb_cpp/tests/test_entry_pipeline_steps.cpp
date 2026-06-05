@@ -2,7 +2,7 @@
 #include "kimp/core/types.hpp"
 #include "kimp/strategy/arbitrage_engine.hpp"
 
-#include <cassert>
+#include "test_check.hpp"
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -83,8 +83,8 @@ void test_blocks_without_transfer_route() {
     h.set_book(Exchange::Bithumb, "AAA", 1955.0, 1960.0, 80.0, 80.0);
     h.set_book(Exchange::Bybit, "AAA", 2.0, 2.01, 80.0, 80.0);
     h.arm_rates();
-    assert(!h.signal.has_value());
-    assert(h.premiums().empty());
+    KIMP_CHECK(!h.signal.has_value());
+    KIMP_CHECK(h.premiums().empty());
     std::cout << "PASS\n";
 }
 
@@ -97,8 +97,12 @@ void test_blocks_stale_quotes() {
     h.set_book(Exchange::Bithumb, "AAA", 1955.0, 1960.0, 80.0, 80.0, stale);
     h.set_book(Exchange::Bybit, "AAA", 2.0, 2.01, 80.0, 80.0, stale);
     h.arm_rates();
-    assert(!h.signal.has_value());
-    assert(h.premiums().empty());
+    // A routed symbol stays listed; stale quotes only mark it unusable.
+    const auto premiums = h.premiums();
+    KIMP_CHECK(!h.signal.has_value());
+    KIMP_CHECK(premiums.size() == 1);
+    KIMP_CHECK(!premiums.front().quote_usable);
+    KIMP_CHECK(!premiums.front().entry_signal);
     std::cout << "PASS\n";
 }
 
@@ -113,8 +117,12 @@ void test_blocks_desynced_quotes() {
         Exchange::Bybit, "AAA", 2.0, 2.01, 80.0, 80.0,
         base_ts - TradingConfig::MAX_QUOTE_DESYNC_MS - 50);
     h.arm_rates();
-    assert(!h.signal.has_value());
-    assert(h.premiums().empty());
+    // Desynced books stay listed but unusable; no signal must fire.
+    const auto premiums = h.premiums();
+    KIMP_CHECK(!h.signal.has_value());
+    KIMP_CHECK(premiums.size() == 1);
+    KIMP_CHECK(!premiums.front().quote_usable);
+    KIMP_CHECK(!premiums.front().entry_signal);
     std::cout << "PASS\n";
 }
 
@@ -126,8 +134,12 @@ void test_blocks_wide_spread() {
     h.set_book(Exchange::Bithumb, "AAA", 1800.0, 1960.0, 80.0, 80.0);
     h.set_book(Exchange::Bybit, "AAA", 2.0, 2.02, 80.0, 80.0);
     h.arm_rates();
-    assert(!h.signal.has_value());
-    assert(h.premiums().empty());
+    // Wide Korean spread keeps the symbol listed but unusable; no signal fires.
+    const auto premiums = h.premiums();
+    KIMP_CHECK(!h.signal.has_value());
+    KIMP_CHECK(premiums.size() == 1);
+    KIMP_CHECK(!premiums.front().quote_usable);
+    KIMP_CHECK(!premiums.front().entry_signal);
     std::cout << "PASS\n";
 }
 
@@ -140,15 +152,15 @@ void test_blocks_when_top_book_is_too_small() {
     h.set_book(Exchange::Bybit, "AAA", 2.0, 2.01, 10.0, 10.0);
     h.arm_rates();
     const auto premiums = h.premiums();
-    assert(!h.signal.has_value());
-    assert(premiums.size() == 1);
-    assert(!premiums.front().both_can_fill_target);
-    assert(!premiums.front().entry_signal);
+    KIMP_CHECK(!h.signal.has_value());
+    KIMP_CHECK(premiums.size() == 1);
+    KIMP_CHECK(!premiums.front().both_can_fill_target);
+    KIMP_CHECK(!premiums.front().entry_signal);
     std::cout << "PASS\n";
 }
 
 void test_blocks_when_net_profit_is_below_floor() {
-    std::cout << "TEST 6: NetKRW 300 미만이면 차단... ";
+    std::cout << "TEST 6: NetKRW가 진입 최소 수익 미만이면 차단... ";
     Harness h;
     h.add_coin("AAA");
     h.set_route(Exchange::Bithumb, Exchange::Bybit, "AAA");
@@ -156,10 +168,10 @@ void test_blocks_when_net_profit_is_below_floor() {
     h.set_book(Exchange::Bybit, "AAA", 2.0, 2.01, 100.0, 100.0);
     h.arm_rates();
     const auto premiums = h.premiums();
-    assert(!h.signal.has_value());
-    assert(premiums.size() == 1);
-    assert(premiums.front().net_profit_krw < TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
-    assert(!premiums.front().entry_signal);
+    KIMP_CHECK(!h.signal.has_value());
+    KIMP_CHECK(premiums.size() == 1);
+    KIMP_CHECK(premiums.front().net_profit_krw < TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
+    KIMP_CHECK(!premiums.front().entry_signal);
     std::cout << "PASS\n";
 }
 
@@ -173,19 +185,25 @@ void test_selects_best_pair_across_all_venues() {
         }
     }
 
-    h.set_book(Exchange::Bithumb, "AAA", 1987.0, 1990.0, 80.0, 80.0);
-    h.set_book(Exchange::Upbit, "AAA", 1982.0, 1985.0, 80.0, 80.0);
+    // Upbit (cheapest Korean ask) + OKX (highest foreign bid) is the best route
+    // and must clear the net-profit floor (~1.16k KRW) so a signal actually fires.
+    h.set_book(Exchange::Bithumb, "AAA", 1990.0, 1995.0, 80.0, 80.0);
+    h.set_book(Exchange::Upbit, "AAA", 1970.0, 1975.0, 80.0, 80.0);
     h.set_book(Exchange::Bybit, "AAA", 2.0, 2.005, 80.0, 80.0);
-    h.set_book(Exchange::OKX, "AAA", 2.01, 2.015, 80.0, 80.0);
-    h.arm_rates();
+    h.set_book(Exchange::OKX, "AAA", 2.05, 2.055, 80.0, 80.0);
+    // The entry signal latches on the first qualifying evaluation, so arm the
+    // winning Korean venue (Upbit) rate first to capture the globally-best
+    // Upbit-OKX pair. The premium path below re-derives best pair independently.
+    h.set_usdt_rate(Exchange::Upbit, USDT_KRW);
+    h.set_usdt_rate(Exchange::Bithumb, USDT_KRW);
 
     const auto premiums = h.premiums();
-    assert(premiums.size() == 1);
-    assert(premiums.front().best_korean_exchange == Exchange::Upbit);
-    assert(premiums.front().best_foreign_exchange == Exchange::OKX);
-    assert(h.signal.has_value());
-    assert(h.signal->korean_exchange == Exchange::Upbit);
-    assert(h.signal->foreign_exchange == Exchange::OKX);
+    KIMP_CHECK(premiums.size() == 1);
+    KIMP_CHECK(premiums.front().best_korean_exchange == Exchange::Upbit);
+    KIMP_CHECK(premiums.front().best_foreign_exchange == Exchange::OKX);
+    KIMP_CHECK(h.signal.has_value());
+    KIMP_CHECK(h.signal->korean_exchange == Exchange::Upbit);
+    KIMP_CHECK(h.signal->foreign_exchange == Exchange::OKX);
     std::cout << "PASS\n";
 }
 
@@ -194,18 +212,20 @@ void test_emits_signal_when_all_steps_pass() {
     Harness h;
     h.add_coin("AAA");
     h.set_route(Exchange::Bithumb, Exchange::Bybit, "AAA");
-    h.set_book(Exchange::Bithumb, "AAA", 1955.0, 1960.0, 80.0, 80.0);
-    h.set_book(Exchange::Bybit, "AAA", 2.0, 2.01, 80.0, 80.0);
+    // ~2.9% premium → net ~844 KRW, comfortably above MIN_ENTRY_NET_PROFIT_KRW.
+    // Foreign spread kept within MAX_FOREIGN_SPREAD_PCT (0.40%).
+    h.set_book(Exchange::Bithumb, "AAA", 1940.0, 1945.0, 80.0, 80.0);
+    h.set_book(Exchange::Bybit, "AAA", 2.0, 2.005, 80.0, 80.0);
     h.arm_rates();
 
     const auto premiums = h.premiums();
-    assert(h.signal.has_value());
-    assert(premiums.size() == 1);
-    assert(premiums.front().quote_usable);
-    assert(premiums.front().both_can_fill_target);
-    assert(premiums.front().net_edge_pct > 0.0);
-    assert(premiums.front().net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
-    assert(premiums.front().entry_signal);
+    KIMP_CHECK(h.signal.has_value());
+    KIMP_CHECK(premiums.size() == 1);
+    KIMP_CHECK(premiums.front().quote_usable);
+    KIMP_CHECK(premiums.front().both_can_fill_target);
+    KIMP_CHECK(premiums.front().net_edge_pct > 0.0);
+    KIMP_CHECK(premiums.front().net_profit_krw >= TradingConfig::MIN_ENTRY_NET_PROFIT_KRW);
+    KIMP_CHECK(premiums.front().entry_signal);
     std::cout << "PASS\n";
 }
 
