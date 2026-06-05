@@ -268,8 +268,11 @@ double resolved_fill_price(const kimp::Order& order, double fallback) {
 }
 
 bool quantities_match(double lhs, double rhs) {
-    const double scale = std::max({1.0, std::fabs(lhs), std::fabs(rhs)});
-    return std::fabs(lhs - rhs) <= (scale * 1e-6);
+    const double scale = std::max(std::fabs(lhs), std::fabs(rhs));
+    if (scale <= 0.0) {
+        return true;
+    }
+    return (std::fabs(lhs - rhs) / scale) <= kimp::TradingConfig::HEDGE_QUANTITY_TOLERANCE_RATIO;
 }
 
 void log_hedge_audit(std::string_view phase,
@@ -1916,14 +1919,24 @@ bool OrderManager::prepare_bybit_shorting(const std::vector<SymbolId>& symbols) 
         unique_symbols.emplace_back("BTC", "USDT");
     }
 
+    size_t prepared_count = 0;
+    size_t skipped_count = 0;
     for (const auto& symbol : unique_symbols) {
         if (!bybit->prepare_shorting(symbol)) {
-            Logger::error("Failed to prepare Bybit spot-margin shorting for {}", symbol.to_string());
-            return false;
+            Logger::warn("Skipping Bybit spot-margin prep for {}", symbol.to_string());
+            ++skipped_count;
+            continue;
         }
+        ++prepared_count;
     }
 
-    Logger::info("Prepared Bybit spot-margin shorting for {} symbols", unique_symbols.size());
+    if (prepared_count == 0) {
+        Logger::error("Failed to prepare any Bybit spot-margin shorting symbols");
+        return false;
+    }
+
+    Logger::info("Prepared Bybit spot-margin shorting for {} symbols (skipped {})",
+                 prepared_count, skipped_count);
     return true;
 }
 
@@ -1947,29 +1960,34 @@ bool OrderManager::prepare_okx_shorting(const std::vector<SymbolId>& symbols) {
         unique_symbols.emplace_back("BTC", "USDT");
     }
 
+    size_t prepared_count = 0;
+    size_t skipped_count = 0;
     for (const auto& symbol : unique_symbols) {
         if (!okx->prepare_shorting(symbol)) {
-            Logger::error("Failed to prepare OKX spot-margin shorting for {}", symbol.to_string());
-            return false;
+            Logger::warn("Skipping OKX spot-margin prep for {}", symbol.to_string());
+            ++skipped_count;
+            continue;
         }
+        ++prepared_count;
     }
 
-    Logger::info("Prepared OKX spot-margin shorting for {} symbols", unique_symbols.size());
+    if (prepared_count == 0) {
+        Logger::error("Failed to prepare any OKX spot-margin shorting symbols");
+        return false;
+    }
+
+    Logger::info("Prepared OKX spot-margin shorting for {} symbols (skipped {})",
+                 prepared_count, skipped_count);
     return true;
 }
 
 Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount) {
+    (void)quantity;
     auto korean_ex = get_korean_exchange(ex);
     if (!korean_ex) {
         Order order;
         order.status = OrderStatus::Rejected;
         return order;
-    }
-
-    if (ex == Exchange::Bithumb) {
-        if (bithumb_exchange_) {
-            return bithumb_exchange_->place_market_buy_quantity(symbol, quantity);
-        }
     }
 
     return korean_ex->place_market_buy_cost(symbol, krw_amount);

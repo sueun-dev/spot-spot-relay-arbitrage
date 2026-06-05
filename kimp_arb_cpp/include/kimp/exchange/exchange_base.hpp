@@ -338,6 +338,19 @@ public:
 
     // Korean exchanges need cost-based buying
     Order place_market_buy_cost(const SymbolId& symbol, Price cost) override = 0;
+
+    // Optional exact-quantity Korean buy helper. Production code paths use
+    // cost-based market buys and may reject this path entirely.
+    virtual Order place_market_buy_quantity(const SymbolId& symbol, Quantity quantity) {
+        Order order;
+        order.exchange = exchange_id_;
+        order.symbol = symbol;
+        order.side = Side::Buy;
+        order.type = OrderType::Market;
+        order.quantity = quantity;
+        order.status = OrderStatus::Rejected;
+        return order;
+    }
 };
 
 /**

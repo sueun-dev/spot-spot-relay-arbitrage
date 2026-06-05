@@ -68,7 +68,8 @@ public:
      *    "side":"sell","ordType":"market","sz":"0.001"}]}
      */
     Order place_order_sync(const std::string& inst_id, Side side, double qty,
-                           const std::string& td_mode);
+                           const std::string& td_mode,
+                           std::string_view ccy = {});
 
 private:
     void authenticate();

@@ -688,7 +688,13 @@ bool BybitExchange::prepare_shorting(const SymbolId& symbol) {
         int ret_code = static_cast<int>(doc["retCode"].get_int64().value());
         if (ret_code != 0) {
             std::string_view ret_msg = doc["retMsg"].get_string().value();
-            // retCode 0 = success; some coins may already be ON — treat as success
+            // Some coins cannot be toggled via this endpoint even though margin shorting
+            // still works through UTA spot margin. Treat the known "Unable to adjust"
+            // response as non-fatal so startup does not loop forever.
+            if (ret_code == 3000002) {
+                Logger::warn("[Bybit] Collateral switch skipped for {} retCode={}: {}", base, ret_code, ret_msg);
+                return true;
+            }
             Logger::warn("[Bybit] Collateral switch for {} retCode={}: {}", base, ret_code, ret_msg);
             return false;
         }

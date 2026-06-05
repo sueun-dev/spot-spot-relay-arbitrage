@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="${ROOT_DIR}/kimp_arb_cpp"
-BUILD_DIR="${SRC_DIR}/build"
+BUILD_DIR="${SRC_DIR}/build/build/Release"
 DEFAULT_CONFIG="${SRC_DIR}/config/config.yaml"
 HELP_MODE=0
 MONITOR_ONLY_MODE=0
@@ -67,8 +67,12 @@ fi
 mkdir -p "${BUILD_DIR}"
 
 if [[ ${HELP_MODE} -eq 0 || ! -x "${BUILD_DIR}/kimp_bot" ]]; then
-  cmake -Wno-dev -S "${SRC_DIR}" -B "${BUILD_DIR}" >/dev/null
+  # Conan 의존성 설치 (이미 캐시되면 빠름)
+  cd "${SRC_DIR}"
+  conan install . --output-folder=build --build=missing -s build_type=Release > /dev/null 2>&1 || true
+  cmake --preset conan-release > /dev/null 2>&1
   cmake --build "${BUILD_DIR}" --target kimp_bot -j8 >/dev/null
+  cd "${ROOT_DIR}"
 fi
 
 if [[ $# -eq 0 ]]; then

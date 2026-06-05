@@ -30,6 +30,7 @@ private:
         double min_qty{0.0};
         double qty_step{0.0};
         double min_notional{0.0};
+        double price_tick{0.0};
     };
     std::unordered_map<std::string, LotSize> lot_size_cache_;
     mutable std::shared_mutex metadata_mutex_;

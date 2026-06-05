@@ -166,13 +166,7 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("foreign entry failed");
         }
 
-        Order korean_entry;
-        if (options.pair.korean == kimp::Exchange::Bithumb) {
-            korean_entry = std::dynamic_pointer_cast<kimp::exchange::bithumb::BithumbExchange>(korean_ex)
-                               ->place_market_buy_quantity(korean_symbol, foreign_entry_qty);
-        } else {
-            korean_entry = korean_ex->place_market_buy_cost(korean_symbol, foreign_entry_qty * korean_quote.ask);
-        }
+        Order korean_entry = korean_ex->place_market_buy_cost(korean_symbol, foreign_entry_qty * korean_quote.ask);
         live_trade::wait_korean_fill(options.pair.korean, korean_symbol, korean_ex, korean_entry);
         const double korean_entry_qty = live_trade::resolved_fill_quantity(korean_entry);
         const double korean_entry_px = live_trade::resolved_fill_price(korean_entry, korean_quote.ask);

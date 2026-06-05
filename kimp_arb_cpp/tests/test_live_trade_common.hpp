@@ -220,7 +220,10 @@ inline TopQuote fetch_okx_quote(boost::asio::io_context& io_context,
         throw std::runtime_error("OKX public REST init failed");
     }
     auto response = client.get("/api/v5/market/books?instId=" + std::string(symbol.get_base()) + "-" +
-                               std::string(symbol.get_quote()) + "&sz=1");
+                               std::string(symbol.get_quote()) + "&sz=1",
+                               {{"User-Agent",
+                                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"}});
     client.shutdown();
     if (!response.success) {
         throw std::runtime_error("OKX quote fetch failed: " + response.error);
@@ -261,8 +264,11 @@ inline double resolved_fill_price(const Order& order, double fallback) {
 }
 
 inline bool quantities_match(double lhs, double rhs) {
-    const double scale = std::max({1.0, std::fabs(lhs), std::fabs(rhs)});
-    return std::fabs(lhs - rhs) <= scale * 1e-6;
+    const double scale = std::max(std::fabs(lhs), std::fabs(rhs));
+    if (scale <= 0.0) {
+        return true;
+    }
+    return (std::fabs(lhs - rhs) / scale) <= kimp::TradingConfig::HEDGE_QUANTITY_TOLERANCE_RATIO;
 }
 
 template <typename ForeignPtr>

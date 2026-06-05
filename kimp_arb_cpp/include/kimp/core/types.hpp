@@ -359,7 +359,7 @@ struct TradingConfig {
     // Entry threshold
     static constexpr double ENTRY_PREMIUM_THRESHOLD = 0.0;    // Legacy/monitor alias only
     static constexpr double MIN_NET_EDGE_PCT = 0.0;           // Enter only when net edge is positive
-    static constexpr double MIN_ENTRY_NET_PROFIT_KRW = 300.0; // Enter only when projected NetKRW for the executable entry size is >= 300
+    static constexpr double MIN_ENTRY_NET_PROFIT_KRW = 600.0; // Enter only when projected NetKRW for the executable entry size is >= 600
 
     // Fee structure for the relay model (per-exchange taker rates)
     static constexpr int KOREAN_FEE_EVENTS = 1;               // Korean side: 1 trade (buy or sell)
@@ -405,6 +405,7 @@ struct TradingConfig {
 
     static constexpr double MAX_PRICE_DIFF_PERCENT = 50.0;
     static constexpr double MIN_ORDER_KRW = 5000.0;           // Minimum order in KRW
+    static constexpr double HEDGE_QUANTITY_TOLERANCE_RATIO = 5e-5; // 0.005%
 
     // Quote quality guards — ENTRY (strict: avoid bad fills on new positions)
     static constexpr uint64_t MAX_QUOTE_AGE_MS = 700;         // Require sub-second-ish quote freshness on entry

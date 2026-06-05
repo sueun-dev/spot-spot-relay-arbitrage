@@ -82,7 +82,8 @@ void OkxTradeWS::authenticate() {
 }
 
 Order OkxTradeWS::place_order_sync(const std::string& inst_id, Side side, double qty,
-                                    const std::string& td_mode) {
+                                   const std::string& td_mode,
+                                   std::string_view ccy) {
     Order order;
     order.exchange = Exchange::OKX;
     order.side = side;
@@ -106,19 +107,33 @@ Order OkxTradeWS::place_order_sync(const std::string& inst_id, Side side, double
         pending_orders_.emplace(msg_id, std::move(promise));
     }
 
-    // Build WS order message — snprintf avoids ostringstream heap allocs on hot path
-    // OKX format: {"id":"msgId","op":"order","args":[{"instId":"BTC-USDT","tdMode":"cross",
-    //              "side":"sell","ordType":"market","sz":"0.001"}]}
+    // OKX cross-margin shorts require ccy=USDT for spot margin orders.
+    // Market sells size in base; market buys size in quote.
     char buf[512];
-    int len = std::snprintf(buf, sizeof(buf),
-        "{\"id\":\"%s\",\"op\":\"order\",\"args\":[{"
-        "\"instId\":\"%s\",\"tdMode\":\"%s\",\"side\":\"%s\","
-        "\"ordType\":\"market\",\"sz\":\"%.8f\"}]}",
-        msg_id.c_str(),
-        inst_id.c_str(),
-        td_mode.c_str(),
-        side == Side::Buy ? "buy" : "sell",
-        qty);
+    int len = 0;
+    if (!ccy.empty()) {
+        len = std::snprintf(buf, sizeof(buf),
+            "{\"id\":\"%s\",\"op\":\"order\",\"args\":[{"
+            "\"instId\":\"%s\",\"tdMode\":\"%s\",\"ccy\":\"%.*s\",\"side\":\"%s\","
+            "\"ordType\":\"market\",\"sz\":\"%.8f\"}]}",
+            msg_id.c_str(),
+            inst_id.c_str(),
+            td_mode.c_str(),
+            static_cast<int>(ccy.size()),
+            ccy.data(),
+            side == Side::Buy ? "buy" : "sell",
+            qty);
+    } else {
+        len = std::snprintf(buf, sizeof(buf),
+            "{\"id\":\"%s\",\"op\":\"order\",\"args\":[{"
+            "\"instId\":\"%s\",\"tdMode\":\"%s\",\"side\":\"%s\","
+            "\"ordType\":\"market\",\"sz\":\"%.8f\"}]}",
+            msg_id.c_str(),
+            inst_id.c_str(),
+            td_mode.c_str(),
+            side == Side::Buy ? "buy" : "sell",
+            qty);
+    }
     if (len <= 0 || static_cast<size_t>(len) >= sizeof(buf)) {
         order.status = OrderStatus::Rejected;
         {

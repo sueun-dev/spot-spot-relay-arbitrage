@@ -16,6 +16,10 @@ namespace kimp::exchange::okx {
 
 namespace {
 
+constexpr std::string_view kOkxUserAgent =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
+
 // Fast OKX BBO message parser (bbo-tbt channel)
 // Format: {"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["price","size","","1"]],"bids":[["price","size","","1"]],"ts":"1597026383085"}]}
 bool parse_bbo_fast(std::string_view message, Ticker& ticker) {
@@ -305,7 +309,9 @@ void OkxExchange::subscribe_orderbook(const std::vector<SymbolId>& symbols) {
 
 std::vector<SymbolId> OkxExchange::get_available_symbols() {
     std::vector<SymbolId> symbols;
-    auto headers = std::unordered_map<std::string, std::string>{};
+    auto headers = std::unordered_map<std::string, std::string>{
+        {"User-Agent", std::string(kOkxUserAgent)}
+    };
 
     // Step 1: Fetch MARGIN instruments to know which bases support margin short
     std::unordered_set<std::string> margin_bases;
@@ -382,6 +388,10 @@ std::vector<SymbolId> OkxExchange::get_available_symbols() {
             if (!min_sz.error()) {
                 info.min_qty = opt::fast_stod(min_sz.get_string().value());
             }
+            auto tick_sz = item["tickSz"];
+            if (!tick_sz.error()) {
+                info.price_tick = opt::fast_stod(tick_sz.get_string().value());
+            }
 
             {
                 std::unique_lock lock(metadata_mutex_);
@@ -401,7 +411,9 @@ std::vector<Ticker> OkxExchange::fetch_all_tickers() {
     std::vector<Ticker> tickers;
 
     // GET /api/v5/market/tickers?instType=SPOT
-    auto headers = std::unordered_map<std::string, std::string>{};
+    auto headers = std::unordered_map<std::string, std::string>{
+        {"User-Agent", std::string(kOkxUserAgent)}
+    };
     auto response = rest_client_->get("/api/v5/market/tickers?instType=SPOT", headers);
     if (!response.success) {
         Logger::error("[OKX] Failed to fetch all tickers: {}", response.error);
@@ -536,7 +548,7 @@ Order OkxExchange::open_short(const SymbolId& symbol, Quantity quantity) {
     // Try WebSocket Trade API first (~5-20ms vs ~150-300ms REST)
     if (trade_ws_ && trade_ws_->is_connected()) {
         Order ws_order = trade_ws_->place_order_sync(
-            symbol_to_okx(symbol), Side::Sell, adj_qty, "cross");
+            symbol_to_okx(symbol), Side::Sell, adj_qty, "cross", "USDT");
         if (ws_order.status != OrderStatus::Rejected) {
             ws_order.symbol = symbol;
             ws_order.quantity = adj_qty;
@@ -551,7 +563,7 @@ Order OkxExchange::open_short(const SymbolId& symbol, Quantity quantity) {
     // REST fallback
     char body_buf[512];
     int body_len = std::snprintf(body_buf, sizeof(body_buf),
-        "{\"instId\":\"%s\",\"tdMode\":\"cross\",\"side\":\"sell\","
+        "{\"instId\":\"%s\",\"tdMode\":\"cross\",\"ccy\":\"USDT\",\"side\":\"sell\","
         "\"ordType\":\"market\",\"sz\":\"%.8f\"}",
         symbol_to_okx(symbol).c_str(), adj_qty);
     if (body_len <= 0 || static_cast<size_t>(body_len) >= sizeof(body_buf)) {
@@ -599,27 +611,38 @@ Order OkxExchange::close_short(const SymbolId& symbol, Quantity quantity) {
         return order;
     }
 
-    // Try WebSocket Trade API first (~5-20ms vs ~150-300ms REST)
-    if (trade_ws_ && trade_ws_->is_connected()) {
-        Order ws_order = trade_ws_->place_order_sync(
-            symbol_to_okx(symbol), Side::Buy, adj_qty, "cross");
-        if (ws_order.status != OrderStatus::Rejected) {
-            ws_order.symbol = symbol;
-            ws_order.quantity = adj_qty;
-            ws_order.client_order_id = order.client_order_id;
-            Logger::info("[OKX-WS] Closed cross-margin short {} {} - orderId: {}",
-                         symbol.to_string(), adj_qty, ws_order.order_id_str);
-            return ws_order;
+    double price_hint = 0.0;
+    double min_notional = 0.0;
+    if (auto cached = get_cached_ticker(symbol)) {
+        price_hint = cached->ask > 0.0 ? cached->ask : cached->last;
+    }
+    {
+        std::shared_lock lock(metadata_mutex_);
+        auto it = lot_size_cache_.find(symbol_to_okx(symbol));
+        if (it != lot_size_cache_.end()) {
+            min_notional = it->second.min_notional;
         }
-        Logger::warn("[OKX] WS close failed, falling back to REST");
+    }
+    if (price_hint <= 0.0) {
+        order.status = OrderStatus::Rejected;
+        Logger::error("[OKX] No price available to close short {}", symbol.to_string());
+        return order;
+    }
+    double close_notional = adj_qty * price_hint * (1.0 + TradingConfig::OKX_FEE_RATE);
+    if (min_notional > 0.0 && close_notional < min_notional) {
+        close_notional = min_notional;
+    }
+    if (close_notional <= 0.0) {
+        order.status = OrderStatus::Rejected;
+        Logger::error("[OKX] Short close quote notional invalid: {} {}", symbol.to_string(), adj_qty);
+        return order;
     }
 
-    // REST fallback
     char body_buf[512];
     int body_len = std::snprintf(body_buf, sizeof(body_buf),
-        "{\"instId\":\"%s\",\"tdMode\":\"cross\",\"side\":\"buy\","
+        "{\"instId\":\"%s\",\"tdMode\":\"cross\",\"ccy\":\"USDT\",\"side\":\"buy\","
         "\"ordType\":\"market\",\"sz\":\"%.8f\"}",
-        symbol_to_okx(symbol).c_str(), adj_qty);
+        symbol_to_okx(symbol).c_str(), close_notional);
     if (body_len <= 0 || static_cast<size_t>(body_len) >= sizeof(body_buf)) {
         order.status = OrderStatus::Rejected;
         Logger::error("[OKX] Short close body buffer overflow");
@@ -637,8 +660,8 @@ Order OkxExchange::close_short(const SymbolId& symbol, Quantity quantity) {
     }
 
     parse_order_response(response.body, order, &order.order_id_str);
-    Logger::info("[OKX-REST] Closed cross-margin short {} {} - Status: {}, orderId: {}",
-                 symbol.to_string(), adj_qty, static_cast<int>(order.status),
+    Logger::info("[OKX-REST] Closed cross-margin short {} {} via market buy notional {} - Status: {}, orderId: {}",
+                 symbol.to_string(), adj_qty, close_notional, static_cast<int>(order.status),
                  order.order_id_str);
     return order;
 }
@@ -1024,7 +1047,8 @@ std::unordered_map<std::string, std::string> OkxExchange::build_auth_headers(
         {"OK-ACCESS-KEY", credentials_.api_key},
         {"OK-ACCESS-SIGN", signature},
         {"OK-ACCESS-TIMESTAMP", timestamp},
-        {"OK-ACCESS-PASSPHRASE", credentials_.passphrase}
+        {"OK-ACCESS-PASSPHRASE", credentials_.passphrase},
+        {"User-Agent", std::string(kOkxUserAgent)}
     };
 }
 

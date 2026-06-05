@@ -446,50 +446,109 @@ std::optional<kimp::RuntimeConfig> load_config(const std::string& path,
         if (!load_exchange("bithumb", kimp::Exchange::Bithumb)) return std::nullopt;
         if (!load_exchange("bybit", kimp::Exchange::Bybit)) return std::nullopt;
 
-        // OKX is optional — load if present in config, skip silently if not
-        if (yaml["exchanges"]["okx"]) {
+        if (!yaml["exchanges"]["okx"]) {
+            std::cerr << "Exchange 'okx' not found in config" << std::endl;
+            return std::nullopt;
+        }
+        {
             auto okx_node = yaml["exchanges"]["okx"];
             kimp::ExchangeCredentials okx_creds;
             okx_creds.enabled = okx_node["enabled"] ? okx_node["enabled"].as<bool>() : true;
-
-            if (okx_creds.enabled) {
-                if (okx_node["ws_endpoint"]) okx_creds.ws_endpoint = okx_node["ws_endpoint"].as<std::string>();
-                if (okx_node["ws_private_endpoint"]) okx_creds.ws_private_endpoint = okx_node["ws_private_endpoint"].as<std::string>();
-                if (okx_node["ws_trade_endpoint"]) okx_creds.ws_trade_endpoint = okx_node["ws_trade_endpoint"].as<std::string>();
-                if (okx_node["rest_endpoint"]) okx_creds.rest_endpoint = okx_node["rest_endpoint"].as<std::string>();
-                if (okx_node["api_key"]) okx_creds.api_key = expand_env(okx_node["api_key"].as<std::string>());
-                if (okx_node["secret_key"]) okx_creds.secret_key = expand_env(okx_node["secret_key"].as<std::string>());
-                if (okx_node["passphrase"]) okx_creds.passphrase = expand_env(okx_node["passphrase"].as<std::string>());
-
-                if (!require_private_keys ||
-                    (!okx_creds.api_key.empty() && !okx_creds.secret_key.empty() && !okx_creds.passphrase.empty())) {
-                    config.exchanges[kimp::Exchange::OKX] = std::move(okx_creds);
-                } else {
-                    std::cerr << "OKX credentials incomplete (api_key, secret_key, passphrase required). Skipping OKX." << std::endl;
-                    okx_creds.enabled = false;
-                    config.exchanges[kimp::Exchange::OKX] = std::move(okx_creds);
-                }
-            } else {
-                config.exchanges[kimp::Exchange::OKX] = std::move(okx_creds);
+            if (!okx_creds.enabled) {
+                std::cerr << "Exchange 'okx' must be enabled" << std::endl;
+                return std::nullopt;
             }
+
+            if (okx_node["ws_endpoint"]) okx_creds.ws_endpoint = okx_node["ws_endpoint"].as<std::string>();
+            if (okx_node["ws_private_endpoint"]) okx_creds.ws_private_endpoint = okx_node["ws_private_endpoint"].as<std::string>();
+            if (okx_node["ws_trade_endpoint"]) okx_creds.ws_trade_endpoint = okx_node["ws_trade_endpoint"].as<std::string>();
+            if (okx_node["rest_endpoint"]) okx_creds.rest_endpoint = okx_node["rest_endpoint"].as<std::string>();
+            if (okx_node["api_key"]) okx_creds.api_key = expand_env(okx_node["api_key"].as<std::string>());
+            if (okx_node["secret_key"]) okx_creds.secret_key = expand_env(okx_node["secret_key"].as<std::string>());
+            if (okx_node["passphrase"]) okx_creds.passphrase = expand_env(okx_node["passphrase"].as<std::string>());
+
+            if (require_private_keys &&
+                (okx_creds.api_key.empty() || okx_creds.secret_key.empty() || okx_creds.passphrase.empty())) {
+                std::cerr << "Exchange 'okx': private API credentials are missing";
+                std::vector<std::string> missing_vars;
+                if (okx_node["api_key"]) {
+                    if (auto env_name = env_placeholder_name(okx_node["api_key"].as<std::string>());
+                        env_name && okx_creds.api_key.empty()) {
+                        missing_vars.push_back(*env_name);
+                    }
+                }
+                if (okx_node["secret_key"]) {
+                    if (auto env_name = env_placeholder_name(okx_node["secret_key"].as<std::string>());
+                        env_name && okx_creds.secret_key.empty()) {
+                        missing_vars.push_back(*env_name);
+                    }
+                }
+                if (okx_node["passphrase"]) {
+                    if (auto env_name = env_placeholder_name(okx_node["passphrase"].as<std::string>());
+                        env_name && okx_creds.passphrase.empty()) {
+                        missing_vars.push_back(*env_name);
+                    }
+                }
+                if (!missing_vars.empty()) {
+                    std::cerr << " (set " << missing_vars.front();
+                    for (std::size_t i = 1; i < missing_vars.size(); ++i) {
+                        std::cerr << ", " << missing_vars[i];
+                    }
+                    std::cerr << ")";
+                }
+                std::cerr << ". OKX is required." << std::endl;
+                return std::nullopt;
+            }
+
+            config.exchanges[kimp::Exchange::OKX] = std::move(okx_creds);
         }
 
-        // Upbit is optional — load if present in config, skip silently if not
-        if (yaml["exchanges"]["upbit"]) {
+        if (!yaml["exchanges"]["upbit"]) {
+            std::cerr << "Exchange 'upbit' not found in config" << std::endl;
+            return std::nullopt;
+        }
+        {
             auto upbit_node = yaml["exchanges"]["upbit"];
             kimp::ExchangeCredentials upbit_creds;
             upbit_creds.enabled = upbit_node["enabled"] ? upbit_node["enabled"].as<bool>() : true;
-
-            if (upbit_creds.enabled) {
-                if (upbit_node["ws_endpoint"]) upbit_creds.ws_endpoint = upbit_node["ws_endpoint"].as<std::string>();
-                if (upbit_node["rest_endpoint"]) upbit_creds.rest_endpoint = upbit_node["rest_endpoint"].as<std::string>();
-                if (upbit_node["api_key"]) upbit_creds.api_key = expand_env(upbit_node["api_key"].as<std::string>());
-                if (upbit_node["secret_key"]) upbit_creds.secret_key = expand_env(upbit_node["secret_key"].as<std::string>());
-                // Upbit doesn't need credentials for public data (monitor-only)
-                config.exchanges[kimp::Exchange::Upbit] = std::move(upbit_creds);
-            } else {
-                config.exchanges[kimp::Exchange::Upbit] = std::move(upbit_creds);
+            if (!upbit_creds.enabled) {
+                std::cerr << "Exchange 'upbit' must be enabled" << std::endl;
+                return std::nullopt;
             }
+
+            if (upbit_node["ws_endpoint"]) upbit_creds.ws_endpoint = upbit_node["ws_endpoint"].as<std::string>();
+            if (upbit_node["rest_endpoint"]) upbit_creds.rest_endpoint = upbit_node["rest_endpoint"].as<std::string>();
+            if (upbit_node["api_key"]) upbit_creds.api_key = expand_env(upbit_node["api_key"].as<std::string>());
+            if (upbit_node["secret_key"]) upbit_creds.secret_key = expand_env(upbit_node["secret_key"].as<std::string>());
+
+            if (require_private_keys &&
+                (upbit_creds.api_key.empty() || upbit_creds.secret_key.empty())) {
+                std::cerr << "Exchange 'upbit': private API credentials are missing";
+                std::vector<std::string> missing_vars;
+                if (upbit_node["api_key"]) {
+                    if (auto env_name = env_placeholder_name(upbit_node["api_key"].as<std::string>());
+                        env_name && upbit_creds.api_key.empty()) {
+                        missing_vars.push_back(*env_name);
+                    }
+                }
+                if (upbit_node["secret_key"]) {
+                    if (auto env_name = env_placeholder_name(upbit_node["secret_key"].as<std::string>());
+                        env_name && upbit_creds.secret_key.empty()) {
+                        missing_vars.push_back(*env_name);
+                    }
+                }
+                if (!missing_vars.empty()) {
+                    std::cerr << " (set " << missing_vars.front();
+                    for (std::size_t i = 1; i < missing_vars.size(); ++i) {
+                        std::cerr << ", " << missing_vars[i];
+                    }
+                    std::cerr << ")";
+                }
+                std::cerr << ". Upbit is required." << std::endl;
+                return std::nullopt;
+            }
+
+            config.exchanges[kimp::Exchange::Upbit] = std::move(upbit_creds);
         }
 
     } catch (const YAML::Exception& e) {
@@ -689,13 +748,16 @@ int main(int argc, char* argv[]) {
     net::io_context io_context;
     auto work_guard = net::make_work_guard(io_context);
 
-    // Create exchanges (Bithumb: Korean spot, Bybit + OKX: spot margin short venues)
-    // load_config guarantees Bithumb + Bybit entries exist; check enabled flag only
+    // Create exchanges (Bithumb + Upbit: Korean venues, Bybit + OKX: foreign venues)
+    // load_config guarantees all four entries exist; check enabled flags only
     auto& bithumb_creds = config.exchanges[kimp::Exchange::Bithumb];
     auto& bybit_creds = config.exchanges[kimp::Exchange::Bybit];
+    auto& okx_creds = config.exchanges[kimp::Exchange::OKX];
+    auto& upbit_creds = config.exchanges[kimp::Exchange::Upbit];
+    const bool upbit_trade_enabled = !upbit_creds.api_key.empty() && !upbit_creds.secret_key.empty();
 
-    if (!bithumb_creds.enabled || !bybit_creds.enabled) {
-        spdlog::error("Both Bithumb and Bybit must be enabled for arbitrage");
+    if (!bithumb_creds.enabled || !bybit_creds.enabled || !okx_creds.enabled || !upbit_creds.enabled) {
+        spdlog::error("Bithumb, Upbit, Bybit, and OKX must all be enabled for arbitrage");
         return 1;
     }
 
@@ -704,40 +766,18 @@ int main(int argc, char* argv[]) {
     auto bybit = std::make_shared<kimp::exchange::bybit::BybitExchange>(
         io_context, std::move(bybit_creds));
 
-    // OKX: optional foreign exchange (enabled only when credentials are configured)
-    std::shared_ptr<kimp::exchange::okx::OkxExchange> okx;
-    bool okx_enabled = false;
-    {
-        auto it = config.exchanges.find(kimp::Exchange::OKX);
-        if (it != config.exchanges.end() && it->second.enabled) {
-            okx = std::make_shared<kimp::exchange::okx::OkxExchange>(
-                io_context, std::move(it->second));
-            okx_enabled = true;
-            spdlog::info("OKX exchange enabled as additional foreign venue");
-        } else {
-            spdlog::info("OKX exchange not configured or disabled — running with Bybit only");
-        }
-    }
+    std::shared_ptr<kimp::exchange::okx::OkxExchange> okx =
+        std::make_shared<kimp::exchange::okx::OkxExchange>(io_context, std::move(okx_creds));
+    bool okx_enabled = true;
+    spdlog::info("OKX exchange enabled as required foreign venue");
 
-    // Upbit: optional Korean exchange (price comparison with Bithumb)
-    std::shared_ptr<kimp::exchange::upbit::UpbitExchange> upbit;
-    bool upbit_enabled = false;
-    bool upbit_trade_enabled = false;
-    {
-        auto it = config.exchanges.find(kimp::Exchange::Upbit);
-        if (it != config.exchanges.end() && it->second.enabled) {
-            upbit_trade_enabled = !it->second.api_key.empty() && !it->second.secret_key.empty();
-            upbit = std::make_shared<kimp::exchange::upbit::UpbitExchange>(
-                io_context, std::move(it->second));
-            upbit_enabled = true;
-            if (upbit_trade_enabled) {
-                spdlog::info("Upbit exchange enabled as additional Korean venue (trading + monitoring)");
-            } else {
-                spdlog::info("Upbit exchange enabled as additional Korean venue (monitoring only; API keys missing)");
-            }
-        } else {
-            spdlog::info("Upbit exchange not configured or disabled — running with Bithumb only");
-        }
+    std::shared_ptr<kimp::exchange::upbit::UpbitExchange> upbit =
+        std::make_shared<kimp::exchange::upbit::UpbitExchange>(io_context, std::move(upbit_creds));
+    bool upbit_enabled = true;
+    if (upbit_trade_enabled) {
+        spdlog::info("Upbit exchange enabled as required Korean venue (trading + monitoring)");
+    } else {
+        spdlog::info("Upbit exchange enabled as required Korean venue (monitoring only)");
     }
 
     if (show_balances) {
@@ -756,13 +796,9 @@ int main(int argc, char* argv[]) {
         };
 
         print_balance_section("Bithumb", fetch_balances("Bithumb", bithumb));
-        if (upbit_enabled) {
-            print_balance_section("Upbit", fetch_balances("Upbit", upbit));
-        }
+        print_balance_section("Upbit", fetch_balances("Upbit", upbit));
         print_balance_section("Bybit", fetch_balances("Bybit", bybit));
-        if (okx_enabled) {
-            print_balance_section("OKX", fetch_balances("OKX", okx));
-        }
+        print_balance_section("OKX", fetch_balances("OKX", okx));
 
         kimp::Logger::shutdown();
         return 0;
@@ -773,22 +809,14 @@ int main(int argc, char* argv[]) {
     engine.set_exchange(kimp::Exchange::Bithumb, bithumb);
     engine.set_exchange(kimp::Exchange::Bybit, bybit);
     engine.add_exchange_pair(kimp::Exchange::Bithumb, kimp::Exchange::Bybit);
-    if (okx_enabled) {
-        engine.set_exchange(kimp::Exchange::OKX, okx);
-        engine.add_exchange_pair(kimp::Exchange::Bithumb, kimp::Exchange::OKX);
-    }
-    if (upbit_enabled) {
-        engine.set_exchange(kimp::Exchange::Upbit, upbit);
-        engine.add_exchange_pair(kimp::Exchange::Upbit, kimp::Exchange::Bybit);
-        if (okx_enabled) {
-            engine.add_exchange_pair(kimp::Exchange::Upbit, kimp::Exchange::OKX);
-        }
-        if (!upbit_trade_enabled) {
-            engine.set_exchange_pair_entry_enabled(kimp::Exchange::Upbit, kimp::Exchange::Bybit, false);
-            if (okx_enabled) {
-                engine.set_exchange_pair_entry_enabled(kimp::Exchange::Upbit, kimp::Exchange::OKX, false);
-            }
-        }
+    engine.set_exchange(kimp::Exchange::OKX, okx);
+    engine.add_exchange_pair(kimp::Exchange::Bithumb, kimp::Exchange::OKX);
+    engine.set_exchange(kimp::Exchange::Upbit, upbit);
+    engine.add_exchange_pair(kimp::Exchange::Upbit, kimp::Exchange::Bybit);
+    engine.add_exchange_pair(kimp::Exchange::Upbit, kimp::Exchange::OKX);
+    if (!upbit_trade_enabled) {
+        engine.set_exchange_pair_entry_enabled(kimp::Exchange::Upbit, kimp::Exchange::Bybit, false);
+        engine.set_exchange_pair_entry_enabled(kimp::Exchange::Upbit, kimp::Exchange::OKX, false);
     }
 
     // Order manager for auto-trading
@@ -796,12 +824,8 @@ int main(int argc, char* argv[]) {
     order_manager.set_engine(&engine);
     order_manager.set_exchange(kimp::Exchange::Bithumb, bithumb);
     order_manager.set_exchange(kimp::Exchange::Bybit, bybit);
-    if (upbit_trade_enabled) {
-        order_manager.set_exchange(kimp::Exchange::Upbit, upbit);
-    }
-    if (okx_enabled) {
-        order_manager.set_exchange(kimp::Exchange::OKX, okx);
-    }
+    order_manager.set_exchange(kimp::Exchange::Upbit, upbit);
+    order_manager.set_exchange(kimp::Exchange::OKX, okx);
 
     // Position persistence callback (crash recovery)
     order_manager.set_position_update_callback([](const kimp::Position* pos) {
@@ -1073,35 +1097,29 @@ int main(int argc, char* argv[]) {
     bybit->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
         engine.on_ticker_update(ticker);
     });
-    if (okx_enabled) {
-        okx->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
-            engine.on_ticker_update(ticker);
-        });
-    }
-    if (upbit_enabled) {
-        upbit->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
-            engine.on_ticker_update(ticker);
-        });
-    }
+    okx->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
+        engine.on_ticker_update(ticker);
+    });
+    upbit->set_ticker_callback([&engine](const kimp::Ticker& ticker) {
+        engine.on_ticker_update(ticker);
+    });
 
     // Connect
     spdlog::info("Connecting to exchanges...");
     bithumb->connect();
     bybit->connect();
-    if (okx_enabled) {
-        okx->connect();
-    }
-    if (upbit_enabled) {
-        upbit->connect();
-    }
+    okx->connect();
+    upbit->connect();
 
     // Wait for connections (poll instead of fixed sleep, max 10 seconds)
     spdlog::info("Waiting for connections...");
     int wait_count = 0;
     while (!g_shutdown && wait_count < 50) {
-        bool all_connected = bithumb->is_connected() && bybit->is_connected();
-        if (okx_enabled) all_connected = all_connected && okx->is_connected();
-        if (upbit_enabled) all_connected = all_connected && upbit->is_connected();
+        bool all_connected =
+            bithumb->is_connected() &&
+            bybit->is_connected() &&
+            okx->is_connected() &&
+            upbit->is_connected();
         if (all_connected) {
             spdlog::info("All exchanges connected");
             break;
@@ -1110,25 +1128,15 @@ int main(int argc, char* argv[]) {
         ++wait_count;
     }
 
-    if (!bithumb->is_connected() || !bybit->is_connected()) {
-        spdlog::error("Failed to connect to required exchanges (Bithumb/Bybit)");
+    if (!bithumb->is_connected() || !bybit->is_connected() || !okx->is_connected() || !upbit->is_connected()) {
+        spdlog::error("Failed to connect to required exchanges (Bithumb/Upbit/Bybit/OKX)");
         bithumb->disconnect();
         bybit->disconnect();
-        if (okx_enabled) okx->disconnect();
-        if (upbit_enabled) upbit->disconnect();
+        okx->disconnect();
+        upbit->disconnect();
         stop_io_threads();
         kimp::Logger::shutdown();
         return 1;
-    }
-    if (okx_enabled && !okx->is_connected()) {
-        spdlog::warn("OKX connection failed — continuing with Bybit only");
-        okx_enabled = false;
-        okx.reset();
-    }
-    if (upbit_enabled && !upbit->is_connected()) {
-        spdlog::warn("Upbit connection failed — continuing with Bithumb only");
-        upbit_enabled = false;
-        upbit.reset();
     }
 
     // Find common symbols: (Bithumb ∪ Upbit) ∩ (Bybit ∪ OKX)
@@ -1239,13 +1247,15 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Prepare OKX spot margin account (optional — non-fatal if it fails)
-        if (okx_enabled) {
-            if (!order_manager.prepare_okx_shorting(common_symbols)) {
-                spdlog::warn("OKX spot margin setup failed — OKX will not be used for entries");
-                engine.set_exchange_pair_entry_enabled(kimp::Exchange::Bithumb, kimp::Exchange::OKX, false);
-                engine.set_exchange_pair_entry_enabled(kimp::Exchange::Upbit, kimp::Exchange::OKX, false);
-            }
+        if (!order_manager.prepare_okx_shorting(common_symbols)) {
+            spdlog::error("OKX spot margin setup failed");
+            bithumb->disconnect();
+            bybit->disconnect();
+            okx->disconnect();
+            upbit->disconnect();
+            stop_io_threads();
+            kimp::Logger::shutdown();
+            return 1;
         }
 
         // Build external position blacklist (prevents trading coins with existing manual positions)

@@ -48,6 +48,7 @@ Pass condition:
 No orders are placed.
 
 ```bash
+./kimp_test_live_step_by_step --symbol ADA
 ./kimp_test_live_pair_roundtrip --pair Bi-By --symbol ADA
 ./kimp_test_live_pair_roundtrip --pair Bi-Ok --symbol ADA
 ./kimp_test_live_pair_roundtrip --pair Up-By --symbol ADA
@@ -56,6 +57,7 @@ No orders are placed.
 
 What to inspect:
 
+- step-by-step route / quote / netKRW output for all 4 pairs
 - top-of-book ask/bid
 - top-of-book size
 - target quantity

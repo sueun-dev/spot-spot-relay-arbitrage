@@ -203,6 +203,14 @@ target_link_libraries(kimp_test_live_margin_setup PRIVATE kimp_lib)
 add_executable(kimp_test_live_pair_roundtrip tests/test_live_pair_roundtrip.cpp)
 target_link_libraries(kimp_test_live_pair_roundtrip PRIVATE kimp_lib)
 
+# Step-by-step regression: each entry gate should block or pass for the expected reason
+add_executable(kimp_test_entry_pipeline_steps tests/test_entry_pipeline_steps.cpp)
+target_link_libraries(kimp_test_entry_pipeline_steps PRIVATE kimp_lib)
+
+# Live smoke: print a step-by-step decision trace for one symbol across all 4 pairs
+add_executable(kimp_test_live_step_by_step tests/test_live_step_by_step.cpp)
+target_link_libraries(kimp_test_live_step_by_step PRIVATE kimp_lib)
+
 # Regression: KRW price formatting must not round sub-won Bithumb quotes into fake prices
 add_executable(kimp_test_price_format tests/test_price_format.cpp)
 target_link_libraries(kimp_test_price_format PRIVATE kimp_lib)
