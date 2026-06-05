@@ -57,11 +57,15 @@ int main() {
         Exchange::Bithumb, SymbolId("USDT", "KRW"), 1000.0, 1000.2, 1000.1, 1000000.0, 1000000.0));
 
     // Make all symbols qualify for relay entry with enough top-of-book quantity.
+    // The Korean book is priced ~5% below the foreign book so the projected per-entry
+    // net profit clears TradingConfig::MIN_ENTRY_NET_PROFIT_KRW with comfortable margin
+    // (this regression checks position-slot capacity, not the profit floor, so the
+    // premium must stay well above the floor even if that constant is later raised).
     for (const auto& base : bases) {
         engine.on_ticker_update(make_ticker(
             Exchange::Bybit, SymbolId(base, "USDT"), 100.0, 100.1, 100.05, 10.0, 10.0));
         engine.on_ticker_update(make_ticker(
-            Exchange::Bithumb, SymbolId(base, "KRW"), 97950.0, 98000.0, 97975.0, 10.0, 10.0));
+            Exchange::Bithumb, SymbolId(base, "KRW"), 94950.0, 95000.0, 94975.0, 10.0, 10.0));
     }
 
     // Trigger one more full pass after all quotes are populated.
