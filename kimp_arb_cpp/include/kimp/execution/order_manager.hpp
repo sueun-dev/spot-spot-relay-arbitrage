@@ -144,7 +144,7 @@ private:
     std::shared_ptr<exchange::ForeignShortExchangeBase> get_foreign_exchange(Exchange ex);
 
     // Single order execution helpers
-    Order execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount);
+    Order execute_korean_buy(Exchange ex, const SymbolId& symbol, double krw_amount);
     Order execute_foreign_short(Exchange ex, const SymbolId& symbol, double quantity);
     Order execute_korean_sell(Exchange ex, const SymbolId& symbol, double quantity);
     Order execute_foreign_cover(Exchange ex, const SymbolId& symbol, double quantity);

@@ -91,7 +91,6 @@ public:
 
     Order place_market_order(const SymbolId& symbol, Side side, Quantity quantity) override;
     Order place_market_buy_cost(const SymbolId& symbol, Price cost) override;
-    Order place_market_buy_quantity(const SymbolId& symbol, Quantity quantity) override;
     bool cancel_order(uint64_t order_id) override;
 
     double get_balance(const std::string& currency) override;
@@ -119,8 +118,6 @@ private:
     std::unordered_map<std::string, std::string> build_v1_auth_headers(
         const std::string& query_string) const;
 
-    std::optional<double> fetch_best_ask_price(const SymbolId& symbol);
-    bool cancel_order_v1(const std::string& order_id);
     bool query_order_detail_v1(const std::string& order_id, Order& order);
     bool query_order_detail_ws(const std::string& order_id, Order& order);
 

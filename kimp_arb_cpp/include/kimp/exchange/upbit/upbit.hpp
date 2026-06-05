@@ -95,9 +95,6 @@ private:
         return std::string(symbol.get_quote()) + "-" + std::string(symbol.get_base());
     }
 
-    std::optional<double> fetch_best_ask_price(const SymbolId& symbol);
-    bool cancel_order_uuid(const std::string& order_id);
-
     // JWT authentication for Upbit API (HS512)
     std::string generate_jwt_token() const;
     std::string generate_jwt_token_with_query(const std::string& query_string) const;

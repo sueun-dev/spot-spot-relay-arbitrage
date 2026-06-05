@@ -679,7 +679,7 @@ ExecutionResult OrderManager::execute_spot_relay_entry(
             });
 
             record_latency(LatencyStage::EntryKoreanSubmitStart, 0, 0, actual_filled, krw_amount);
-            Order korean_order = execute_korean_buy(signal.korean_exchange, signal.symbol, actual_filled, krw_amount);
+            Order korean_order = execute_korean_buy(signal.korean_exchange, signal.symbol, krw_amount);
             record_latency(LatencyStage::EntryKoreanSubmitAck,
                            static_cast<int64_t>(korean_order.status),
                            0,
@@ -1673,7 +1673,7 @@ ExecutionResult OrderManager::execute_spot_relay_exit(const ExitSignal& signal, 
             });
 
             record_latency(LatencyStage::ReentryKoreanSubmitStart, 0, 0, actual_filled, krw_amount);
-            Order korean_order = execute_korean_buy(signal.korean_exchange, position.symbol, actual_filled, krw_amount);
+            Order korean_order = execute_korean_buy(signal.korean_exchange, position.symbol, krw_amount);
             record_latency(LatencyStage::ReentryKoreanSubmitAck,
                            static_cast<int64_t>(korean_order.status),
                            0,
@@ -1981,8 +1981,7 @@ bool OrderManager::prepare_okx_shorting(const std::vector<SymbolId>& symbols) {
     return true;
 }
 
-Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, double quantity, double krw_amount) {
-    (void)quantity;
+Order OrderManager::execute_korean_buy(Exchange ex, const SymbolId& symbol, double krw_amount) {
     auto korean_ex = get_korean_exchange(ex);
     if (!korean_ex) {
         Order order;
