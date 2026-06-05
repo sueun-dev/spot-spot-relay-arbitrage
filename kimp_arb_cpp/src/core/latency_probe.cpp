@@ -541,16 +541,16 @@ void LatencyProbe::exporter_loop() {
     std::vector<LatencyEvent> batch;
     batch.reserve(256);
     std::size_t producer_cursor = 0;
-    LatencyEvent event;
+    LatencyEvent popped;
 
     while (running_.load(std::memory_order_acquire) ||
            pending_events_.load(std::memory_order_relaxed) > 0) {
         batch.clear();
         while (batch.size() < 256) {
-            if (!try_pop_event(event, producer_cursor)) {
+            if (!try_pop_event(popped, producer_cursor)) {
                 break;
             }
-            batch.push_back(std::move(event));
+            batch.push_back(std::move(popped));
         }
 
         if (batch.empty()) {
