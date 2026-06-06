@@ -1,7 +1,7 @@
 <h1 align="center">Spot-Spot Relay Arbitrage Engine</h1>
 
 <p align="center">
-  <strong>Low-latency KRW premium execution engine for Korean spot vs offshore spot margin hedging</strong>
+  <strong>Low-latency KRW premium execution engine for Korean spot vs offshore spot-margin hedging</strong>
 </p>
 
 <p align="center">
@@ -9,11 +9,13 @@
 </p>
 
 <p align="center">
+  <a href="#overview">Overview</a> &bull;
+  <a href="#repository-layout">Repository</a> &bull;
   <a href="#architecture">Architecture</a> &bull;
   <a href="#execution-flow">Execution Flow</a> &bull;
   <a href="#safety">Safety</a> &bull;
   <a href="#performance">Performance</a> &bull;
-  <a href="#build">Build</a>
+  <a href="#build--run">Build &amp; Run</a>
 </p>
 
 ---
@@ -31,6 +33,14 @@ Bithumb (KRW Spot)          Bybit (USDT Spot Margin)
      Profit = premium captured - fees
 ```
 
+The project ships in two parts:
+
+- **`kimp_arb_cpp/`** — the C++20 execution engine (`kimp_bot`). This is the live trader: it ingests
+  market data over WebSocket, computes net edge, and places hedged orders on Bithumb + Bybit.
+- **A Node.js "spot-relay" monitoring layer** (`scripts/` + `dashboard/`) — a standalone read-only
+  scanner that streams Bithumb/Bybit spot books, computes the same fee-adjusted relay edge, writes a
+  live JSON snapshot, and renders it in a Next.js dashboard. It places **no orders**.
+
 ### Core Constraints
 
 | Rule | Detail |
@@ -38,12 +48,36 @@ Bithumb (KRW Spot)          Bybit (USDT Spot Margin)
 | **No futures** | Spot-only on both sides — no funding rate risk |
 | **No GateIO** | Bybit spot margin only |
 | **Target coins** | Common pairs across Bithumb KRW + Bybit USDT spot margin |
-| **Entry gate** | 70 USDT per split, both sides 1-tick instant fill, net edge > 0 after fees |
+| **Entry gate** | Per-add notional unit, both sides 1-tick instant fill, net edge > 0 after fees |
 | **Fee model** | Bithumb ×1 (buy) + Bybit ×3 (borrow + short + cover) |
 
 ---
 
-## Architecture
+## Repository Layout
+
+```
+.
+├── kimp_arb_cpp/          # C++20 execution engine (the live trading bot)
+│   ├── include/kimp/      # Headers (core, exchange, execution, memory, network, strategy, utils)
+│   ├── src/               # Implementation files + main.cpp (CLI entry point)
+│   ├── config/config.yaml # Runtime configuration loaded by kimp_bot
+│   ├── tests/             # Regression, benchmark, and live-smoke test binaries
+│   ├── third_party/       # Vendored jwt-cpp (MIT)
+│   ├── CMakeLists.txt     # Build definition (targets: kimp_bot + tests)
+│   └── conanfile.py       # Conan dependency manifest
+├── scripts/               # Node.js spot-relay monitor (read-only)
+│   ├── spot-relay-live.mjs    # Live scanner → writes data/spot-relay-live.json
+│   └── lib/                   # Edge math + snapshot builder (+ node:test suites)
+├── dashboard/             # Next.js dashboard that visualizes the relay snapshot
+├── run_bot.sh             # Build + run the live trading engine
+├── run_monitor.sh         # Build + run the engine in monitor-only mode (no orders)
+├── package.json           # npm scripts for the Node relay layer (relay:*)
+└── MUSTREAD.md            # Operational runbook (paths, env, common errors) — Korean
+```
+
+---
+
+## Architecture (C++ engine)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -55,14 +89,14 @@ Bithumb (KRW Spot)          Bybit (USDT Spot Margin)
            │  fast-parse    │  ondemand     │              │
            ▼               ▼              ▼              ▼
     ┌─────────────────────────────────────────────────────────┐
-    │              PriceCache (64 shards, lock-free BBO)       │
+    │              PriceCache (sharded, lock-free BBO)         │
     │         atomic reads — zero mutex on hot path            │
     └────────────────────────┬────────────────────────────────┘
                              │
                              ▼
     ┌─────────────────────────────────────────────────────────┐
     │              ArbitrageEngine                             │
-    │  • Premium calc (SIMD: AVX2 4x / NEON 2x)              │
+    │  • Premium calc (SIMD: AVX2 4x / NEON 2x / scalar)     │
     │  • Spread guards (Korean + Foreign)                      │
     │  • Quote freshness check (MAX_QUOTE_AGE_MS)             │
     │  • Entry/exit signal generation                          │
@@ -74,7 +108,7 @@ Bithumb (KRW Spot)          Bybit (USDT Spot Margin)
                 │                         │
                 ▼                         ▼
     ┌─────────────────────────────────────────────────────────┐
-    │         LifecycleExecutor (4-8 fixed workers)            │
+    │              LifecycleExecutor (fixed worker pool)       │
     │              SPSC Ring Buffer — lock-free                │
     └────────────────────────┬────────────────────────────────┘
                              │
@@ -142,13 +176,13 @@ Signal: Premium dropped below exit threshold
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Quantity matching** | `quantities_match()` — relative tolerance `1e-6` (0.0001%) |
-| **Auto correction** | `flatten_extra_foreign_short()` / `flatten_extra_korean_long()` |
+| **Quantity matching** | `quantities_match()` — relative tolerance `HEDGE_QUANTITY_TOLERANCE_RATIO = 5e-5` (0.005%) |
+| **Auto correction** | flatten extra foreign short / flatten extra Korean long |
 | **Critical stop** | Bot halts + position snapshot preserved if correction fails |
 | **Rollback** | Failed Korean buy → automatic foreign short cover |
 | **Quote freshness** | Entry: 700ms max age, Exit: 8000ms max age |
 | **Spread guard** | Rejects entry if spread too wide on either side |
-| **Min profit floor** | `MIN_ENTRY_NET_PROFIT_KRW = 300` — no entry below this |
+| **Min profit floor** | `MIN_ENTRY_NET_PROFIT_KRW = 600` — no entry below this |
 
 ### Failure Modes
 
@@ -175,76 +209,165 @@ Signal: Premium dropped below exit threshold
 | Bithumb REST order | ~100-300ms | REST API (no WS order API) |
 | **Total entry** | **~150-400ms** | Bithumb REST dominates |
 
+> Numbers above are design targets. Measure your own with `kimp_bot --latency-probe`
+> (writes `trade_logs/latency_events.mmapbin`; add `--latency-probe-summary` for per-span CSV).
+
 ### Low-Latency Design
 
 | Component | Technique |
 |-----------|-----------|
 | **Price updates** | Lock-free atomic BBO reads (0 mutex on ticker path) |
-| **JSON parsing** | simdjson ondemand (zero heap alloc) + manual fast-parse fallback |
+| **JSON parsing** | simdjson ondemand + manual fast-parse fallback |
 | **Premium calc** | SIMD batch: AVX2 (4x parallel) / NEON (2x) / scalar fallback |
 | **Signal queue** | SPSC ring buffer, cache-line aligned, lock-free |
 | **Workers** | Fixed thread pool (no spawn/join overhead) |
 | **Memory** | Stack-allocated signals, pre-allocated orders, no `new`/`delete` on hot path |
 | **Connections** | Pre-warmed SSL, TCP_NODELAY, HTTP keep-alive, connection pool |
-| **CPU** | Core pinning, SCHED_FIFO realtime priority (Linux) |
+| **CPU** | Optional core pinning / realtime priority (configurable, off by default) |
 
 ---
 
 ## Configuration
 
+Two layers configure the engine:
+
+**1. Runtime YAML — `kimp_arb_cpp/config/config.yaml`** (loaded by `kimp_bot` at startup):
+
 ```yaml
-# Key trading parameters (types.hpp::TradingConfig)
-MAX_POSITIONS: 1-4                    # Concurrent arbitrage positions
-TARGET_ENTRY_USDT: 35.0               # Per-split notional
-MAX_POSITIONS_USD: 3000.0             # Per-exchange risk budget
-MIN_NET_EDGE_PCT: 0.0                 # Entry threshold (after fees)
-MIN_ENTRY_NET_PROFIT_KRW: 300.0       # Minimum profit floor per entry
-BITHUMB_FEE_RATE: 0.04%              # Maker/taker
-BYBIT_FEE_RATE: 0.10%                # Borrow + trade
-MAX_QUOTE_AGE_MS: 700                 # Entry quote freshness
-MAX_QUOTE_AGE_MS_EXIT: 8000           # Exit quote freshness (relaxed)
-ENTRY_FAST_SCAN_COOLDOWN_MS: 20       # Re-entry debounce
-ENTRY_STALL_TIMEOUT_MS: 120000        # Finalize partial position if stuck
+trading:
+  max_positions: 1               # Concurrent arbitrage positions (1–4)
+  position_size_usd: 70.0        # Per-symbol side exposure budget
+  order_size_usd: 70.0           # Notional per submitted order
+  entry_premium_threshold: 0.0   # Enter when net edge is positive
+  exit_premium_threshold: 0.25   # Exit floor (%)
 ```
+
+**2. Compile-time defaults — `kimp_arb_cpp/include/kimp/core/types.hpp` (`TradingConfig`):**
+
+```cpp
+MAX_POSITIONS              = 1        // runtime-overridable, range 1–4
+TARGET_ENTRY_USDT         = 35.0     // per-check entry unit (one add)
+CAPITAL_PER_EXCHANGE_USD  = 3000.0   // risk budget per venue
+MIN_NET_EDGE_PCT          = 0.0      // entry threshold (after fees)
+MIN_ENTRY_NET_PROFIT_KRW  = 600.0    // minimum projected NetKRW per entry
+BITHUMB_FEE_RATE          = 0.0004   // 0.04% taker (coupon)
+BYBIT_FEE_RATE            = 0.0010   // 0.10% taker (VIP0)
+MAX_QUOTE_AGE_MS          = 700      // entry quote freshness
+MAX_QUOTE_AGE_MS_EXIT     = 8000     // exit quote freshness (relaxed)
+ENTRY_FAST_SCAN_COOLDOWN_MS = 20     // re-entry debounce
+ENTRY_STALL_TIMEOUT_MS    = 120000   // finalize partial position if stuck (2 min)
+```
+
+### Required credentials
+
+`kimp_bot` reads exchange keys from environment variables (the `run_*.sh` scripts auto-load a
+root `.env`). Live trading requires:
+
+```
+BITHUMB_API_KEY  BITHUMB_SECRET_KEY
+BYBIT_API_KEY    BYBIT_SECRET_KEY
+```
+
+OKX/Upbit are monitor-only and use `OKX_*` / `UPBIT_*` if configured. `--monitor-only` runs without
+private keys.
 
 ---
 
-## Project Structure
+## Build & Run
 
+### Prerequisites
+
+- A C++20 compiler (Clang or GCC) and CMake ≥ 3.20
+- [Conan 2](https://conan.io/) (resolves the C++ dependencies below)
+- Dependencies (installed by Conan): Boost, OpenSSL, ZLIB, simdjson, spdlog, fmt, yaml-cpp
+  (jwt-cpp is vendored under `third_party/`)
+- For the optional monitoring layer: Node.js 18+ and npm
+
+### Recommended: helper scripts
+
+The scripts handle Conan install, the CMake preset, the correct build path, `.env` loading, and a
+pre-flight network check — then launch `kimp_bot`. Run them from the repository root:
+
+```bash
+# Monitor only (no orders, no position prompts)
+./run_monitor.sh --monitor-interval-sec 1
+
+# Live trading (requires BITHUMB_/BYBIT_ keys in ./.env)
+./run_bot.sh --monitor-interval-sec 1
+
+# Show the full CLI help
+./run_bot.sh --help
 ```
-kimp_arb_cpp/
-├── include/kimp/
-│   ├── core/           # Types, config, logger, SIMD helpers, latency probe
-│   ├── exchange/       # Bithumb, Bybit, OKX, Upbit connectors
-│   ├── execution/      # OrderManager, LifecycleExecutor (worker pool)
-│   ├── memory/         # Lock-free SPSC/MPMC ring buffers, atomic bitset
-│   ├── network/        # WebSocket client, HTTP connection pool, broadcast server
-│   ├── strategy/       # ArbitrageEngine, PriceCache, signal generation
-│   └── utils/          # HMAC-SHA512/256 crypto for exchange auth
-├── src/                # Implementation files
-├── config/             # YAML runtime configuration
-└── tests/              # Test binaries
+
+> See `MUSTREAD.md` for the operational runbook (path rules, env checks, and fixes for common
+> runtime errors).
+
+### Manual build (Conan + CMake)
+
+```bash
+cd kimp_arb_cpp
+conan install . --output-folder=build --build=missing -s build_type=Release
+cmake --preset conan-release
+cmake --build build/build/Release --target kimp_bot -j8
+
+# The binary lands at: kimp_arb_cpp/build/build/Release/kimp_bot
+./build/build/Release/kimp_bot --monitor-only
 ```
+
+### Useful CLI flags (`kimp_bot`)
+
+| Flag | Effect |
+|------|--------|
+| `-c, --config <path>` | Config file (default `config/config.yaml`) |
+| `--monitor-only` | Monitor only — no auto-trading, no position prompts |
+| `--monitor-interval-sec <n>` | Monitor refresh interval (default 2) |
+| `--scan-spot-relay` | Scan Bithumb↔Bybit spot-transfer candidates and exit |
+| `--show-balances` | Print non-zero balances on all configured exchanges |
+| `--manual-confirm-once` | Wait for one live candidate and trade only after manual confirmation |
+| `--dashboard-stream` | Enable JSON exporter + local relay WS output |
+| `--latency-probe` | Record async latency events (`--latency-probe-summary` for CSV spans) |
+
+### Tests
+
+Test binaries are defined in `CMakeLists.txt` and built alongside the engine. Build a target, then
+run it from the build directory, e.g.:
+
+```bash
+cmake --build build/build/Release --target kimp_test_entry kimp_test_order_manager_pnl -j8
+./build/build/Release/kimp_test_entry
+./build/build/Release/kimp_test_order_manager_pnl
+```
+
+Live-network smoke tests (`kimp_test_live_*`) require valid API keys; see
+`kimp_arb_cpp/tests/LIVE_TESTS.md`.
 
 ---
 
-## Build
+## Spot-Relay Monitor & Dashboard (Node.js)
+
+A standalone, **read-only** layer that streams Bithumb (KRW spot) and Bybit (USDT spot) order books,
+computes the fee-adjusted relay edge, and writes a live snapshot for the dashboard. It never places
+orders. From the repository root:
 
 ```bash
-# Dependencies: Boost, OpenSSL, simdjson, spdlog, fmt, yaml-cpp, jwt-cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j $(nproc)
+# 1. Install dashboard deps (one time)
+npm --prefix ./dashboard install
+
+# 2. Run the unit tests (node:test)
+npm run relay:test
+
+# 3a. Live scanner only → writes data/spot-relay-live.json
+npm run relay:monitor
+
+# 3b. Dashboard only (Next.js, http://localhost:3213)
+npm run relay:dashboard
+
+# 3c. Both together (scanner + dashboard)
+npm run relay:web
 ```
 
-### Run
-
-```bash
-# Monitor only (no trading)
-./build/kimp_bot --monitor-only
-
-# Live trading
-./build/kimp_bot --config config/production.yaml
-```
+The dashboard reads `data/spot-relay-live.json` (override with the `KIMP_RELAY_PATH` env var) and
+serves on port **3213**.
 
 ---
 
@@ -256,6 +379,13 @@ cmake --build build -j $(nproc)
 | **Bybit** | Foreign spot margin (SHORT/COVER) | WS (orderbook + private) + Trade WS (orders) | WebSocket |
 | **OKX** | Alt foreign (monitoring) | WS (orderbook) | REST |
 | **Upbit** | Alt Korean (monitoring) | WS (ticker) | REST |
+
+---
+
+## License
+
+No top-level license file is included; all rights reserved unless stated otherwise by the author.
+The vendored `kimp_arb_cpp/third_party/jwt-cpp` library is distributed under its own MIT license.
 
 ---
 
