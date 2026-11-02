@@ -384,7 +384,7 @@ serves on port **3213**.
 
 ## License
 
-No top-level license file is included; all rights reserved unless stated otherwise by the author.
+[MIT](LICENSE).
 The vendored `kimp_arb_cpp/third_party/jwt-cpp` library is distributed under its own MIT license.
 
 ---
